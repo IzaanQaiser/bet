@@ -50,7 +50,7 @@ One Postgres role per service, matching `overview.md` §3 as closely as table-le
 
 | Postgres role | Tables |
 |---|---|
-| `app_ingest` | `INSERT` on `items` · `SELECT` on `items`, `conversations`, `suggestions` (routing check, `data-model.md` §2.4) |
+| `app_ingest` | `INSERT` on `items` · `SELECT` on `items`, `conversations`, `suggestions` (routing check, `data-model.md` §2.5) |
 | `app_resolver` | `SELECT, UPDATE` on `items` · `SELECT, INSERT, UPDATE` on `conversations` · `SELECT, INSERT` on `item_embeddings` |
 | `app_committer` | `SELECT, UPDATE` on `items` · `INSERT` on `obligations`, `latents` · `INSERT` on `dead_letters` (§2.1) |
 | `app_dispatcher` | `SELECT` on `items`, `obligations` · `UPDATE` on `obligations` (`reminder_sent_at`) · `SELECT, INSERT` on `capacity_snapshots` · `SELECT, INSERT, UPDATE` on `suggestions` · `SELECT, UPDATE` on `latents` |

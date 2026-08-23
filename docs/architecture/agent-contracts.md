@@ -57,13 +57,15 @@ class ConfirmedItemMessage(BaseModel):
     type: Literal["obligation", "latent"]   # a surfaced latent arrives here already flipped to "obligation"
     title: str
     summary: str
-    due_at: datetime                        # required here — by this point ambiguity must be resolved
+    due_at: datetime | None                 # required (non-null) iff type == "obligation"; always null for a latent
     effort_minutes: Literal[15, 30, 60, 120, 240]
-    action_type: Literal["calendar", "email"]
-    email_draft: str | None                 # required if action_type == "email"
+    action_type: Literal["calendar", "email"] | None   # null for a latent; "calendar" for every MVP obligation (§3.2)
+    email_draft: str | None                 # null unless the email-action stretch sets action_type == "email" — see §3.2's open flag
 ```
 
-`ExtractedItemMessage` carries the *entire* extraction result, not just `item_id` — `extractor-svc` has no DB write role (ADR 0003), so `resolver-svc` is the first service to actually persist these fields into `items`.
+**Resolved bug:** `due_at` was originally typed as required (non-null) — wrong, since a latent legitimately has no due date and this message type also carries latents through the normal confirm path (a latent gets confirmed too, per PRD §2 item 4 — confirmation applies to every item, not just obligations). `committer-svc` branches on `type`: for `"obligation"` it writes Calendar (and Gmail if `action_type == "email"`) and `INSERT`s into `obligations`; for `"latent"` it does no external write at all and just `INSERT`s into `latents`.
+
+`ExtractedItemMessage` carries the *entire* extraction result, not just `item_id` — `extractor-svc` has no DB write role (ADR 0003), so `resolver-svc` is the first service to actually persist these fields into `items`. `ConfirmedItemMessage` likewise carries its full payload rather than just `item_id` — `resolver-svc` could technically let `committer-svc` re-`SELECT` from `items`, but `due_at` has no `items` column to `SELECT` from in the first place (see `data-model.md` §2.4), so the full-payload shape stays uniform across all three messages by necessity, not just convention.
 
 ---
 
@@ -154,19 +156,32 @@ Rules:
 Output must conform exactly to the provided schema. No text outside it.
 ```
 
-`resolver-svc` applies `filled_fields` to the `items` row, sets `conversations.pending_fields = still_missing`, and either sends `question` (incrementing `exchange_count`, per `state-machine.md` §1.2) or transitions to `AWAITING_CONFIRMATION` if `still_missing` is empty.
+**Where `filled_fields` actually go:** `title`/`summary`/`effort_minutes`/`focus_depth`/`confidence` are columns on `items` — `resolver-svc` writes those straight there. `due_at` has no `items` column (`data-model.md` §2.4) — it's written into `conversations.resolved_fields` instead. `resolver-svc` creates the `conversations` row the moment it consumes `items.extracted`, *unconditionally* — even on the path where extraction was already complete and confident and goes straight to `AWAITING_CONFIRMATION` with no clarifying question ever sent — specifically so a `due_at` the extractor already produced has somewhere to be staged before commit. `conversations.pending_fields` is set to `still_missing` either way, and `resolver-svc` either sends `question` (incrementing `exchange_count`, per `state-machine.md` §1.2) or transitions to `AWAITING_CONFIRMATION` if `still_missing` is empty. At the moment a `Y` is parsed, `resolver-svc` builds `ConfirmedItemMessage` by reading the `items` row plus `conversations.resolved_fields` and merging them — this is the one and only place those two sources come together.
+
+**Open gap, flagged rather than invented:** neither the PRD nor this doc currently specifies *how* `action_type`/`email_draft` ever get set to anything other than their MVP defaults (`"calendar"` / `null`) — the Extractor's schema and prompt (§2) have no notion of an email-type obligation at all. This only matters once the email-action stretch (ADR 0008, PRD §2 item 11) is actually being built — it's the lowest item in the cut order and may never be reached. Do not invent the drafting mechanism now; spec it as its own small addition to the Extractor contract (or a discriminator in the clarification call) at the point the stretch is actually started, not before.
 
 **A correction during `AWAITING_CONFIRMATION`** (`state-machine.md` §1.4) is handled by the same call: `known_fields` includes the current (possibly wrong) value, `missing_fields` is set to just the field the correction plausibly targets — inferred by a cheap heuristic (does the reply contain a time/date pattern → `due_at`; a duration pattern → `effort_minutes`; otherwise → whichever field is most recently confirmed and shortest, defaulting to `title`) — and `latest_reply` is the correction text. This reuses one schema instead of building a second "correction interpreter."
 
 ### 3.3 Confirmation card — deterministic, no LLM
 
-Exact format, from PRD §5.2, with the optional thread-attach suffix (`state-machine.md` §1.1.3) appended only when applicable:
+**Resolved gap:** the PRD's example (§5.2) only shows the obligation case — confirmation applies to latents too (PRD §2 item 4, "explicit confirmation before any write," is unconditional on type), and a latent has no `due_at` to render. Two variants:
+
+**Obligation** — exact format from PRD §5.2:
 ```
 {icon} {title}
 {formatted_due_at} · {effort_minutes} min
 Reply Y to confirm, N to cancel, or send a correction.
 ```
 `{icon}` is `📅` for `action_type == "calendar"`, `✉️` for `"email"`. `{formatted_due_at}` is rendered in the user's timezone as `Ddd D Mon, H:MM AM/PM` (e.g. `Thu 4 Sep, 2:00 PM`) — matches the PRD's literal example exactly.
+
+**Latent** — no due date to show, so no date line:
+```
+💡 {title}
+{summary} · {effort_minutes} min
+Reply Y to confirm, N to cancel, or send a correction.
+```
+
+Both variants share the thread-attach suffix below when applicable.
 
 Thread-attach suffix, appended as its own paragraph when a `0.82 ≤ similarity < 0.92` latent match exists:
 ```

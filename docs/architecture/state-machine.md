@@ -74,6 +74,8 @@ Runs once, immediately, before the completeness check — per PRD §5.2 ordering
 
 ### 1.2 Completeness check (on entering `EXTRACTED`, after dedupe clears)
 
+**`resolver-svc` creates the `conversations` row unconditionally at this point** — even when nothing is missing and the item goes straight to `AWAITING_CONFIRMATION` — because it's also where a `due_at` the extractor already resolved gets staged (`conversations.resolved_fields`, `data-model.md` §2.4) ahead of commit, not only a scratchpad for multi-turn clarification.
+
 - `missing_fields` non-empty **or** `confidence < 0.75` → `CLARIFYING`.
 - Otherwise → `AWAITING_CONFIRMATION` directly.
 
@@ -97,7 +99,7 @@ A **correction** (a reply that isn't `Y`/`N`) is treated as new information: if 
 
 ### 1.5 `CONFIRMED` → `COMMITTED`
 
-`resolver-svc` publishes to `items.confirmed` the instant a `Y` is parsed — this is the one and only place a message is allowed onto that topic from the forward pipeline (§4 covers the second, narrower path from `dispatcher-svc`). `committer-svc` consumes, writes to Calendar (obligation) or Gmail (email-action obligation, per ADR 0008, selected by `obligations.action_type`), writes the DB rows, sets `COMMITTED`. There is no user-visible gap between `Y` and the write completing that the state machine needs to model — if `committer-svc` fails here, it's a technical failure (§3), not a new user-facing state.
+`resolver-svc` publishes to `items.confirmed` the instant a `Y` is parsed — this is the one and only place a message is allowed onto that topic from the forward pipeline (§4 covers the second, narrower path from `dispatcher-svc`). The message is built by reading the `items` row plus `conversations.resolved_fields` and merging them (`agent-contracts.md` §3.2) — this is where a staged `due_at` finally reaches a service that can write it anywhere durable. `committer-svc` consumes, and branches on `type`: for an obligation it writes Calendar (or Gmail, per ADR 0008, selected by `action_type`) and `INSERT`s `obligations`; for a latent it makes no external write and just `INSERT`s `latents`. Either way it sets `COMMITTED`. There is no user-visible gap between `Y` and the write completing that the state machine needs to model — if `committer-svc` fails here, it's a technical failure (§3), not a new user-facing state.
 
 ---
 
