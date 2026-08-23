@@ -6,7 +6,8 @@ Architecture is being documented incrementally in docs/architecture/, one docume
 - docs/architecture/overview.md — service topology, write-access boundaries, data flow (done)
 - docs/architecture/state-machine.md — item and latent lifecycle, transition rules, failure handling (done)
 - docs/architecture/data-model.md — schema, indexes, migration strategy (done)
-- capacity-engine.md, agent-contracts.md, infrastructure.md — not yet written
+- docs/architecture/capacity-engine.md — snapshot computation and scoring, worked examples (done)
+- agent-contracts.md, infrastructure.md — not yet written
 
 Do not invent architectural decisions that are not documented. If a sibling architecture doc doesn't exist yet, flag the gap rather than filling it in ad hoc.
 

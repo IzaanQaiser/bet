@@ -6,7 +6,7 @@ Sibling docs (written one at a time, in this order):
 1. **`overview.md`** (this doc) — service topology, write-access boundaries, data flow
 2. `state-machine.md` — item and latent lifecycle, transition rules, failure handling (done)
 3. `data-model.md` — schema, indexes, migration strategy (done)
-4. `capacity-engine.md` — snapshot computation and scoring, worked examples
+4. `capacity-engine.md` — snapshot computation and scoring, worked examples (done)
 5. `agent-contracts.md` — exact I/O schemas and prompts for Extractor, Resolver, Dispatcher
 6. `infrastructure.md` — GCP resource inventory, IAM bindings, IaC structure
 
@@ -145,6 +145,6 @@ Flagging rather than deciding here, per `AGENTS.md`:
 
 - Exact Pub/Sub message schemas per topic → `agent-contracts.md`
 - ~~`conversations` state machine detail (how clarification exchanges are counted, batched, and exhausted)~~ → done, see `state-machine.md`
-- Capacity snapshot computation detail and worked numeric examples → `capacity-engine.md`
+- ~~Capacity snapshot computation detail and worked numeric examples~~ → done, see `capacity-engine.md`
 - Terraform/gcloud resource list, service account names, exact IAM role bindings → `infrastructure.md`
 - Local dev story (Pub/Sub emulator, Cloud SQL proxy) → `infrastructure.md`
