@@ -51,6 +51,7 @@ None currently.
 ## Notes for the next session
 
 - No repo scaffolding exists yet (`services/`, `shared/`, `migrations/`, `infra/` per `docs/engineering/conventions.md` are not created). Step 1 starts from zero.
+- Every step now has full acceptance criteria and named unit/integration/manual tests in `docs/engineering/test-plan.md` — read that step's section before starting it, and don't consider a step done until its tests pass, not just its code.
 - Onboarding (PRD §10) is deliberately not in the critical path — bootstrap the single demo user's OAuth token and `users` row manually (see PRD §14's scope note) rather than building the real SMS onboarding flow. That flow only happens in step 19, if time allows.
 - Demo needs seeded/backdated data (`docs/product/prd.md` §13, "Demo data note" + step 16) — don't leave this until step 17.
 - CI (GitHub Actions) deliberately not set up yet — add once step 4–6 produces real code and tests to run against.

@@ -50,6 +50,8 @@ Given the timeline, test investment is targeted, not exhaustive:
 - **Integration tests, required for the critical path only:** ingest → extract → confirm → commit, against the Pub/Sub emulator and a local Postgres.
 - **Not building:** end-to-end tests against real Twilio/Calendar/Gmail. Verified manually during the live demo instead — that's what the demo *is*.
 
+Per-step acceptance criteria and the exact named tests behind each of these bullets live in `docs/engineering/test-plan.md`, one section per PRD §14 build-order step — read only the step you're working.
+
 ## Local dev
 - **Pub/Sub emulator** (`gcloud beta emulators pubsub start`) — every service reads `PUBSUB_EMULATOR_HOST` when set and talks to the emulator instead of real Pub/Sub.
 - **Cloud SQL Auth Proxy** for local Postgres access against the real dev instance (not a local Postgres container) — avoids a schema-drift class of bugs between local and deployed, acceptable given there's only one instance total (ADR [0004](../decisions/0004-single-postgres-instance.md)).

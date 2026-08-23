@@ -18,7 +18,7 @@ Do not invent architectural decisions that are not documented. If a sibling arch
 
 Load-bearing decisions and their rationale are recorded in docs/decisions/ (ADRs) — read the relevant one before changing course on something it covers (e.g. don't reach for an orchestrator agent, a second data store, or vector search for matching without reading why those were rejected).
 
-Engineering conventions (language, repo layout, testing, migrations, local dev) live in docs/engineering/conventions.md.
+Engineering conventions (language, repo layout, testing, migrations, local dev) live in docs/engineering/conventions.md. Per-step acceptance criteria and named unit/integration/manual tests live in docs/engineering/test-plan.md — read only the section for the step you're on.
 
 Before implementing a subsystem, read the relevant architecture documentation.
 

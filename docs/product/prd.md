@@ -409,7 +409,7 @@ If a Veo cold-open is used, it must be clearly stylised and confined to 0:00–0
 
 ## 14. Build order
 
-Strict. Do not work ahead. Each step below is scoped to one service, one well-isolated concern, or one pure-logic module — small enough that a single session can hold the relevant doc(s) plus the code in context at once, without needing the whole six-doc architecture set loaded every time. **Reads** names the minimal doc set for that step; don't read more than that going in. **Done when** is the concrete, checkable signal that the step is actually finished — not "looks right," something you can verify.
+Strict. Do not work ahead. Each step below is scoped to one service, one well-isolated concern, or one pure-logic module — small enough that a single session can hold the relevant doc(s) plus the code in context at once, without needing the whole six-doc architecture set loaded every time. **Reads** names the minimal doc set for that step; don't read more than that going in. **Done when** is the concrete, checkable signal that the step is actually finished — not "looks right," something you can verify. Full acceptance criteria and named unit/integration/manual tests per step: `docs/engineering/test-plan.md` — read only that step's section, not the whole file.
 
 **Deliberate scope call, not an oversight:** PRD §10 (onboarding — bot texts an OAuth link, asks timezone/working hours) has no step below. For the single demo user, bootstrap manually — a refresh token minted once via the OAuth flow directly, dropped into Secret Manager, one `users` row inserted by hand. The real SMS-driven onboarding flow is bonus-tier (folds into step 19 if time allows); judges need to see the core loop, not account creation.
 

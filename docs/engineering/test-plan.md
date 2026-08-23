@@ -1,0 +1,312 @@
+# Test Plan
+
+One section per `docs/product/prd.md` §14 build-order step. Where that doc's "Done when" is a one-line signal, this is the checklist and the actual test names behind it. Read only the section for the step you're working — that's the point of keeping these separate from the PRD.
+
+Three categories per step, not all always present:
+- **Unit tests** — pure logic, no I/O, no emulator. Fast, required, per `docs/engineering/conventions.md`.
+- **Automated/integration tests** — against the Pub/Sub emulator and a local Postgres (via Cloud SQL proxy), per `conventions.md`'s local dev setup. Cover the critical path, not everything.
+- **Manual verification** — real Twilio/Calendar/Gmail. Not automated, on purpose (`conventions.md`: "Not building: end-to-end tests against real Twilio/Calendar/Gmail. Verified manually during the live demo instead"). Listed explicitly so nothing gets skipped silently.
+
+Test files live in each service's `tests/` directory, or `shared/tests/` for anything in the shared package, per `conventions.md`'s repo layout.
+
+---
+
+## Step 1 — Infra skeleton
+
+**Acceptance criteria**
+- `terraform plan` is clean; `terraform apply` succeeds; re-applying immediately is a no-op.
+- Every resource in `infrastructure.md` §1 exists: 6 Pub/Sub topics, Cloud SQL instance running, GCS bucket with 30-day lifecycle rule, Artifact Registry repo, 5 service accounts, the two static Secret Manager entries (placeholder values acceptable here).
+- Every Pub/Sub IAM binding is resource-scoped, not project-wide (`infrastructure.md` §2.1's non-negotiable) — spot-check via `gcloud pubsub topics get-iam-policy` on `items.confirmed`: `sa-extractor` must not appear.
+
+**Tests:** none (infra-only, nothing to unit test). Optional `scripts/verify-infra.sh` asserting resource existence via `gcloud`, run manually — not required.
+
+**Manual verification:** review `gcloud pubsub topics list` / `gcloud sql instances list` / `gcloud iam service-accounts list` against `infrastructure.md` §1's table.
+
+---
+
+## Step 2 — DB schema + shared package
+
+**Acceptance criteria**
+- `scripts/migrate.sh` applies `migrations/0001_init.sql` cleanly.
+- Every table/column/index/constraint in `data-model.md` §2 exists exactly, including the `resolved_fields` column and the `hnsw` index.
+- Every Pydantic model in `agent-contracts.md` §1 exists verbatim in `shared/obligation_engine_shared/schemas.py`.
+
+**Unit tests** (`shared/tests/test_schemas.py`)
+- `test_raw_item_message_valid` / `test_extracted_item_message_valid` / `test_confirmed_item_message_valid` — construct each with valid fixture data, no error.
+- `test_extracted_item_message_rejects_invalid_effort_minutes` — `effort_minutes=45` raises `ValidationError` (it's a `Literal`, not an int).
+- `test_confirmed_item_message_due_at_optional_for_latent` — `type="latent", due_at=None` is valid (regression guard for the bug fixed in the cohesiveness pass).
+- `test_message_roundtrip` — `Model.model_validate_json(instance.model_dump_json())` equals the original, for all three models.
+
+**Integration tests** (`shared/tests/test_migration.py`)
+- `test_migration_applies_cleanly` — against a scratch Postgres, run the migration, assert it exits 0.
+- `test_all_tables_exist` — query `information_schema.tables`, assert all nine tables from `data-model.md` §2 are present.
+- `test_pgvector_extension_enabled`.
+
+---
+
+## Step 3 — `ingest-svc` + real Twilio number
+
+**Acceptance criteria**
+- Valid, correctly-signed webhook POST → exactly one `items` row (`state='RECEIVED'`) and exactly one `items.raw` message, same `item_id`.
+- Invalid/missing signature → 4xx, zero rows, zero messages (bad input is rejected inline per `state-machine.md` §3, never touches the pipeline).
+- Real Twilio number wired to the deployed `.run.app` URL.
+
+**Unit tests** (`services/ingest-svc/tests/test_webhook.py`)
+- `test_valid_signature_accepted` / `test_tampered_signature_rejected` / `test_missing_signature_rejected`.
+- `test_parses_text_only_payload` — Twilio form body → correct `text`, `media_uri=None`.
+
+**Integration tests** (`services/ingest-svc/tests/test_ingest_integration.py`, Pub/Sub emulator + local Postgres)
+- `test_valid_webhook_creates_item_and_publishes` — synthetic valid payload → one `items` row + one `items.raw` message, matching `item_id`.
+- `test_invalid_webhook_creates_nothing` — synthetic bad-signature payload → zero rows, zero messages.
+
+**Manual verification:** one real SMS to the real number; confirm via Cloud Logging filtered on the resulting `item_id`.
+
+---
+
+## Step 4 — `extractor-svc`
+
+**Acceptance criteria**
+- Consuming a text-only `RawItemMessage` → exactly one schema-valid `ExtractedItemMessage` published.
+- Ambiguous date → `due_at: null` + `"due_at"` in `missing_fields`, never a guessed date.
+- `effort_minutes` always one of the five buckets.
+- No-deadline input → `type: "latent"`.
+- `sa-extractor` has no Cloud SQL connectivity at all — an infra check, not a code one (confirm no `DATABASE_URL`/proxy sidecar configured for this service).
+
+**Unit tests** (`services/extractor-svc/tests/test_extractor.py`, Gemini client mocked)
+- `test_extraction_maps_fixture_response_to_message` — mocked Gemini returns a fixed valid JSON fixture, assert the resulting `ExtractedItemMessage` matches exactly.
+- `test_schema_violation_from_model_is_rejected` — mocked response with `effort_minutes: 45` is caught before publish, not passed through.
+- `test_ambiguous_date_leaves_due_at_null` — fixture response with `due_at: null, missing_fields: ["due_at"]` round-trips correctly.
+
+**Integration tests** (Pub/Sub emulator, Gemini mocked)
+- `test_raw_to_extracted_end_to_end` — publish `RawItemMessage` → consumer runs with mocked Gemini → assert exact `ExtractedItemMessage` on `items.extracted`.
+
+**Manual verification (real Gemini, not mocked):** send 3–5 representative real messages — clear obligation, ambiguous date, no-deadline idea, a garbled/low-confidence one — and eyeball extraction quality. This is model-output quality, not wiring; it cannot be meaningfully asserted in an automated test.
+
+---
+
+## Step 5 — `resolver-svc` stub (temporary)
+
+**Acceptance criteria**
+- Any `ExtractedItemMessage` with **empty** `missing_fields` → immediately publishes a matching `items.confirmed`, no DB writes beyond progress, no SMS.
+- An item with **non-empty** `missing_fields` is left in `EXTRACTED` and logged, not force-confirmed — this step proves the happy path only, it doesn't pretend to solve incomplete items.
+- Every auto-confirm is logged distinctly (e.g. `"AUTO-CONFIRMED (stub, no gate) item_id=..."`) so it's unmistakable in Cloud Logging that this is temporary scaffolding, not the real gate.
+
+**Unit tests** (`services/resolver-svc/tests/test_stub.py`)
+- `test_complete_item_auto_confirms`.
+- `test_incomplete_item_left_in_extracted` — `missing_fields` non-empty → no publish, no state change beyond logging.
+
+**Integration tests:** `test_extracted_to_confirmed_stub` (Pub/Sub emulator) — publish a complete `ExtractedItemMessage`, assert `ConfirmedItemMessage` appears.
+
+---
+
+## Step 6 — `committer-svc`
+
+**Acceptance criteria**
+- `type="obligation"` → one real Calendar event (verified by reading it back via the Calendar API, not just "no error"), one `obligations` row with matching `calendar_event_id`, `items.state='COMMITTED'`.
+- `type="latent"` → zero external calls, one `latents` row (`surface_count=0`, `dismissal_count=0`, `dormant_until=null`), `items.state='COMMITTED'`.
+- A Calendar API failure does not mark `COMMITTED` — item stays recoverable, error logged with `item_id`.
+
+**Unit tests** (`services/committer-svc/tests/test_committer.py`, Calendar client mocked)
+- `test_obligation_branch_calls_calendar_write` — mock asserts calendar-write called with correct args.
+- `test_latent_branch_does_not_call_calendar` — mock asserts calendar-write **not** called.
+- `test_calendar_failure_does_not_mark_committed`.
+
+**Integration tests** (Pub/Sub emulator + local Postgres, Calendar mocked)
+- `test_confirmed_obligation_full_cycle` / `test_confirmed_latent_full_cycle`.
+
+**Manual verification:** one real obligation end-to-end — actual Google Calendar event appears. Required once against the real API; mocks can't fully validate OAuth/API behavior.
+
+---
+
+## Step 7 — Capacity engine, pure functions
+
+The cleanest step to test — no I/O, and `capacity-engine.md` §6 already hands you exact expected numbers.
+
+**Acceptance criteria**
+- `free_intervals`, `block_fit`, `depth_fit`, `load_fit`, `revival_score` implemented exactly per `capacity-engine.md`'s formulas.
+- The worked example (§6) reproduces exactly: `fit_score = 0.875`, `revival_score ≈ 0.633` (assert to 3 decimal places).
+- The contrast example (§6, insufficient block) reproduces `fit_score = 0`.
+
+**Unit tests** (`services/dispatcher-svc/tests/test_capacity_engine.py` or `shared/tests/` if the module lives there)
+- `test_free_intervals_merges_back_to_back_events`
+- `test_free_intervals_all_day_event_blocks_whole_day`
+- `test_block_fit_deep_requires_125_percent_margin`
+- `test_block_fit_shallow_no_margin_required`
+- `test_depth_fit_deep_flat_below_threshold` / `test_depth_fit_deep_falls_off_above_threshold` (floor 0.3)
+- `test_depth_fit_shallow_rewards_fragmentation` (cap 1.2)
+- `test_load_fit_at_mean_is_half` (`load_delta=0` → `0.5`)
+- `test_load_fit_40_percent_below_is_one` (`load_delta=-0.4` → `1.0`)
+- `test_load_fit_clips_at_bounds`
+- `test_revival_score_worked_example` — the full §6 scenario, asserting `0.633` to 3dp
+- `test_eligibility_excludes_young_items` (`days_since_capture < 3`)
+- `test_eligibility_excludes_recently_surfaced` (within 10 days)
+- `test_selection_picks_best_day_per_latent_then_argmax_across_latents`
+- `test_selection_respects_threshold` (below `0.4` → no suggestion)
+
+**Integration/manual:** none needed — this step is explicitly I/O-free.
+
+---
+
+## Step 8 — `dispatcher-svc`
+
+**Acceptance criteria**
+- `/dispatch`, invoked manually, computes and persists exactly 7 `capacity_snapshots` rows (one per day) from real Calendar reads.
+- Reminders are idempotent: an obligation already reminded (`reminder_sent_at` set) is never reminded twice, even if `/dispatch` runs twice in a row.
+- Never more than one suggestion sent per run, even with multiple latents clearing the threshold.
+- Suggestion text matches `agent-contracts.md` §4.2 exactly, including all three evidence-line branches (superlative / "lighter than usual" / omitted).
+
+**Unit tests** (`services/dispatcher-svc/tests/test_dispatcher.py`)
+- `test_reminder_not_resent_if_already_sent`.
+- `test_suggestion_text_superlative_branch` / `test_suggestion_text_lighter_than_usual_branch` / `test_suggestion_text_omitted_branch` — fixed snapshot fixtures, assert exact rendered string for each.
+
+**Integration tests** (Pub/Sub emulator + local Postgres, Calendar + Twilio mocked)
+- `test_dispatch_run_produces_7_snapshots`.
+- `test_dispatch_run_sends_at_most_one_suggestion` — fixture with multiple latents clearing threshold, assert exactly one SMS captured by the mocked Twilio client.
+
+**Manual verification:** real `/dispatch` trigger against a real calendar — this is the literal PRD §13 demo segment ("manually trigger the dispatcher").
+
+---
+
+## Step 9 — Real `resolver-svc` — confirmation
+
+**Acceptance criteria**
+- Complete/confident extraction → correct confirmation card variant (obligation vs. latent, `agent-contracts.md` §3.3) instead of auto-confirming.
+- `AFFIRMATIVE`-set reply → `items.confirmed` published. `NEGATIVE`-set reply → `CANCELLED`, terminal message sent, no publish.
+- A reply outside `Y`/`N` doesn't crash and is logged distinctly (full correction-handling completeness is step 10's job, since it reuses the clarification call).
+- `classify_reply` (shared) is unit-tested once and reused identically here and by `dispatcher-svc` — no duplicated logic.
+
+**Unit tests**
+- `shared/tests/test_classify_reply.py` — every string in each set maps correctly, case-insensitive/whitespace-trimmed; arbitrary strings map to `"OTHER"`.
+- `services/resolver-svc/tests/test_confirmation_card.py` — obligation variant includes date/duration; latent variant has no date line; thread-attach suffix appears only when applicable.
+
+**Integration tests** (Pub/Sub emulator + local Postgres)
+- `test_y_reply_publishes_confirmed`.
+- `test_n_reply_cancels_no_publish`.
+
+**Manual verification:** one real SMS confirm/cancel round trip.
+
+---
+
+## Step 10 — Real `resolver-svc` — clarification loop
+
+**Acceptance criteria**
+- `exchange_count` increments only on outbound questions, never inbound replies (`state-machine.md` §1.2).
+- After the 3rd unresolved exchange → `NEEDS_REVIEW`, correct terminal message, no 4th question sent.
+- `conversations` row created unconditionally at `EXTRACTED` consumption — verified even for an item that never enters `CLARIFYING` (the zero-clarification path still gets a row, for `due_at` staging).
+- Resolved `due_at` lands in `conversations.resolved_fields`, never attempted against an `items` column.
+- Multiple missing fields batch into exactly one question, never one message per field.
+
+**Unit tests** (`services/resolver-svc/tests/test_clarification.py`)
+- `test_exchange_counting_table` — table-driven over `(reply, missing_fields_before) → (exchange_count_after, state_after)`, matching the `state-machine.md` §1 diagram exactly for the 0/1/2/3-exchange cases.
+- `test_filled_fields_routing` — mocked `ClarificationResponse`, assert `title`/`summary`/`effort_minutes`/`focus_depth` go to `items`, `due_at` goes to `conversations.resolved_fields`.
+- `test_needs_review_sends_no_fourth_question`.
+
+**Integration tests** (Pub/Sub emulator + local Postgres)
+- `test_conversations_row_created_on_zero_clarification_path`.
+- `test_three_exchange_exhaustion_reaches_needs_review`.
+- `test_single_exchange_resolves_to_awaiting_confirmation`.
+
+**Manual verification:** one real multi-turn SMS clarification exchange.
+
+---
+
+## Step 11 — Multimodal ingest
+
+**Acceptance criteria**
+- MMS with image/PDF: media persisted to GCS at the correct `raw_media_uri`, correct MIME type, `extractor-svc` passes bytes to Gemini and produces a valid extraction.
+- An unsupported attachment type is rejected with a clear error, not silently dropped.
+- Text-only path (steps 3–4) has no regression.
+
+**Unit tests**
+- `services/ingest-svc/tests/test_media.py` — `test_mime_type_routing` (image/PDF/unsupported).
+
+**Integration tests**
+- `test_mms_end_to_end` — synthetic MMS payload with fixture image → GCS upload → `items.raw` → mocked-Gemini extraction → `items.extracted`.
+- `test_text_only_regression` — rerun step 3/4's integration tests, confirm unaffected.
+
+**Manual verification:** one real photographed note, one real screenshot, both via actual MMS.
+
+---
+
+## Step 12 — Dedupe via embeddings
+
+**Acceptance criteria**
+- `dedupe_hash` exact-match catches identical resends **without** an embedding API call (assert the mocked embedding client is not invoked in that case).
+- `similarity ≥ 0.92` → `DUPLICATE_SUSPECTED`; `Y` → `MERGED`, no new `obligations`/`latents` row; `N` → proceeds as if no match.
+- `0.82–0.92` against an existing latent → thread-attach offer, non-blocking.
+- Below `0.82` → no dedupe action (regression against false positives).
+
+**Unit tests** (`services/resolver-svc/tests/test_dedupe.py`)
+- `test_dedupe_hash_normalizes_case_and_whitespace`.
+- `test_similarity_boundary_at_0_92` / `test_similarity_boundary_at_0_82` — fixture embedding pairs at and just past each threshold.
+
+**Integration tests** (Pub/Sub emulator + local Postgres with `pgvector`)
+- `test_near_duplicate_caught` / `test_dissimilar_item_not_caught`.
+
+**Manual verification:** send a genuine near-duplicate (differently worded) real message; confirm the dedupe prompt appears.
+
+---
+
+## Step 13 — DLQ + error handling
+
+**Acceptance criteria**
+- Every subscription has a dead-letter policy (`max_delivery_attempts=3`) pointing at the correct `.dlq` topic (`gcloud pubsub subscriptions describe`).
+- A forced technical failure → exactly 3 attempts → `.dlq` message → exactly one `dead_letters` row with correct `item_id`/`stage`/`error`/`retry_count`.
+- Bad-input rejections (malformed payload) never appear in `dead_letters` (regression against over-eager dead-lettering — `state-machine.md` §3's distinction).
+- Manual replay (republish stored `payload` to the correct topic) re-enters the pipeline at the failed stage, not from `RECEIVED`.
+
+**Unit tests:** the bad-input-vs-technical-failure classification in each consumer.
+
+**Integration tests** (Pub/Sub emulator, `max_delivery_attempts=2` for faster tests)
+- `test_forced_failure_reaches_dlq_after_max_attempts`.
+- `test_committer_writes_dead_letter_row_correctly`.
+- `test_replay_reenters_at_failed_stage`.
+
+---
+
+## Step 14 — Feedback loop / dismissal scoring
+
+**Acceptance criteria**
+- `N` reply: `dismissal_count` increments; `<2` → back to `ELIGIBLE`; `==2` → `dormant_until = now() + 30d`.
+- `Later` reply: `dormant_until = now() + 7d`, `dismissal_count` unchanged.
+- No reply within 24h: `outcome='no_response'`, no penalty, `dormant_until` unchanged, resolved **before** the same run scores any new suggestion.
+- `Y` reply: `outcome='accepted'`, converts to obligation via the minimal `items.confirmed` publish (`state-machine.md` §2.3), picked up correctly by step 6's committer.
+
+**Unit tests** (`services/dispatcher-svc/tests/test_feedback.py`)
+- `test_outcome_table` — table-driven over every `SURFACED` branch, matching `state-machine.md` §2's diagram exactly.
+- `test_24h_timeout_resolves_before_new_scoring`.
+
+**Integration tests**
+- `test_accept_path_full_cycle` — `SURFACED` → `Y` → routed via `ingest-svc` → `items.type` flips to `obligation`, `due_at` computed as block-start capped at block length, `items.confirmed` published, `committer-svc` commits it.
+
+---
+
+## Step 15 — Email draft + send action (stretch)
+
+**Not yet specifiable.** The drafting mechanism itself is an open design gap (`agent-contracts.md` §3.2's flagged note) — write the spec first, following the same doc-before-code pattern as everything else, then fill in this section's acceptance criteria and test names. Do not invent tests against an unspecified mechanism.
+
+What's already fixed regardless of the mechanism: the same confirm-gate applies (no send without `Y`), and `email_sent_at` is set exactly once — no duplicate sends on retry or DLQ replay.
+
+---
+
+## Step 16 — Seed demo data script
+
+**Acceptance criteria**
+- Running it against a clean dev DB produces: one demo user, one latent backdated to ~18 days old, a full 14-day `capacity_snapshots` history shaped to reproduce the worked-example-style suggestion.
+- Refuses to run outside an explicit demo/dev guard (e.g. `ENVIRONMENT=demo`) — never touches real user data.
+
+**Integration test:** `test_seed_then_dispatch_produces_suggestion` — run the script against a scratch DB, run `/dispatch`, assert a suggestion is actually produced. This is the confidence check tying steps 7/8/14 together against realistic data.
+
+---
+
+## Step 17 — Record demo
+
+Not a software step — a pre-flight checklist instead of tests: every "Manual verification" bullet in steps 3–16 has been performed at least once against the real deployed system before recording, so nothing is discovered live on camera.
+
+## Step 18 — README, diagram export, write-up
+
+Checklist, not tests: README spin-up instructions followed once from a genuinely clean environment; diagram matches the actual deployed topology, not an earlier draft.
+
+## Step 19 — Bonus
+
+No acceptance criteria — optional, cut freely.
