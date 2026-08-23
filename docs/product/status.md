@@ -46,8 +46,12 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Blockers
 
-- **Billing account closed.** `gcloud billing accounts list` shows the only account ("My Billing Account", `01153A-78309A-856476`) as `OPEN: False`. Cloud SQL and other paid resources can't be provisioned until this is fixed — reactivated or a new one created — and its ID confirmed. Blocks `terraform apply` for step 1.
-- **No GCP project ID chosen yet.** User confirmed a new dedicated project (not reusing `ock2-dev` or others) — proposed ID `obligation-engine`, not yet created or confirmed.
+- **Billing account closed.** `gcloud billing accounts list` shows the only account under `waslyrideshare@gmail.com` ("My Billing Account", `01153A-78309A-856476`) as `OPEN: False`. Cloud SQL and other paid resources can't be provisioned until this is reactivated (or a new one created) and linked to the project. Blocks `terraform apply` for step 1 — everything else is ready.
+
+## Decided
+
+- Account: `waslyrideshare@gmail.com`.
+- Project: `obligation-engine-hack` (plain `obligation-engine` was already taken globally) — created, set as active `gcloud` project, ADC quota project aligned.
 
 ## Notes for the next session
 
