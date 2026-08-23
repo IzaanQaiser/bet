@@ -401,6 +401,8 @@ Judged on reproducibility. Must contain:
 
 **Non-negotiable:** the split-screen of phone + streaming Cloud Run logs during the live segment. That single shot answers *Proof of Action* and *proof of GCP deployment* simultaneously.
 
+**Demo data note:** the "you mentioned this 18 days ago, lightest day in two weeks" narrative (§5.3, `capacity-engine.md` §6) needs a latent that's actually old and a real 14-day calendar history to compute `load_delta` against — neither exists organically this early in a 9-day build. Don't leave this to chance: build a small seed script (`scripts/seed-demo-data.sh` or similar, alongside build order step 8) that inserts a demo latent with a backdated `created_at` and, if needed, synthetic `capacity_snapshots` history, so the demo suggestion is reproducible and controllable rather than dependent on having organically used the bot for weeks beforehand.
+
 If a Veo cold-open is used, it must be clearly stylised and confined to 0:00–0:15, so no judge mistakes the live segment for edited footage.
 
 ---

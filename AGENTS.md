@@ -21,3 +21,15 @@ Engineering conventions (language, repo layout, testing, migrations, local dev) 
 Before implementing a subsystem, read the relevant architecture documentation.
 
 Prefer simple, explicit, testable designs over speculative abstraction.
+
+## Commit messages
+
+Conventional Commits: `<type>(<scope>): <summary>`.
+
+- Types: `feat`, `fix`, `refactor`, `test`, `chore`, `docs`.
+- Scope: a service name (`ingest-svc`, `extractor-svc`, `resolver-svc`, `committer-svc`, `dispatcher-svc`), `shared`, `infra`, or `docs` for documentation-only changes. Omit the scope for something genuinely repo-wide.
+- Summary: imperative mood, no trailing period, under ~70 characters.
+- Body (optional, blank line after the summary): explain *why*, not *what* — the diff already shows what changed. Use it for the reasoning a future session would otherwise have to reconstruct (a bug that motivated the fix, a tradeoff that was considered and rejected).
+- Only create commits when asked to.
+
+This matches the pattern already used across the `chore(docs): ...` commits in this repo's history — keep using it once implementation starts (`feat(extractor-svc): ...`, `fix(resolver-svc): ...`, etc.).

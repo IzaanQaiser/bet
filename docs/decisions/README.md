@@ -4,6 +4,8 @@ Short records of load-bearing decisions and why the alternative lost. These exis
 
 If you're about to change one of these, read the Context/Alternatives section first. If the reasoning no longer holds, update the ADR rather than silently drifting from it.
 
+**When to add a new one:** if you make a load-bearing tradeoff during implementation — something a future session (or a coding agent working a narrow task) could plausibly "fix" without knowing it was deliberate — write it down here as `000N-slug.md`, following the format of the existing ones (Context / Decision / Alternatives considered / Consequences). Don't let a real tradeoff live only in a commit message or a code comment; both get lost long before this file does. Routine implementation choices that follow directly from an architecture doc don't need one — this is for the decisions the docs don't already make for you.
+
 | # | Decision |
 |---|---|
 | [0001](0001-no-orchestrator-agent.md) | No orchestrator agent — explicit state machine owns control flow |
