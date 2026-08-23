@@ -14,12 +14,12 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**In progress: Step 1 — Infra skeleton.** `infra/*.tf` written (project APIs, 5 service accounts, 6 Pub/Sub topics + publish-side IAM, Cloud SQL instance + IAM DB auth users, GCS bucket, Artifact Registry, Secret Manager secret containers). Not yet applied — blocked, see Blockers below.
+**Step 1 done. Next: Step 2 — DB schema + shared package.**
 
 | Step | Status |
 |---|---|
 | **Phase A — Foundation** | |
-| 1. Infra skeleton (Terraform) | In progress — code written, not applied |
+| 1. Infra skeleton (Terraform) | **Done** — applied to `obligation-engine-hack`, all acceptance criteria verified (idempotent, IAM scoping confirmed, resource inventory confirmed) |
 | 2. DB schema + shared package | Not started |
 | 3. `ingest-svc` + real Twilio number | Not started |
 | **Phase B — Core pipeline (auto-confirm stub)** | |
@@ -46,12 +46,14 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Blockers
 
-- **Billing account closed.** `gcloud billing accounts list` shows the only account under `waslyrideshare@gmail.com` ("My Billing Account", `01153A-78309A-856476`) as `OPEN: False`. Cloud SQL and other paid resources can't be provisioned until this is reactivated (or a new one created) and linked to the project. Blocks `terraform apply` for step 1 — everything else is ready.
+None.
 
 ## Decided
 
-- Account: `waslyrideshare@gmail.com`.
-- Project: `obligation-engine-hack` (plain `obligation-engine` was already taken globally) — created, set as active `gcloud` project, ADC quota project aligned.
+- Account: `waslyrideshare@gmail.com`. Project: `obligation-engine-hack` (plain `obligation-engine` was already taken globally).
+- Billing account `01153A-78309A-856476` linked and enabled. (History: was closed due to a declined card; user paid the balance and reopened it; hit a billing-account project-quota limit next, resolved by unlinking `msa-gpt` to free a slot.)
+- `obligation-engine-db` (Cloud SQL Postgres 15, `db-f1-micro`) is live at connection name `obligation-engine-hack:us-central1:obligation-engine-db`.
+- Media bucket: `obligation-engine-hack-media`. Artifact Registry: `us-central1-docker.pkg.dev/obligation-engine-hack/obligation-engine`.
 
 ## Notes for the next session
 
