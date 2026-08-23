@@ -46,7 +46,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Blockers
 
-- **Need a real Twilio account.** Account SID, Auth Token, and a purchased phone number — requires signup I can't do (browser/phone verification). Checklist given to the user; not yet received. Blocks: deploying ingest-svc, wiring the webhook, and step 3's manual verification.
+- **Still need a real, owned Twilio phone number.** Account SID (`AC3292d4a7944b87b2fe3db562856e32bd`) and Auth Token obtained and stored in Secret Manager. The number shown in Twilio's "Try out SMS" panel (`+17372212163`) turned out to be a **shared/pooled trial demo number, not one actually owned by the account** — confirmed empirically via three separate API calls (`IncomingPhoneNumbers` empty, a real send attempt blocked, `OutgoingCallerIds` blocked) even after a successful send through that panel. A real purchased number (via the console's actual "Buy a number" flow, not "Try it out") is still needed before deploy + webhook wiring + manual verification can happen.
 
 ## Decided
 
@@ -54,6 +54,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 - Billing account `01153A-78309A-856476` linked and enabled. (History: was closed due to a declined card; user paid the balance and reopened it; hit a billing-account project-quota limit next, resolved by unlinking `msa-gpt` to free a slot.)
 - `obligation-engine-db` (Cloud SQL Postgres 15, `db-f1-micro`) is live at connection name `obligation-engine-hack:us-central1:obligation-engine-db`.
 - Media bucket: `obligation-engine-hack-media`. Artifact Registry: `us-central1-docker.pkg.dev/obligation-engine-hack/obligation-engine`.
+- Twilio: Account SID `AC3292d4a7944b87b2fe3db562856e32bd`; Auth Token in Secret Manager (`twilio-auth-token`); an API Key's secret also captured and stored (`twilio-api-key-secret`) for outbound sends in later steps — see `infrastructure.md` §4.1 for why there are two separate Twilio credentials, not one. Twilio account is Trial type — 100 free messages, one number, only sends to Verified Caller IDs; fine for the whole build, revisit before final demo recording only if the trial message prefix matters for polish.
 
 ## Notes for the next session
 

@@ -25,6 +25,31 @@ resource "google_secret_manager_secret" "google_oauth_client_secret" {
   depends_on = [google_project_service.apis]
 }
 
+# Twilio API Key — not in the original infrastructure.md plan, added during
+# step 3 build. Distinct from twilio-auth-token: the Auth Token is required
+# for webhook signature validation (no substitute), but outbound sends
+# (resolver-svc, dispatcher-svc — overview.md's write matrix) use this
+# instead, since an API key is independently revocable without touching the
+# master Auth Token every other service's signature check depends on. The
+# key SID (public, not a secret) is plain config, not stored here.
+resource "google_secret_manager_secret" "twilio_api_key_secret" {
+  secret_id = "twilio-api-key-secret"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
+resource "google_secret_manager_secret_iam_member" "sms_senders_read_api_key" {
+  for_each = {
+    resolver   = google_service_account.resolver.email
+    dispatcher = google_service_account.dispatcher.email
+  }
+  secret_id = google_secret_manager_secret.twilio_api_key_secret.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${each.value}"
+}
+
 resource "google_secret_manager_secret_iam_member" "ingest_reads_twilio_token" {
   secret_id = google_secret_manager_secret.twilio_auth_token.secret_id
   role      = "roles/secretmanager.secretAccessor"

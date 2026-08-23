@@ -14,7 +14,7 @@ Sixth and final doc in the architecture set — see `overview.md` §0. Closes ou
 | Pub/Sub subscriptions | One push subscription per topic per consuming service, `items.*` subscriptions configured with a dead-letter policy (`max_delivery_attempts=3`) pointing at the matching `.dlq` topic |
 | Cloud Scheduler | Two jobs — `dispatch-daily` (07:00), `dispatch-midday` — both push `POST /dispatch` on `dispatcher-svc` |
 | GCS bucket | Media storage, `raw_media_uri` targets; lifecycle rule deletes objects after 30 days (PRD §9) |
-| Secret Manager | `twilio-auth-token`, `google-oauth-client-secret`, one `user-refresh-token-{user_id}` secret per onboarded user |
+| Secret Manager | `twilio-auth-token`, `twilio-api-key-secret` (added during step 3 — see below), `google-oauth-client-secret`, one `user-refresh-token-{user_id}` secret per onboarded user |
 | Artifact Registry | One repo, container images for all five services |
 | Service accounts | Five, one per Cloud Run service — see §2 |
 
@@ -81,6 +81,14 @@ The exact Gemini 3.5 Flash model resource string is deliberately left as a place
 - Each user's refresh token is its own secret, `user-refresh-token-{user_id}`; `users.google_refresh_token_ref` (`data-model.md` §2) stores that secret's full resource name (`projects/{project}/secrets/user-refresh-token-{id}/versions/latest`), not the token itself.
 - `sa-committer` and `sa-dispatcher` are granted `secretAccessor` at the **project level** for Secret Manager, not per-secret. Simplification, stated plainly: at hackathon scale (one demo user, a handful at most) per-secret IAM conditions add real complexity for no practical isolation benefit — every user's token is equally sensitive to the same two services either way. If this became a real multi-tenant product, scope this to per-secret conditions; noted as a deliberate scale-appropriate call, same spirit as ADR 0004.
 - **Calendar API quota:** closes the open item from `capacity-engine.md` §8. Default Calendar API quota (per-user, per-100-second buckets) comfortably covers two reads per user per dispatcher run (the 14-day trailing window + 7-day forward window) at any hackathon-relevant user count. No quota increase request needed.
+
+## 4.1 Twilio credentials — two, not one (added during step 3)
+
+Not in the original plan — added once real Twilio setup started. Two distinct credentials, two distinct purposes:
+
+- **`twilio-auth-token`** (the account's master Auth Token) — required for webhook signature validation (`ingest-svc`, `agent-contracts.md`'s Twilio `RequestValidator`). There is no substitute for this; Twilio computes the `X-Twilio-Signature` HMAC using the Auth Token specifically.
+- **`twilio-api-key-secret`** (a Twilio API Key's secret, SID `SK...`) — used for outbound sends (`resolver-svc`, `dispatcher-svc` — the two services with Twilio write access per `overview.md` §3). Independently revocable without touching the Auth Token every service's signature check depends on, so a compromised sending credential doesn't take down inbound validation too. The key's SID is not a secret (Twilio API keys, like the Account SID, are public identifiers paired with a private secret) — it's plain config, not stored in Secret Manager.
+- `sa-resolver` and `sa-dispatcher` get `secretAccessor` on `twilio-api-key-secret` specifically (`infra/secret_manager.tf`), not the project-wide grant §4 describes for the OAuth secrets — this one only ever has two readers, no per-user proliferation to justify simplifying.
 
 ---
 
