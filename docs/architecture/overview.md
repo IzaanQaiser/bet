@@ -7,7 +7,7 @@ Sibling docs (written one at a time, in this order):
 2. `state-machine.md` — item and latent lifecycle, transition rules, failure handling (done)
 3. `data-model.md` — schema, indexes, migration strategy (done)
 4. `capacity-engine.md` — snapshot computation and scoring, worked examples (done)
-5. `agent-contracts.md` — exact I/O schemas and prompts for Extractor, Resolver, Dispatcher
+5. `agent-contracts.md` — exact I/O schemas and prompts for Extractor, Resolver, Dispatcher (done)
 6. `infrastructure.md` — GCP resource inventory, IAM bindings, IaC structure
 
 Until a sibling doc exists, do not invent its content to unblock implementation — flag the gap instead (per `AGENTS.md`).
@@ -43,7 +43,7 @@ flowchart TB
         extractor["extractor-svc\n(Cloud Run, ADK)"]
         resolver["resolver-svc\n(Cloud Run, ADK)"]
         committer["committer-svc\n(Cloud Run)"]
-        dispatcher["dispatcher-svc\n(Cloud Run, ADK)"]
+        dispatcher["dispatcher-svc\n(Cloud Run)"]
         scheduler["Cloud Scheduler\n(07:00 + midday)"]
         gcs["GCS\n(media, 30d TTL)"]
         sql["Cloud SQL\nPostgres + pgvector"]
@@ -143,7 +143,7 @@ Every service logs structured JSON with `item_id` (or, for dispatcher runs with 
 
 Flagging rather than deciding here, per `AGENTS.md`:
 
-- Exact Pub/Sub message schemas per topic → `agent-contracts.md`
+- ~~Exact Pub/Sub message schemas per topic~~ → done, see `agent-contracts.md` §1
 - ~~`conversations` state machine detail (how clarification exchanges are counted, batched, and exhausted)~~ → done, see `state-machine.md`
 - ~~Capacity snapshot computation detail and worked numeric examples~~ → done, see `capacity-engine.md`
 - Terraform/gcloud resource list, service account names, exact IAM role bindings → `infrastructure.md`

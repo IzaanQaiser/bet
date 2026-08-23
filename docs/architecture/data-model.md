@@ -181,6 +181,6 @@ Per `docs/engineering/conventions.md`: this DDL becomes `migrations/0001_init.sq
 
 ## 5. Open items for sibling docs
 
-- Exact rendering of `conversations.pending_fields` into a batched SMS question, and the literal Pub/Sub message shapes that reference these rows → `agent-contracts.md`.
+- ~~Exact rendering of `conversations.pending_fields` into a batched SMS question, and the literal Pub/Sub message shapes that reference these rows~~ → done, see `agent-contracts.md` §1, §3.2.
 - `capacity_snapshots` is written by `dispatcher-svc` once per user per day (`UNIQUE (user_id, date)` enforces one row) — the exact computation producing `free_minutes` / `largest_contiguous_block` / `fragmentation_index` / `load_delta` is `capacity-engine.md`'s job, not this doc's.
 - Service account roles that map to the write-access matrix in `overview.md` §3 (who gets `INSERT`/`UPDATE` on which table, concretely) → `infrastructure.md`.

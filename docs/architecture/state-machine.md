@@ -184,6 +184,6 @@ Forwarding in steps 1–2 is a synchronous internal call (Cloud Run service-to-s
 
 ## 5. Open items for sibling docs
 
-- Exact `conversations.pending_fields` shape and how a batched multi-field question is rendered → `agent-contracts.md`.
+- ~~Exact `conversations.pending_fields` shape and how a batched multi-field question is rendered~~ → done, see `agent-contracts.md` §3.2.
 - ~~Whether `dead_letters.payload_ref` points to GCS or is inlined for small payloads~~ → resolved, inline `jsonb`, see `data-model.md` §2.3.
 - ~~`dormant_until` reuse (§2.2) needs to land in `data-model.md`'s column documentation~~ → done, see `data-model.md` §2 comment + §3.
