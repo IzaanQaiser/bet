@@ -16,6 +16,8 @@ __pycache__/
 *.tfstate
 *.tfstate.*
 *.auto.tfvars
+tfplan
+*.tfplan
 
 # OS / editor
 .DS_Store
