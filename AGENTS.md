@@ -2,6 +2,8 @@
 
 Product requirements live in docs/product/prd.md — read it at the start of every session, it is the source of truth for scope, non-negotiables, and build order.
 
+Current build progress lives in docs/product/status.md — read it right after the PRD to know which build-order step is active without inferring it from git log. Update it whenever a step completes, starts, or gets blocked; keep it short.
+
 Architecture is being documented incrementally in docs/architecture/, one document at a time. Current state:
 - docs/architecture/overview.md — service topology, write-access boundaries, data flow (done)
 - docs/architecture/state-machine.md — item and latent lifecycle, transition rules, failure handling (done)
