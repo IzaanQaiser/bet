@@ -46,9 +46,9 @@ Every Pub/Sub grant above is bound **at the topic or subscription resource**, no
 
 ### 2.2 Postgres roles (table-level GRANTs)
 
-One Postgres role per service, matching `overview.md` §3 as closely as table-level grants allow:
+One Postgres role per service, matching `overview.md` §3 as closely as table-level grants allow. **Naming note:** the illustrative names below (`app_ingest` etc.) are shorthand for this table — the real Postgres roles are the IAM database users `infra/cloud_sql.tf` actually creates, named after each service account's email (e.g. `sa-ingest@obligation-engine-hack.iam`). The literal `GRANT` statements live in `migrations/0001_init.sql`, applied in step 2, since they need these tables to exist first.
 
-| Postgres role | Tables |
+| Postgres role (shorthand) | Tables |
 |---|---|
 | `app_ingest` | `INSERT` on `items` · `SELECT` on `items`, `conversations`, `suggestions` (routing check, `data-model.md` §2.5) |
 | `app_resolver` | `SELECT, UPDATE` on `items` · `SELECT, INSERT, UPDATE` on `conversations` · `SELECT, INSERT` on `item_embeddings` |
@@ -56,6 +56,8 @@ One Postgres role per service, matching `overview.md` §3 as closely as table-le
 | `app_dispatcher` | `SELECT` on `items`, `obligations` · `UPDATE` on `obligations` (`reminder_sent_at`) · `SELECT, INSERT` on `capacity_snapshots` · `SELECT, INSERT, UPDATE` on `suggestions` · `SELECT, UPDATE` on `latents` |
 
 `sa-extractor` has no Postgres role because it has no Cloud SQL binding at all (§2.1) — there's nothing to grant.
+
+**Migration/admin bootstrap — decided during step 2, not originally specified here.** None of the four service IAM database users can run DDL: Postgres 15 revokes `CREATE` on the public schema by default, and Cloud SQL does **not** auto-grant `cloudsqlsuperuser` to IAM database users (verified empirically before assuming either way — see `docs/product/status.md` history). `infra/service_accounts.tf` adds one more IAM database user for the developer's own Google identity, granted `cloudsqlsuperuser` via a one-time bootstrap through the built-in `postgres` user (its password is set, used once, then immediately rotated to an unretained random value — nobody holds it going forward, and it can always be reset again via `gcloud sql users set-password` if ever needed). Migrations run as the developer's IAM identity through the Cloud SQL Auth Proxy, not as any service account.
 
 ---
 

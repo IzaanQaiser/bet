@@ -1,0 +1,56 @@
+"""Pub/Sub message schemas — the literal source of truth for the topic
+contracts described in docs/architecture/agent-contracts.md §1. If this file
+and that doc ever disagree, this file is buggy, not the doc."""
+
+from datetime import datetime
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+class RawItemMessage(BaseModel):
+    """items.raw — published by ingest-svc."""
+
+    item_id: UUID
+    user_id: UUID
+    media_uri: str | None = None  # GCS URI, null if text-only
+    mime_type: str | None = None  # null if text-only
+    text: str | None = None  # the SMS body, if any
+    received_at: datetime
+
+
+class ExtractedItemMessage(BaseModel):
+    """items.extracted — published by extractor-svc."""
+
+    item_id: UUID
+    user_id: UUID
+    type: Literal["obligation", "latent"]
+    title: str
+    summary: str
+    due_at: datetime | None
+    effort_minutes: Literal[15, 30, 60, 120, 240]
+    focus_depth: Literal["shallow", "deep"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    missing_fields: list[str]
+    reasoning: str  # log-only, never shown to the user
+
+
+class ConfirmedItemMessage(BaseModel):
+    """items.confirmed — published by resolver-svc (normal path) or
+    dispatcher-svc (accepted-suggestion path, state-machine.md §2.3).
+
+    due_at/action_type/email_draft are Optional, not required: a latent
+    flows through this same message shape and legitimately has none of
+    them. See agent-contracts.md §1's "Resolved bug" note.
+    """
+
+    item_id: UUID
+    user_id: UUID
+    type: Literal["obligation", "latent"]
+    title: str
+    summary: str
+    due_at: datetime | None = None
+    effort_minutes: Literal[15, 30, 60, 120, 240]
+    action_type: Literal["calendar", "email"] | None = None
+    email_draft: str | None = None

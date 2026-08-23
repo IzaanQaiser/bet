@@ -1,0 +1,25 @@
+[project]
+name = "obligation-engine"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+# services/* joins this list starting step 3, when the first service exists.
+members = ["shared"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.16", "obligation-engine-shared"]
+
+[tool.uv.sources]
+obligation-engine-shared = { workspace = true }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
