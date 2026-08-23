@@ -14,13 +14,13 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**Step 1 done. Next: Step 2 — DB schema + shared package.**
+**Steps 1-2 done. Next: Step 3 — `ingest-svc` + real Twilio number.**
 
 | Step | Status |
 |---|---|
 | **Phase A — Foundation** | |
 | 1. Infra skeleton (Terraform) | **Done** — applied to `obligation-engine-hack`, all acceptance criteria verified (idempotent, IAM scoping confirmed, resource inventory confirmed) |
-| 2. DB schema + shared package | Not started |
+| 2. DB schema + shared package | **Done** — migration applied, all 11 tests pass (8 unit + 3 integration, run for real against live Cloud SQL) |
 | 3. `ingest-svc` + real Twilio number | Not started |
 | **Phase B — Core pipeline (auto-confirm stub)** | |
 | 4. `extractor-svc` | Not started |
@@ -57,8 +57,11 @@ None.
 
 ## Notes for the next session
 
-- `infra/` now exists with step 1's Terraform. Once billing + project ID are sorted: `terraform init`, `terraform plan -var="project_id=<id>"`, `terraform apply -var="project_id=<id>"`.
-- `services/`, `shared/`, `migrations/` per `docs/engineering/conventions.md` still don't exist — those start at step 2.
+- Local toolchain: `uv`, `ruff`, `psql` (via `libpq`), `cloud-sql-proxy` all installed (`$HOME/.local/bin` and `/opt/homebrew/opt/libpq/bin` added to PATH in `~/.zshrc`).
+- `migrations/0001_init.sql` applied to the real `obligation_engine` database (schema + table-level GRANTs for the four service IAM users). `shared/obligation_engine_shared` (schemas, db, pubsub helpers) built and tested — `uv run pytest shared/tests/` passes 11/11 when a Cloud SQL Auth Proxy is running (`DB_USER`, `DB_HOST`, `DB_PORT`, `GCP_PROJECT_ID`, `CLOUD_SQL_INSTANCE` env vars — see `shared/tests/test_migration.py` docstring); the 3 integration tests skip cleanly without it.
+- Real finding worth knowing: Cloud SQL's `cloudsqlsuperuser` role does **not** include `CREATEDB` — scratch-database create/drop for tests goes through `gcloud sql databases`, not raw SQL. Documented in `infrastructure.md` §2.2 and the test file itself.
+- Migration/admin access: run as the developer's own IAM identity (`waslyrideshare@gmail.com`, granted `cloudsqlsuperuser`) through the proxy — never as any of the four service accounts. See `infrastructure.md` §2.2's "Migration/admin bootstrap" note.
+- `services/` per `docs/engineering/conventions.md` still doesn't exist — starts at step 3.
 - Every step now has full acceptance criteria and named unit/integration/manual tests in `docs/engineering/test-plan.md` — read that step's section before starting it, and don't consider a step done until its tests pass, not just its code.
 - Onboarding (PRD §10) is deliberately not in the critical path — bootstrap the single demo user's OAuth token and `users` row manually (see PRD §14's scope note) rather than building the real SMS onboarding flow. That flow only happens in step 19, if time allows.
 - Demo needs seeded/backdated data (`docs/product/prd.md` §13, "Demo data note" + step 16) — don't leave this until step 17.

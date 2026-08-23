@@ -31,3 +31,16 @@ resource "google_service_account" "dispatcher" {
   display_name = "dispatcher-svc"
   depends_on   = [google_project_service.apis]
 }
+
+# Developer's own IAM identity, granted cloudsqlsuperuser for running
+# migrations. Deliberate addition beyond docs/architecture/infrastructure.md's
+# original service-account list: none of the four service-account Postgres
+# users have schema-creation rights (Postgres 15 revokes CREATE on the public
+# schema by default), and the built-in `postgres` user has no password set.
+# IAM auth as the developer avoids managing a separate admin password/secret.
+
+resource "google_sql_user" "developer_admin" {
+  name     = "waslyrideshare@gmail.com"
+  instance = google_sql_database_instance.main.name
+  type     = "CLOUD_IAM_USER"
+}
