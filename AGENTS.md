@@ -35,3 +35,13 @@ Conventional Commits: `<type>(<scope>): <summary>`.
 - Only create commits when asked to.
 
 This matches the pattern already used across the `chore(docs): ...` commits in this repo's history — keep using it once implementation starts (`feat(extractor-svc): ...`, `fix(resolver-svc): ...`, etc.).
+
+## Manual steps outside my control
+
+Some build steps need something only the user can do — a GCP Console click, a Twilio signup or phone number purchase, an OAuth consent screen field, billing enablement, anything behind a browser login I don't have. When a step needs one of these:
+
+- Flag it **before** starting the step, not mid-implementation after hitting a wall.
+- Give it as a **numbered, atomic checklist** — one explicit action per step (one click, one field, one command run in *their* terminal), never a bundled instruction like "set up Twilio" or "configure OAuth."
+- Name the exact screen/field/button, not a general area to go find it in.
+- State what the user should have afterward (a value to paste back, a confirmation screen) so it's obvious when that step is actually done.
+- Never guess or fabricate a value (project ID, phone number, token) the user hasn't given — ask for it and wait.
