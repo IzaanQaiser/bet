@@ -47,7 +47,7 @@ CREATE TABLE items (
     raw_media_uri  text,                     -- GCS URI, null for text-only
     ingested_at    timestamptz NOT NULL DEFAULT now(),
 
-    type           text NOT NULL CHECK (type IN ('obligation', 'latent')),
+    type           text CHECK (type IN ('obligation', 'latent')),   -- nullable: unknown until EXTRACTED (see §2.6)
     state          text NOT NULL CHECK (state IN (
                        'RECEIVED', 'EXTRACTED', 'DUPLICATE_SUSPECTED',
                        'CLARIFYING', 'NEEDS_REVIEW', 'AWAITING_CONFIRMATION',
@@ -163,6 +163,10 @@ Fixed here: `resolved_fields` holds obligation-specific values resolved during t
 
 `title`/`summary`/`effort_minutes`/`focus_depth`/`confidence` don't have this problem — they're already columns on `items`, and `resolver-svc` has `UPDATE` on `items` (`infrastructure.md` §2.2), so those get written straight there as they're resolved.
 
+### 2.6 `items.type` — made nullable (migration 0002)
+
+**Resolved bug, found while implementing `ingest-svc` (build step 3).** `type` was originally `NOT NULL` — wrong: `ingest-svc` writes the `RECEIVED` row before any extraction has happened, and whether an item is an `obligation` or a `latent` is exactly what `extractor-svc` determines (`state-machine.md` §1, `RECEIVED → EXTRACTED`). There is no legitimate value `ingest-svc` could put there. `migrations/0001_init.sql` is left as applied (forward-only, `docs/engineering/conventions.md`); `migrations/0002_items_type_nullable.sql` drops the `NOT NULL`. The `CHECK (type IN (...))` constraint is untouched and still correct — Postgres treats a `NULL` as satisfying a `CHECK`, so this required no other change.
+
 ### 2.5 `conversations.state` — removed from the PRD sketch
 
 The PRD sketch lists a `state` column on `conversations`. Dropped here: it would duplicate `items.state`, which already distinguishes `CLARIFYING` from `AWAITING_CONFIRMATION` for the same item, and two columns tracking the same fact is a drift risk (which one does `resolver-svc` trust if they ever disagree?). "Is this conversation open" is answered by joining to `items.state IN ('CLARIFYING', 'AWAITING_CONFIRMATION')` — a two-table join on indexed columns (`conversations.user_id`, `items` primary key), cheap enough at this scale. `items.state` remains the single source of truth for pipeline position, full stop.
@@ -180,6 +184,7 @@ The PRD is intentionally a first-pass sketch, not the canonical schema — this 
 | `conversations` has no field for resolved-but-uncommitted obligation data (`due_at` etc.) | Added `resolved_fields jsonb` | §2.4 — nowhere else to stage it before commit |
 | `suggestions` has no `user_id` | Added, denormalized | §2.2 — hot-path routing query needs it join-free |
 | `latents` has no explicit snooze column | `dormant_until` reused for snooze, not a new column | `state-machine.md` §2.2 — one column, two callers, documented here per that doc's own note |
+| `items.type` was `NOT NULL` | Made nullable (migration 0002) | §2.6 — unknown until `EXTRACTED`, `ingest-svc` has no legitimate value to write |
 
 ---
 

@@ -32,7 +32,8 @@ pytestmark = pytest.mark.skipif(
     reason="requires a live Cloud SQL Auth Proxy connection — see module docstring",
 )
 
-MIGRATION_SQL = (Path(__file__).parents[2] / "migrations" / "0001_init.sql").read_text()
+MIGRATIONS_DIR = Path(__file__).parents[2] / "migrations"
+MIGRATION_FILES = sorted(MIGRATIONS_DIR.glob("*.sql"))  # applied in order, matching scripts/migrate.sh
 
 EXPECTED_TABLES = {
     "users",
@@ -100,7 +101,8 @@ def scratch_db():
 
 def test_migration_applies_cleanly(scratch_db):
     conn = _admin_connection(scratch_db)
-    conn.execute(MIGRATION_SQL)
+    for f in MIGRATION_FILES:
+        conn.execute(f.read_text())
     conn.close()
 
 
