@@ -8,7 +8,9 @@ Architecture is being documented incrementally in docs/architecture/, one docume
 - docs/architecture/data-model.md — schema, indexes, migration strategy (done)
 - docs/architecture/capacity-engine.md — snapshot computation and scoring, worked examples (done)
 - docs/architecture/agent-contracts.md — exact I/O schemas and prompts for Extractor, Resolver, Dispatcher (done)
-- infrastructure.md — not yet written
+- docs/architecture/infrastructure.md — GCP resource inventory, IAM bindings, IaC structure (done)
+
+The architecture doc set is complete. Work moving forward is implementation, governed by docs/engineering/conventions.md.
 
 Do not invent architectural decisions that are not documented. If a sibling architecture doc doesn't exist yet, flag the gap rather than filling it in ad hoc.
 

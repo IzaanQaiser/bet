@@ -240,5 +240,5 @@ Per `state-machine.md` §2.3: on `"Y"` to a suggestion, `dispatcher-svc` constru
 
 ## 5. Open items for sibling docs
 
-- ADK project/location/model-version environment configuration, and the Vertex AI service account each of `extractor-svc`/`resolver-svc` runs under → `infrastructure.md`.
+- ~~ADK project/location/model-version environment configuration, and the Vertex AI service account each of `extractor-svc`/`resolver-svc` runs under~~ → done, see `infrastructure.md` §3.
 - Gemini call retry/timeout policy (a Gemini 5xx or timeout during extraction or clarification is a **technical failure**, per `state-machine.md` §3 — routed to the normal Pub/Sub retry/DLQ path, not a special case) → nothing further needed here, just confirming it's covered by the existing failure-handling doc, not a new mechanism.

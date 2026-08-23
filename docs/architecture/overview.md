@@ -8,7 +8,7 @@ Sibling docs (written one at a time, in this order):
 3. `data-model.md` — schema, indexes, migration strategy (done)
 4. `capacity-engine.md` — snapshot computation and scoring, worked examples (done)
 5. `agent-contracts.md` — exact I/O schemas and prompts for Extractor, Resolver, Dispatcher (done)
-6. `infrastructure.md` — GCP resource inventory, IAM bindings, IaC structure
+6. `infrastructure.md` — GCP resource inventory, IAM bindings, IaC structure (done)
 
 Until a sibling doc exists, do not invent its content to unblock implementation — flag the gap instead (per `AGENTS.md`).
 
@@ -83,7 +83,7 @@ flowchart TB
 | `ingest-svc` | Validate Twilio webhook signature, persist media to GCS, publish raw item to `items.raw`. No LLM calls. | Twilio webhook (sync HTTP) |
 | `extractor-svc` | Consume `items.raw`, call Gemini 3.5 Flash with strict schema, publish to `items.extracted`. | Pub/Sub push |
 | `resolver-svc` | Consume `items.extracted`, run dedupe + clarification + confirmation over SMS, hold `conversations` state, publish to `items.confirmed`. | Pub/Sub push + Twilio inbound SMS webhook (a conversation spans multiple inbound messages) |
-| `committer-svc` | Consume `items.confirmed`, write to Calendar (and Gmail, stretch), mark item `COMMITTED`. | Pub/Sub push |
+| `committer-svc` | Consume `items.confirmed`, write to Calendar (and Gmail, stretch), mark item `COMMITTED`. Also the dead-letter writer: subscribes to all three `.dlq` topics and persists `dead_letters` rows (decision made in `infrastructure.md` §2.1 — reuses this service rather than standing up a sixth one). | Pub/Sub push |
 | `dispatcher-svc` | Compute capacity snapshots, fire deadline reminders, score latents, send at most one suggestion. | Cloud Scheduler (cron) + manual trigger endpoint for demo/judging |
 
 `ingest-svc` is the single Twilio-facing webhook — Twilio supports one messaging webhook per number, so every inbound SMS, whether a brand-new item or a reply mid-conversation, lands there first. `ingest-svc` does a cheap routing check (open `conversations` row for this user → forward to `resolver-svc`; else a pending, unanswered `suggestions` row → forward to `dispatcher-svc`; else treat as a new item and publish to `items.raw`) via a synchronous internal call authenticated by Cloud Run service-to-service IAM, not a public route. Full routing precedence and reply semantics are in `docs/architecture/state-machine.md`. This is the one asymmetry in an otherwise uniform "topic in, topic out" topology — `ingest-svc` sometimes calls a downstream service directly instead of only publishing.
@@ -99,7 +99,7 @@ This table is the security story. Enforced via per-service service accounts and 
 | `ingest-svc` | Twilio payload | GCS (media), `items.raw` topic | none | none |
 | `extractor-svc` | `items.raw` | `items.extracted` topic | Gemini (generate) | **none** |
 | `resolver-svc` | `items.extracted`, `items` (own conversation), `item_embeddings` | `items` (state `CLARIFYING`/`CONFIRMED`), `conversations`, `item_embeddings`, `items.confirmed` topic, Twilio (outbound SMS) | Gemini (generate), embeddings | **none** |
-| `committer-svc` | `items.confirmed` | `items` (state `COMMITTED`), `obligations` | none | Calendar (write), Gmail (send, stretch only) |
+| `committer-svc` | `items.confirmed`, `items.raw.dlq`, `items.extracted.dlq`, `items.confirmed.dlq` | `items` (state `COMMITTED`), `obligations`, `latents`, `dead_letters` | none | Calendar (write), Gmail (send, stretch only) |
 | `dispatcher-svc` | `items`, `latents`, `capacity_snapshots`, `suggestions` | `capacity_snapshots`, `suggestions`, `latents` (surface metadata only), Twilio (outbound SMS), `items.confirmed` topic (publish, and only after parsing an explicit accept reply to a suggestion — same confirm-before-write rule as `resolver-svc`, see ADR 0003) | none | Calendar (read only) |
 
 Read this table top to bottom and confirm: **no service that touches untrusted user input (`ingest-svc`, `extractor-svc`) holds any external write credential.** The only services with Calendar/Gmail write scope (`committer-svc`) or Calendar read scope (`dispatcher-svc`) never see raw user input directly — they only consume already-confirmed, already-structured state.
@@ -146,5 +146,5 @@ Flagging rather than deciding here, per `AGENTS.md`:
 - ~~Exact Pub/Sub message schemas per topic~~ → done, see `agent-contracts.md` §1
 - ~~`conversations` state machine detail (how clarification exchanges are counted, batched, and exhausted)~~ → done, see `state-machine.md`
 - ~~Capacity snapshot computation detail and worked numeric examples~~ → done, see `capacity-engine.md`
-- Terraform/gcloud resource list, service account names, exact IAM role bindings → `infrastructure.md`
-- Local dev story (Pub/Sub emulator, Cloud SQL proxy) → `infrastructure.md`
+- ~~Terraform/gcloud resource list, service account names, exact IAM role bindings~~ → done, see `infrastructure.md` §1–§2, §6.
+- ~~Local dev story (Pub/Sub emulator, Cloud SQL proxy)~~ → done, see `infrastructure.md` §7.

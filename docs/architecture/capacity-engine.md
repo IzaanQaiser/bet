@@ -198,4 +198,4 @@ Reproduces the exact suggestion text from PRD §5.3, with real numbers, so this 
 ## 8. Open items for sibling docs
 
 - ~~Exact SMS rendering of the suggestion and evidence line (including the "lightest day" fallback wording from §6)~~ → done, see `agent-contracts.md` §4.2.
-- Which service account runs the Calendar read for the 14-day trailing window vs. the 7-day forward window — same `dispatcher-svc` credential per `overview.md` §3, just noting both reads happen in one run → nothing further needed, but `infrastructure.md` should confirm the Calendar API quota this implies (21 days of events, once or twice daily, times user count).
+- ~~Which service account runs the Calendar read... `infrastructure.md` should confirm the Calendar API quota this implies~~ → done, see `infrastructure.md` §4 (default quota comfortably covers this).
