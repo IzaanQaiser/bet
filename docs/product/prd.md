@@ -409,22 +409,46 @@ If a Veo cold-open is used, it must be clearly stylised and confined to 0:00–0
 
 ## 14. Build order
 
-Strict. Do not work ahead.
+Strict. Do not work ahead. Each step below is scoped to one service, one well-isolated concern, or one pure-logic module — small enough that a single session can hold the relevant doc(s) plus the code in context at once, without needing the whole six-doc architecture set loaded every time. **Reads** names the minimal doc set for that step; don't read more than that going in. **Done when** is the concrete, checkable signal that the step is actually finished — not "looks right," something you can verify.
 
-1. **Skeleton** — Twilio → Cloud Run → echo. Proves the loop.
-2. **Ingest → extract → commit**, text only, no clarification, no dedupe. First calendar event written.
-3. **Capacity engine + dispatcher.** ← the thing that must exist
-4. Multimodal (image, PDF)
-5. Confirmation + clarification loop
-6. Dedupe via embeddings
-7. DLQ + error handling
-8. Feedback loop / dismissal scoring
-9. Email draft + send action (stretch)
-10. Record demo
-11. README, diagram, write-up
-12. Bonus: blog, social, Veo, Lyria
+**Deliberate scope call, not an oversight:** PRD §10 (onboarding — bot texts an OAuth link, asks timezone/working hours) has no step below. For the single demo user, bootstrap manually — a refresh token minted once via the OAuth flow directly, dropped into Secret Manager, one `users` row inserted by hand. The real SMS-driven onboarding flow is bonus-tier (folds into step 19 if time allows); judges need to see the core loop, not account creation.
 
-**Record the demo before the last day.** A broken demo on 31 Aug with working code is a zero.
+### Phase A — Foundation
+
+1. **Infra skeleton.** Terraform: project APIs, Pub/Sub topics + DLQs, Cloud SQL instance (empty), GCS bucket, Artifact Registry, Secret Manager placeholders, service accounts. *Reads:* `infrastructure.md` §1, §2.1, §6. *Done when:* `terraform apply` succeeds and every resource is visible via `gcloud`.
+2. **DB schema + shared package.** Apply the migration from `data-model.md`'s DDL (including the `resolved_fields` fix). Build `shared/obligation_engine_shared`: Pydantic schemas from `agent-contracts.md` §1, `db.py`, `pubsub.py`. *Reads:* `data-model.md`, `agent-contracts.md` §1, `engineering/conventions.md`. *Done when:* migration applies cleanly; the shared package is importable from a throwaway script.
+3. **`ingest-svc` + real Twilio number.** Webhook signature validation, `INSERT` into `items` (state `RECEIVED`), publish `items.raw`, text-only (no media yet). Deployed, wired to a real Twilio number. *Reads:* `overview.md` (ingest-svc row), `state-machine.md` (`RECEIVED` only), `infrastructure.md` (`sa-ingest`). *Done when:* texting the number creates an `items` row and a message lands on `items.raw`.
+
+### Phase B — Core pipeline (auto-confirm stub, no gate yet)
+
+4. **`extractor-svc`.** Consume `items.raw`, Gemini call via ADK (prompt + schema from `agent-contracts.md` §2), publish `items.extracted`. Text-only. *Reads:* `agent-contracts.md` §0, §2; `overview.md` (extractor-svc row); `infrastructure.md` (`sa-extractor`). *Done when:* a text item reaches `EXTRACTED` with correct fields, traceable by `item_id` in Cloud Logging.
+5. **`resolver-svc` stub — temporary.** Consumes `items.extracted`, skips dedupe/clarify/confirm entirely, auto-publishes `items.confirmed`. **This deliberately violates confirm-before-write (ADR 0003) on purpose, only to prove the pipe end to end — step 9 replaces it with the real gate before this is ever demoed.** *Reads:* `state-machine.md` §1 (just the happy path), `agent-contracts.md` §1. *Done when:* an extracted item reaches `items.confirmed` untouched by a human.
+6. **`committer-svc`.** Consume `items.confirmed`, branch on `type` (obligation → Calendar write; latent → no external write), `INSERT` `obligations`/`latents`, mark `COMMITTED`. Uses the manually-bootstrapped OAuth token from §14's scope note above. *Reads:* `state-machine.md` §1.5; `agent-contracts.md` §1; `data-model.md` (`obligations`/`latents`); `infrastructure.md` (`sa-committer`). *Done when:* texting an obligation produces a real Google Calendar event.
+
+### Phase C — The differentiator
+
+7. **Capacity engine, pure functions only.** `free_intervals`, snapshot metrics, `block_fit`/`depth_fit`/`load_fit`, `revival_score` — exactly as specified, no service, no deploy. *Reads:* `capacity-engine.md` (self-contained). *Done when:* unit tests reproduce the worked example's exact numbers (`fit_score = 0.875`, `revival_score ≈ 0.633`).
+8. **`dispatcher-svc`.** Cloud Scheduler jobs, Calendar read (7-day forward + 14-day trailing), wire step 7's functions to real data, write `capacity_snapshots`, send reminders + at most one suggestion (templates from `agent-contracts.md` §4), manual trigger endpoint. *Reads:* `agent-contracts.md` §4; `overview.md` (dispatcher row); `infrastructure.md` (`sa-dispatcher`, §5). *Done when:* manually triggering `/dispatch` against a real calendar produces a correctly-worded SMS.
+
+### Phase D — Trust and quality features
+
+9. **Real `resolver-svc` — confirmation.** Replace step 5's stub with the actual `AWAITING_CONFIRMATION` ↔ `CONFIRMED`/`CANCELLED` gate — confirmation card, Y/N/correction parsing. Clarification still stubbed (next step). *Reads:* `state-machine.md` §1.2, §1.4; `agent-contracts.md` §3.3, §4.3. *Done when:* a complete item now requires a real `Y` before it commits; `N` cancels.
+10. **Real `resolver-svc` — clarification loop.** The Gemini clarification call, `conversations.resolved_fields` staging, exchange counting, `CLARIFYING`/`NEEDS_REVIEW`. *Reads:* `state-machine.md` §1.2, §1.3; `agent-contracts.md` §3.2; `data-model.md` §2.4. *Done when:* an incomplete item gets a real clarifying question; 3 unresolved exchanges lands `NEEDS_REVIEW`.
+11. **Multimodal ingest.** Extend `ingest-svc` (media → GCS) and `extractor-svc` (image/PDF bytes to Gemini). *Reads:* `overview.md` (media path); `agent-contracts.md` §2. *Done when:* a photographed note extracts correctly.
+12. **Dedupe via embeddings.** `dedupe_hash` prefilter, `text-embedding-004` call, `item_embeddings`, `DUPLICATE_SUSPECTED`, thread-attach offer. *Reads:* `state-machine.md` §1.1; `data-model.md` §2.1; `agent-contracts.md` §3.1. *Done when:* a near-duplicate item triggers "is this the same as X?".
+
+### Phase E — Resilience and polish
+
+13. **DLQ + error handling.** Dead-letter config on every subscription; `committer-svc`'s dead-letter-writer subscriptions. *Reads:* `overview.md` §4; `state-machine.md` §3; `infrastructure.md` §2.1. *Done when:* forcing a failure produces a `dead_letters` row, and manual replay works.
+14. **Feedback loop / dismissal scoring.** Suggestion outcomes recorded, `dismissal_count`/`dormant_until` updates. ~20 lines. *Reads:* `state-machine.md` §2.2; `capacity-engine.md` §5. *Done when:* two dismissals correctly produce a 30-day dormancy (verify by manipulating timestamps, don't wait).
+15. **Email draft + send action (stretch).** Spec the drafting mechanism first — flagged open in `agent-contracts.md` §3.2 — then implement: extends the Extractor schema/prompt and `committer-svc`'s Gmail branch. *Reads:* ADR 0008; `agent-contracts.md`'s open-gap note. *Done when:* an email-type obligation drafts, confirms, and sends.
+
+### Phase F — Ship
+
+16. **Seed demo data script.** Backdated latent + synthetic `capacity_snapshots` history, per the demo data note above. *Done when:* a realistic suggestion fires on demand, not by chance.
+17. **Record demo.** Before the last day — a broken demo on 31 Aug with working code is a zero.
+18. **README, diagram export, write-up.**
+19. **Bonus:** blog, social, Veo, Lyria, and real SMS onboarding if time remains.
 
 ---
 
