@@ -4,8 +4,8 @@ Canonical, implementation-grade architecture for the Capacity-Aware Obligation E
 
 Sibling docs (written one at a time, in this order):
 1. **`overview.md`** (this doc) — service topology, write-access boundaries, data flow
-2. `state-machine.md` — item and latent lifecycle, transition rules, failure handling
-3. `data-model.md` — schema, indexes, migration strategy
+2. `state-machine.md` — item and latent lifecycle, transition rules, failure handling (done)
+3. `data-model.md` — schema, indexes, migration strategy (done)
 4. `capacity-engine.md` — snapshot computation and scoring, worked examples
 5. `agent-contracts.md` — exact I/O schemas and prompts for Extractor, Resolver, Dispatcher
 6. `infrastructure.md` — GCP resource inventory, IAM bindings, IaC structure
