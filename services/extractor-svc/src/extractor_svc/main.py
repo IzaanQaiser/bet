@@ -26,6 +26,7 @@ import json
 import logging
 import os
 from typing import Literal
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from google.adk.agents import LlmAgent
@@ -37,6 +38,7 @@ from obligation_engine_shared.pubsub import decode_push_envelope, publish
 from obligation_engine_shared.schemas import ExtractedItemMessage, RawItemMessage
 from pydantic import BaseModel, Field
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("extractor_svc")
 app = FastAPI()
 
@@ -127,6 +129,17 @@ _agent = LlmAgent(
     model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
     instruction=_SYSTEM_PROMPT,
     output_schema=_ExtractionResult,
+    # Latency fix (same finding as resolver-svc/conversation.py, same root
+    # cause): Gemini 3.5 Flash's default AUTOMATIC thinking budget spent
+    # real, highly variable time deliberating before producing structured
+    # output — not needed for a well-specified extraction schema with this
+    # explicit a rule set. Verified against real Vertex AI before shipping:
+    # default averaged ~4.5s/call across 5 varied cases (chat/obligation/
+    # latent/email/ambiguous-date), thinking_budget=0 averaged ~2.5s, with
+    # equivalent classification quality on every case.
+    generate_content_config=types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_budget=0)
+    ),
 )
 _session_service = InMemorySessionService()
 
@@ -139,7 +152,18 @@ def _download_media(media_uri: str) -> bytes:
 
 
 async def _extract(raw: RawItemMessage) -> _ExtractionResult:
-    session_id = str(raw.item_id)
+    # Real bug, found live: a bare item_id as session_id is deterministic,
+    # so two in-flight handlers for the same item (a genuine Pub/Sub
+    # redelivery racing the still-in-progress first attempt — at-least-once
+    # delivery, not hypothetical) collide on ADK's InMemorySessionService
+    # and both crash with AlreadyExistsError. Worse than a wasted retry:
+    # every subsequent redelivery collides against whatever the first
+    # attempt already created too, so one transient failure can crash-loop
+    # an item straight through all 5 delivery attempts to items-raw-dlq.
+    # resolver-svc's conversation.py already uses this exact unique-suffix
+    # pattern for the same reason (its own module docstring, step 13) —
+    # extractor-svc never got the equivalent fix until this was found.
+    session_id = f"{raw.item_id}-{uuid4().hex[:8]}"
     await _session_service.create_session(
         app_name="extractor", user_id=str(raw.user_id), session_id=session_id
     )

@@ -81,6 +81,7 @@ actually finishes), so its existence is the one true completion signal.
 
 import logging
 import os
+import time
 from datetime import UTC, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -107,6 +108,7 @@ from resolver_svc.dedupe import (
 )
 from resolver_svc.templates import render_needs_review
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("resolver_svc")
 app = FastAPI()
 
@@ -131,10 +133,18 @@ def _send_sms(user_id, to: str, body: str) -> None:
     mid-way through — the SMS really was sent regardless of what the
     caller's transaction later does, so the log entry shouldn't be tied to
     its commit/rollback."""
+    _t0 = time.monotonic()
     _twilio_client().messages.create(to=to, from_=TWILIO_FROM_NUMBER, body=body)
+    _t1 = time.monotonic()
     with get_connection() as log_conn:
+        _t2 = time.monotonic()
         log_message(log_conn, user_id, "out", body)
         log_conn.commit()
+    _t3 = time.monotonic()
+    logger.info(
+        "TIMING _send_sms: twilio_send=%.2fs get_connection=%.2fs log_and_commit=%.2fs total=%.2fs",
+        _t1 - _t0, _t2 - _t1, _t3 - _t2, _t3 - _t0,
+    )
 
 
 def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
@@ -827,8 +837,11 @@ async def _handle_confirmation_reply(
 
 @app.post("/reply")
 async def reply(payload: RoutedReplyMessage):
+    _req_t0 = time.monotonic()
     try:
         with get_connection() as conn:
+            _req_t1 = time.monotonic()
+            logger.info("TIMING /reply: get_connection=%.2fs", _req_t1 - _req_t0)
             item_row = conn.execute(
                 "SELECT type, title, summary, effort_minutes, state FROM items WHERE id = %s",
                 (str(payload.item_id),),
@@ -881,6 +894,8 @@ async def reply(payload: RoutedReplyMessage):
     except Exception:
         logger.exception("reply handling failed item_id=%s", payload.item_id)
         raise HTTPException(status_code=500, detail="reply handling failed") from None
+    finally:
+        logger.info("TIMING /reply: total=%.2fs", time.monotonic() - _req_t0)
 
 
 @app.get("/health")
