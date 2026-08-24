@@ -26,6 +26,30 @@ reply during AWAITING_CONFIRMATION (a reply that isn't Y/N/A) is still
 just logged, no action taken — it needs its own field-targeting
 heuristic (agent-contracts.md §3.2's "cheap heuristic" paragraph) that
 doesn't reuse the due_at-only clarification model cleanly.
+
+Step 13 adds an idempotency guard at the top of /pubsub/push — a real
+bug found in step 11's live testing: a concurrent Pub/Sub redelivery of
+the same items.extracted message during a slow cold start raced this
+handler and 500'd on ADK's InMemorySessionService (its deterministic
+session id isn't safe against two in-flight handlers for the same
+item). That crash happened to be harmless purely by luck — the winning
+request had already sent its SMS first — not because anything actually
+guarded against it.
+
+The guard checks for an existing `conversations` row, not `items.state`
+— an earlier draft checked state, and a second real bug (found
+verifying this step, not hypothetical) showed why that's wrong:
+`_write_item()` commits the state transition in its own transaction,
+separate from the later `conversations` INSERT. A genuine failure
+between those two writes (reproduced with a deliberately-bad user_id)
+left the item stuck at a post-RECEIVED state with no conversation ever
+created — a state-only guard would then swallow every future
+redelivery as "already done" forever, so the message never reaches 5
+delivery attempts and never reaches `dead_letters` at all, defeating
+the exact mechanism this step exists to build. The `conversations` row
+is only ever written as the last DB step of every success path
+(data-model.md §2.4: created unconditionally, the instant processing
+actually finishes), so its existence is the one true completion signal.
 """
 
 import logging
@@ -278,6 +302,32 @@ async def pubsub_push(request: Request):
     except Exception:
         logger.exception("malformed push envelope, could not decode ExtractedItemMessage")
         raise HTTPException(status_code=500, detail="malformed envelope") from None
+
+    with get_connection() as conn:
+        convo_exists = conn.execute(
+            "SELECT 1 FROM conversations WHERE item_id = %s LIMIT 1", (str(extracted.item_id),)
+        ).fetchone()
+    if convo_exists is not None:
+        # A concurrent redelivery of the same items.extracted message,
+        # arriving after the first delivery already finished — the real
+        # race found in step 11 (ADK's InMemorySession crashed on the
+        # second create_session() call, which happened to 500 before any
+        # visible harm, but that was luck, not a guard). Checked against
+        # the conversations row rather than items.state != 'RECEIVED':
+        # _write_item() commits the state transition in its own earlier
+        # transaction, separate from the conversations INSERT — a real
+        # failure found empirically verifying this step, where the
+        # conversations write itself failed (a bad user_id reference),
+        # left the item stuck at a post-RECEIVED state with the
+        # conversation never created. A state-only check would have
+        # swallowed every future redelivery as "already done" forever,
+        # silently defeating the dead-letter path this step exists to
+        # build. The conversations row is only ever written as the last
+        # DB step of every success path (data-model.md §2.4: created
+        # unconditionally, the moment resolver-svc actually finishes),
+        # so its existence is the one true completion signal.
+        logger.info("skipping already-processed item_id=%s (redelivery)", extracted.item_id)
+        return {"status": "already_processed", "item_id": str(extracted.item_id)}
 
     try:
         dedupe = _check_duplicate(extracted)
