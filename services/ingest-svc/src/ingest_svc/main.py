@@ -12,6 +12,16 @@ built yet; dispatcher-svc has no accept-path endpoint until the
 feedback-loop step, so that branch would have nothing to call. Not a
 silent gap: nothing sends a suggestion that could be replied to in this
 deployment's current state either, so it can't be hit for real yet.
+
+Step 11 adds MMS media handling (overview.md's media path): an
+image/PDF attachment is downloaded from Twilio, persisted to GCS, and
+its gs:// URI + MIME type carried on RawItemMessage for extractor-svc
+(agent-contracts.md §2 — "media bytes + MIME type + message text").
+Only the first attachment is handled if a message has more than one
+(PRD §5.1 — extraction always produces exactly one item per message
+regardless, so a second attachment has nowhere structured to go). An
+unsupported attachment type is rejected outright (400), not silently
+dropped, and creates no items row.
 """
 
 import os
@@ -21,6 +31,7 @@ from uuid import UUID, uuid4
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.cloud import storage
 from google.oauth2.id_token import fetch_id_token
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.pubsub import publish
@@ -28,6 +39,18 @@ from obligation_engine_shared.schemas import RawItemMessage
 from twilio.request_validator import RequestValidator
 
 app = FastAPI()
+
+GCS_MEDIA_BUCKET = "obligation-engine-hack-media"
+# PRD §1's "image, PDF, text" — the only three input modes this system
+# claims to support. Common camera/carrier MMS image formats, plus PDF
+# for scanned/forwarded documents.
+SUPPORTED_MEDIA_TYPES = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "application/pdf": "pdf",
+}
 
 
 def _public_url(request: Request) -> str:
@@ -80,6 +103,21 @@ def _forward_to_resolver(user_id: UUID, item_id: UUID, text: str) -> None:
     response.raise_for_status()
 
 
+def _store_media(item_id: UUID, media_url: str, content_type: str) -> str:
+    response = requests.get(
+        media_url,
+        auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]),
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    ext = SUPPORTED_MEDIA_TYPES[content_type]
+    blob_name = f"{item_id}.{ext}"
+    bucket = storage.Client().bucket(GCS_MEDIA_BUCKET)
+    bucket.blob(blob_name).upload_from_string(response.content, content_type=content_type)
+    return f"gs://{GCS_MEDIA_BUCKET}/{blob_name}"
+
+
 @app.post("/webhook/sms")
 async def sms_webhook(request: Request):
     form = dict(await request.form())
@@ -90,32 +128,46 @@ async def sms_webhook(request: Request):
         raise HTTPException(status_code=400, detail="missing From")
     text = form.get("Body")
 
-    item_id: UUID | None = None
+    num_media = int(form.get("NumMedia", "0") or "0")
+    content_type = form.get("MediaContentType0") if num_media > 0 else None
+    if content_type is not None and content_type not in SUPPORTED_MEDIA_TYPES:
+        raise HTTPException(status_code=400, detail=f"unsupported attachment type: {content_type}")
+
     with get_connection() as conn:
         user_id = _resolve_user_id(conn, from_number)
         open_item_id = _open_conversation_item_id(conn, user_id)
-        if open_item_id is None:
-            item_id = uuid4()
-            conn.execute(
-                """
-                INSERT INTO items (id, user_id, raw_channel, raw_media_uri, ingested_at, state)
-                VALUES (%s, %s, 'sms', NULL, now(), 'RECEIVED')
-                """,
-                (str(item_id), str(user_id)),
-            )
-            conn.commit()
 
     if open_item_id is not None:
         _forward_to_resolver(user_id, open_item_id, text or "")
         return {"status": "routed_to_resolver", "item_id": str(open_item_id)}
+
+    # Media downloaded/uploaded before any DB write, not after: if this
+    # fails, Twilio's retry starts clean with nothing written yet, rather
+    # than leaving an orphaned RECEIVED row with no media behind (a
+    # separate row per retry attempt, since item_id is freshly generated
+    # each time).
+    item_id = uuid4()
+    media_uri = None
+    if content_type is not None:
+        media_uri = _store_media(item_id, form["MediaUrl0"], content_type)
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO items (id, user_id, raw_channel, raw_media_uri, ingested_at, state)
+            VALUES (%s, %s, 'sms', %s, now(), 'RECEIVED')
+            """,
+            (str(item_id), str(user_id), media_uri),
+        )
+        conn.commit()
 
     publish(
         "items-raw",
         RawItemMessage(
             item_id=item_id,
             user_id=user_id,
-            media_uri=None,
-            mime_type=None,
+            media_uri=media_uri,
+            mime_type=content_type,
             text=text,
             received_at=datetime.now(UTC),
         ),

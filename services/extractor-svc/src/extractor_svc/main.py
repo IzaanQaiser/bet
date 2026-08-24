@@ -1,5 +1,7 @@
 """extractor-svc — raw multimodal input to structured JSON (docs/architecture/
-agent-contracts.md §2). Text-only per step 4's scope; media handling is step 11.
+agent-contracts.md §2). Step 11 adds real media handling: an image/PDF's
+gs:// URI on RawItemMessage gets downloaded and passed to Gemini as an
+inline Part alongside (or instead of) the SMS text.
 
 Zero DB access, zero Calendar/Gmail scope (ADR 0003) — this is the one service
 in the whole system that ever touches untrusted, unconfirmed user input, and
@@ -15,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.cloud import storage
 from google.genai import types
 from obligation_engine_shared.pubsub import decode_push_envelope, publish
 from obligation_engine_shared.schemas import ExtractedItemMessage, RawItemMessage
@@ -76,13 +79,25 @@ _agent = LlmAgent(
 _session_service = InMemorySessionService()
 
 
+def _download_media(media_uri: str) -> bytes:
+    if not media_uri.startswith("gs://"):
+        raise ValueError(f"unsupported media_uri scheme: {media_uri!r}")
+    bucket_name, _, blob_name = media_uri.removeprefix("gs://").partition("/")
+    return storage.Client().bucket(bucket_name).blob(blob_name).download_as_bytes()
+
+
 async def _extract(raw: RawItemMessage) -> _ExtractionResult:
     session_id = str(raw.item_id)
     await _session_service.create_session(
         app_name="extractor", user_id=str(raw.user_id), session_id=session_id
     )
     runner = Runner(app_name="extractor", agent=_agent, session_service=_session_service)
-    message = types.Content(role="user", parts=[types.Part(text=raw.text or "")])
+
+    parts = [types.Part(text=raw.text or "")]
+    if raw.media_uri:
+        media_bytes = _download_media(raw.media_uri)
+        parts.append(types.Part.from_bytes(data=media_bytes, mime_type=raw.mime_type))
+    message = types.Content(role="user", parts=parts)
 
     final_text = None
     async for event in runner.run_async(
