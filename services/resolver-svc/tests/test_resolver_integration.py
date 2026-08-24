@@ -1,10 +1,10 @@
 """Integration tests against the real dev Postgres (via the Cloud SQL Auth
-Proxy) + the real Pub/Sub emulator (for the Y-reply publish only) —
+Proxy) + the real Pub/Sub emulator (for the AFFIRM-reply publish only) —
 docs/engineering/test-plan.md steps 9 (confirmation) and 10
-(clarification). Twilio and the clarification Gemini call are both
-mocked (a real SMS confirm/cancel round trip and a real multi-turn
-clarification exchange are the required manual verifications, per the
-test plan).
+(clarification), now driven by Phase G step D's unified converse() call.
+Twilio and the conversation Gemini call are both mocked (a real SMS
+confirm/cancel round trip and a real multi-turn exchange are the required
+manual verifications, per the test plan).
 
 Requires PUBSUB_EMULATOR_HOST, GCP_PROJECT_ID, DB_USER, DB_HOST, DB_PORT.
 Skipped automatically otherwise.
@@ -19,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.schemas import ExtractedItemMessage
-from resolver_svc.clarification import ClarificationResult
+from resolver_svc.conversation import ConversationTurnResult
 from resolver_svc.dedupe import DedupeResult
 
 pytestmark = pytest.mark.skipif(
@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 # The real dedupe check (step 12) hits Vertex AI's embedding API — mocked
-# here to a guaranteed no-match, same as clarify() is mocked below, so
+# here to a guaranteed no-match, same as converse() is mocked below, so
 # these steps-9/10-scoped tests stay about what they're actually testing.
 # test_dedupe_integration.py covers the real dedupe path against real
 # Postgres/pgvector.
@@ -93,7 +93,14 @@ def test_conversations_row_created_on_zero_clarification_path(client, test_user)
         missing_fields=[],
         reasoning="Clear latent, no deadline.",
     )
-    with patch("resolver_svc.main._send_sms") as mock_sms, _no_duplicate:
+    with (
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
+        _no_duplicate,
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=[], reply_text="learn pottery, someday — sound good?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
     assert resp.status_code == 200
     mock_sms.assert_called_once()
@@ -148,9 +155,16 @@ def test_y_reply_publishes_confirmed(client, awaiting_confirmation_item, confirm
     item_id, user_id, _phone = awaiting_confirmation_item
     subscriber, sub_path = confirmed_subscription
 
-    resp = client.post(
-        "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "yes"}
-    )
+    with (
+        patch("resolver_svc.main.converse") as mock_converse,
+        patch("resolver_svc.main._send_sms"),
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="AFFIRM", reply_text="bet, locked it in"
+        )
+        resp = client.post(
+            "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "yes"}
+        )
     assert resp.status_code == 200
     assert resp.json() == {"status": "confirmed", "item_id": str(item_id)}
 
@@ -168,13 +182,19 @@ def test_y_reply_publishes_confirmed(client, awaiting_confirmation_item, confirm
 def test_n_reply_cancels_no_publish(client, awaiting_confirmation_item):
     item_id, user_id, phone = awaiting_confirmation_item
 
-    with patch("resolver_svc.main._send_sms") as mock_sms:
+    with (
+        patch("resolver_svc.main.converse") as mock_converse,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="DENY", reply_text="no worries, scrapped it"
+        )
         resp = client.post(
             "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "n"}
         )
     assert resp.status_code == 200
     assert resp.json() == {"status": "cancelled", "item_id": str(item_id)}
-    mock_sms.assert_called_once_with(user_id, phone, "Cancelled.")
+    mock_sms.assert_called_once_with(user_id, phone, "no worries, scrapped it")
 
     with get_connection() as conn:
         state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
@@ -217,24 +237,26 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item
 
     with (
         patch("resolver_svc.main._send_sms") as mock_sms,
-        patch("resolver_svc.main.clarify") as mock_clarify,
+        patch("resolver_svc.main.converse") as mock_converse,
         _no_duplicate,
     ):
-        mock_clarify.return_value = ClarificationResult(
-            due_at_filled=False, due_at=None, still_missing=["due_at"], question="When's it due?"
+        mock_converse.return_value = ConversationTurnResult(
+            due_at_filled=False, due_at=None, still_missing=["due_at"],
+            reply_text="when's it due?",
         )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
         assert resp.json()["status"] == "clarifying"
 
-        mock_clarify.return_value = ClarificationResult(
-            due_at_filled=True, due_at="2026-08-28T14:00:00", still_missing=[]
+        mock_converse.return_value = ConversationTurnResult(
+            due_at_filled=True, due_at="2026-08-28T14:00:00", still_missing=[],
+            reply_text="pay rent friday 2pm — sound good?",
         )
         resp = client.post(
             "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "friday"}
         )
 
     assert resp.json()["status"] == "awaiting_confirmation"
-    assert mock_sms.call_count == 2  # one question, one confirmation card
+    assert mock_sms.call_count == 2  # one question, one confirmation message
 
     with get_connection() as conn:
         state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
@@ -250,16 +272,16 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item
 def test_three_exchange_exhaustion_reaches_needs_review(client, received_item):
     item_id, user_id, phone = received_item
     extracted = _extracted_missing_due_at(item_id, user_id)
-    still_ambiguous = ClarificationResult(
+    still_ambiguous = ConversationTurnResult(
         due_at_filled=False,
         due_at=None,
         still_missing=["due_at"],
-        question="Still not sure — when?",
+        reply_text="still not sure — when?",
     )
 
     with (
         patch("resolver_svc.main._send_sms") as mock_sms,
-        patch("resolver_svc.main.clarify", return_value=still_ambiguous),
+        patch("resolver_svc.main.converse", return_value=still_ambiguous),
         _no_duplicate,
     ):
         client.post("/pubsub/push", json=_push_envelope(extracted))  # exchange 1

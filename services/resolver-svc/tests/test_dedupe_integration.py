@@ -2,7 +2,7 @@
 Postgres + pgvector — docs/engineering/test-plan.md step 12's
 `test_near_duplicate_caught` / `test_dissimilar_item_not_caught`, plus
 a real exact-hash-match case. The embedding call itself is mocked to a
-controlled fixture vector (matching how clarify() is mocked in
+controlled fixture vector (matching how converse() is mocked in
 test_resolver_integration.py) — what's actually exercised here for real
 is the `dedupe_hash` lookup and the pgvector `<=>` cosine search, which
 is what's genuinely new in this step.
@@ -202,7 +202,13 @@ def test_dissimilar_item_not_caught(client, test_user):
     with (
         patch("resolver_svc.main._send_sms") as mock_sms,
         patch("resolver_svc.main.embed", return_value=unrelated),
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        from resolver_svc.conversation import ConversationTurnResult
+
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=[], reply_text="learn pottery, someday — sound good?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.json()["status"] == "awaiting_confirmation"

@@ -1,8 +1,8 @@
 """docs/engineering/test-plan.md step 9 (confirmation) + step 10
-(clarification) — DB and Twilio mocked, per endpoint. Templates are
-covered in test_confirmation_card.py; the multi-turn clarification
-sequence itself (exchange counting, NEEDS_REVIEW) is covered in
-test_clarification.py."""
+(clarification) — DB and Twilio mocked, per endpoint. Phase G step D
+replaced clarify()/render_confirmation_card/classify_reply with
+resolver_svc.conversation.converse() for this flow; converse() itself is
+mocked here, same as clarify() was before it."""
 
 import base64
 from datetime import datetime
@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from obligation_engine_shared.schemas import ExtractedItemMessage
+from resolver_svc.conversation import ConversationTurnResult
 from resolver_svc.dedupe import DedupeResult
 
 
@@ -47,6 +48,8 @@ def _mock_connection(
             result.fetchone.return_value = item_row
         elif "FROM conversations" in sql:
             result.fetchone.return_value = conversation_row
+        elif "FROM messages" in sql:
+            result.fetchall.return_value = []  # _recent_history, empty by default
         else:
             result.fetchone.return_value = None
         return result
@@ -90,15 +93,24 @@ def test_complete_item_awaits_confirmation(client):
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
         _no_duplicate(),
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=[], reply_text="bet, pay rent friday 2pm — sound good?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "awaiting_confirmation", "item_id": str(extracted.item_id)}
 
+    # _write_item's own transient CLARIFYING write happens first (same
+    # code path missing-fields items use); the final write flips it to
+    # AWAITING_CONFIRMATION once converse() resolves everything on the
+    # first pass (a literal in the SQL text itself, not parameterized) —
+    # check the last state write, not the first.
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
-    assert update_calls[0].args[1][-2] == "AWAITING_CONFIRMATION"  # state param
+    assert "AWAITING_CONFIRMATION" in update_calls[-1].args[0]
 
     insert_calls = [
         c for c in conn.execute.call_args_list if "INSERT INTO conversations" in c.args[0]
@@ -106,13 +118,15 @@ def test_complete_item_awaits_confirmation(client):
     assert len(insert_calls) == 1
 
     mock_sms.assert_called_once()
-    assert "Pay rent" in mock_sms.call_args.args[2]
+    assert "pay rent" in mock_sms.call_args.args[2]
 
 
 def test_complete_email_item_shows_email_confirmation_card(client):
     """Step 15 — a fully-resolved email action (recipient already present
-    at extraction) goes straight to AWAITING_CONFIRMATION with the email
-    confirmation-card variant, not the calendar one."""
+    at extraction) stages action_type/email_recipient/email_draft in
+    resolved_fields exactly as before; Phase G step D moved the actual
+    outbound text from a fixed template to converse()'s reply_text, which
+    is mocked here rather than asserted on for exact wording."""
     extracted = _extracted_message(
         title="Reply to Sarah",
         summary="Confirm the delay.",
@@ -126,22 +140,24 @@ def test_complete_email_item_shows_email_confirmation_card(client):
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
         _no_duplicate(),
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=[], reply_text="bet, sending sarah the delay email — good to go?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "awaiting_confirmation"
     mock_sms.assert_called_once()
-    body = mock_sms.call_args.args[2]
-    assert body.startswith("✉️ Email to sarah@example.com:")
-    assert "Confirming the delay" in body
-    assert "Reply Y to send" in body
 
     insert_calls = [
         c for c in conn.execute.call_args_list if "INSERT INTO conversations" in c.args[0]
     ]
-    resolved_fields = insert_calls[0].args[1][2].obj  # Json wrapper
+    # (user_id, item_id, exchange_count, pending_fields, resolved_fields) —
+    # resolved_fields (the Json wrapper) is the last param.
+    resolved_fields = insert_calls[0].args[1][-1].obj
     assert resolved_fields["action_type"] == "email"
     assert resolved_fields["email_recipient"] == "sarah@example.com"
 
@@ -156,8 +172,12 @@ def test_low_confidence_complete_item_still_awaits_confirmation(client):
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
         _no_duplicate(),
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=[], reply_text="bet, pay rent friday 2pm — sound good?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
     assert resp.json()["status"] == "awaiting_confirmation"
     mock_sms.assert_called_once()
@@ -170,14 +190,13 @@ def test_missing_fields_starts_clarification_not_left_stalled(client):
     conn = _mock_connection()
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
-        patch("resolver_svc.main.clarify") as mock_clarify,
+        patch("resolver_svc.main.converse") as mock_converse,
         patch("resolver_svc.main._send_sms") as mock_sms,
         _no_duplicate(),
     ):
-        from resolver_svc.clarification import ClarificationResult
-
-        mock_clarify.return_value = ClarificationResult(
-            due_at_filled=False, due_at=None, still_missing=["due_at"], question="When's it due?"
+        mock_converse.return_value = ConversationTurnResult(
+            due_at_filled=False, due_at=None, still_missing=["due_at"],
+            reply_text="When's it due?",
         )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
@@ -241,7 +260,11 @@ def test_stuck_state_with_no_conversation_is_not_swallowed(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         _no_duplicate(),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=[], reply_text="bet, pay rent friday 2pm — sound good?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.status_code == 200
@@ -261,7 +284,12 @@ def test_y_reply_publishes_confirmed_and_marks_confirmed(client):
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.publish") as mock_publish,
+        patch("resolver_svc.main.converse") as mock_converse,
+        patch("resolver_svc.main._send_sms"),
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="AFFIRM", reply_text="bet, locked it in"
+        )
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "y"})
 
     assert resp.status_code == 200
@@ -287,19 +315,27 @@ def test_n_reply_cancels_no_publish(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.publish") as mock_publish,
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="DENY", reply_text="no worries, scrapped it"
+        )
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "no"})
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "cancelled", "item_id": item_id}
     mock_publish.assert_not_called()
-    mock_sms.assert_called_once_with(UUID(user_id), "+15551234567", "Cancelled.")
+    mock_sms.assert_called_once_with(UUID(user_id), "+15551234567", "no worries, scrapped it")
 
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "CANCELLED" in update_calls[0].args[0]
 
 
-def test_other_reply_during_confirmation_logged_not_acted_on(client):
+def test_other_reply_during_confirmation_gets_a_natural_clarifying_reply(client):
+    """Phase G step D: an unclear reply during AWAITING_CONFIRMATION no
+    longer goes silent (the old classify_reply-based system had no OTHER
+    handling at all) — converse() classifies it OTHER and writes a natural
+    "what do you mean" reply; still no write, no state change."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
         item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION")
@@ -308,7 +344,11 @@ def test_other_reply_during_confirmation_logged_not_acted_on(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.publish") as mock_publish,
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="OTHER", reply_text="not sure what you mean — yes, no, or what should change?"
+        )
         resp = client.post(
             "/reply", json={"user_id": user_id, "item_id": item_id, "text": "move it to Friday"}
         )
@@ -316,9 +356,54 @@ def test_other_reply_during_confirmation_logged_not_acted_on(client):
     assert resp.status_code == 200
     assert resp.json() == {"status": "unhandled_reply", "item_id": item_id}
     mock_publish.assert_not_called()
-    mock_sms.assert_not_called()
+    mock_sms.assert_called_once_with(
+        UUID(user_id), "+15551234567", "not sure what you mean — yes, no, or what should change?"
+    )
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert update_calls == []
+
+
+def test_correction_reply_never_auto_publishes(client):
+    """The sharpest new risk Phase G step D introduces (module docstring):
+    a CORRECTION must merge the updated field and stay AWAITING_CONFIRMATION
+    no matter how complete the result looks — only a later, separate AFFIRM
+    turn is ever allowed to publish to items.confirmed (ADR 0003)."""
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION"),
+        conversation_row=({"due_at": "2026-09-04T14:00:00", "action_type": "calendar"},),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.publish") as mock_publish,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="CORRECTION",
+            due_at_filled=True,
+            due_at="2026-09-04T15:00:00",
+            reply_text="gotcha, switched it to 3pm — still good?",
+        )
+        resp = client.post(
+            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "make it 3pm instead"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "awaiting_confirmation", "item_id": item_id}
+    mock_publish.assert_not_called()
+    mock_sms.assert_called_once_with(
+        UUID(user_id), "+15551234567", "gotcha, switched it to 3pm — still good?"
+    )
+
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert update_calls == []  # items.state untouched — still AWAITING_CONFIRMATION
+    convo_updates = [
+        c for c in conn.execute.call_args_list if "UPDATE conversations" in c.args[0]
+    ]
+    assert len(convo_updates) == 1
+    resolved_fields = convo_updates[0].args[1][0].obj  # Json wrapper
+    assert resolved_fields["due_at"] == "2026-09-04T15:00:00"
 
 
 def test_reply_unknown_item_returns_404(client):
@@ -411,13 +496,17 @@ def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=[], reply_text="bet, pay rent friday 2pm — sound good?"
+        )
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "n"})
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "awaiting_confirmation", "item_id": item_id}
     mock_sms.assert_called_once()
-    assert "Pay rent" in mock_sms.call_args.args[2]
+    assert "pay rent" in mock_sms.call_args.args[2]
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "AWAITING_CONFIRMATION" in update_calls[0].args[0]
 
@@ -430,13 +519,12 @@ def test_duplicate_n_reply_with_missing_fields_resumes_clarification(client):
     )
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
-        patch("resolver_svc.main.clarify") as mock_clarify,
+        patch("resolver_svc.main.converse") as mock_converse,
         patch("resolver_svc.main._send_sms") as mock_sms,
     ):
-        from resolver_svc.clarification import ClarificationResult
-
-        mock_clarify.return_value = ClarificationResult(
-            due_at_filled=False, due_at=None, still_missing=["due_at"], question="When's it due?"
+        mock_converse.return_value = ConversationTurnResult(
+            due_at_filled=False, due_at=None, still_missing=["due_at"],
+            reply_text="When's it due?",
         )
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "n"})
 
@@ -462,13 +550,17 @@ def test_attach_reply_sets_parent_item_id(client):
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="ATTACH", reply_text='cool, linked it to "Take a ceramics class"'
+        )
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "a"})
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "attached", "item_id": item_id}
     mock_sms.assert_called_once_with(
-        UUID(user_id), "+15551234567", 'Attached to "Take a ceramics class".'
+        UUID(user_id), "+15551234567", 'cool, linked it to "Take a ceramics class"'
     )
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert update_calls[0].args[0].strip().startswith("UPDATE items SET parent_item_id")
@@ -476,6 +568,9 @@ def test_attach_reply_sets_parent_item_id(client):
 
 
 def test_attach_reply_with_no_candidate_is_unhandled(client):
+    """No _thread_attach_item_id on record — falls through to the generic
+    reply path (same as OTHER), which now sends a natural reply rather
+    than staying silent."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
         item_row=("latent", "Learn pottery", "Someday.", 120, "AWAITING_CONFIRMATION"),
@@ -484,12 +579,18 @@ def test_attach_reply_with_no_candidate_is_unhandled(client):
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="ATTACH", reply_text="hmm, nothing to attach that to — yes or no on the task?"
+        )
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "a"})
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "unhandled_reply", "item_id": item_id}
-    mock_sms.assert_not_called()
+    mock_sms.assert_called_once_with(
+        UUID(user_id), "+15551234567", "hmm, nothing to attach that to — yes or no on the task?"
+    )
 
 
 def test_health(client):

@@ -8,7 +8,7 @@ search over item_embeddings for this user. similarity >= 0.92 (or an
 exact hash match) routes to DUPLICATE_SUSPECTED and asks "is this the
 same as X?" — never silently merged (ADR 0003). A 0.82-0.92 match
 against an existing *latent* is folded into the eventual confirmation
-card as a non-blocking thread-attach offer instead of its own stage.
+message as a non-blocking thread-attach offer instead of its own stage.
 
 Every path that can reach AWAITING_CONFIRMATION carries a possible
 thread-attach candidate forward through conversations.resolved_fields
@@ -21,11 +21,24 @@ matched item across the DUPLICATE_SUSPECTED Y/N round trip; there is no
 dedicated column for either, matching how `due_at` already had nowhere
 else to live pre-commit (data-model.md §2.4's original resolved bug).
 
-Still deliberately not built, carried over from step 10: a correction
-reply during AWAITING_CONFIRMATION (a reply that isn't Y/N/A) is still
-just logged, no action taken — it needs its own field-targeting
-heuristic (agent-contracts.md §3.2's "cheap heuristic" paragraph) that
-doesn't reuse the due_at-only clarification model cleanly.
+Phase G step D (agent-contracts.md §3.2/§3.3) replaces the old due_at-only
+clarify() call, the fixed render_confirmation_card template, and strict
+Y/N/ATTACH keyword matching — for everything EXCEPT the dedupe question
+itself — with resolver_svc.conversation.converse(), one Gemini call per
+turn that merges fields, classifies intent (AFFIRM/DENY/CORRECTION/
+ATTACH/OTHER) when replying to an already-sent confirmation, and writes
+the actual outbound SMS in the user's own mirrored voice. The dedupe
+question/Y-N-merge classification (classify_reply, render_dedupe_question)
+is deliberately untouched — not what triggered the redesign, and its own
+separate concern from the confirm-before-write flow. Real correction
+handling (a reply that changes a detail rather than confirming/denying)
+is genuinely new here — never built before this step. CORRECTION never
+publishes on its own, no matter how complete the merged fields look —
+only a subsequent, separate AFFIRM turn ever triggers items.confirmed
+(ADR 0003's actual mechanism: the LLM only fills a classified field,
+pipeline code below does a plain `if result.intent == "AFFIRM":` before
+ever publishing — never a second LLM call interpreting the first one's
+output).
 
 Step 13 adds an idempotency guard at the top of /pubsub/push — a real
 bug found in step 11's live testing: a concurrent Pub/Sub redelivery of
@@ -55,6 +68,7 @@ actually finishes), so its existence is the one true completion signal.
 import logging
 import os
 from datetime import UTC, datetime
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
@@ -69,7 +83,7 @@ from obligation_engine_shared.schemas import (
 from psycopg.types.json import Json
 from twilio.rest import Client as TwilioClient
 
-from resolver_svc.clarification import clarify
+from resolver_svc.conversation import converse
 from resolver_svc.dedupe import (
     DedupeResult,
     classify_match,
@@ -78,9 +92,6 @@ from resolver_svc.dedupe import (
     vector_literal,
 )
 from resolver_svc.templates import (
-    render_attached,
-    render_cancelled,
-    render_confirmation_card,
     render_dedupe_question,
     render_merged,
     render_needs_review,
@@ -147,6 +158,21 @@ def _user_phone_and_timezone(conn, user_id) -> tuple[str, str]:
         "SELECT phone_e164, timezone FROM users WHERE id = %s", (str(user_id),)
     ).fetchone()
     return row[0], row[1]
+
+
+def _recent_history(conn, user_id, limit: int = 10) -> list[str]:
+    """Last N messages for this user, oldest first, formatted as plain
+    "user:"/"assistant:" lines — the tone-mirroring context fed to
+    converse() (agent-contracts.md §3, migrations/0007_messages_table.sql)."""
+    rows = conn.execute(
+        "SELECT direction, body FROM messages WHERE user_id = %s "
+        "ORDER BY created_at DESC LIMIT %s",
+        (str(user_id), limit),
+    ).fetchall()
+    return [
+        f"{'user' if direction == 'in' else 'assistant'}: {body}"
+        for direction, body in reversed(rows)
+    ]
 
 
 def _initial_resolved_fields(extracted: ExtractedItemMessage) -> dict:
@@ -231,27 +257,6 @@ def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
     return classify_match(similarity, match_type, match_id, match_title)
 
 
-def _finalize_awaiting_confirmation(
-    conn, item_id, item_type, title, summary, effort_minutes, resolved_fields, thread_attach_title
-) -> str:
-    conn.execute(
-        "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
-        (str(item_id),),
-    )
-    due_at_iso = resolved_fields.get("due_at")
-    return render_confirmation_card(
-        item_type,
-        title,
-        summary,
-        datetime.fromisoformat(due_at_iso) if due_at_iso else None,
-        effort_minutes,
-        resolved_fields.get("action_type"),
-        email_recipient=resolved_fields.get("email_recipient"),
-        email_draft=resolved_fields.get("email_draft"),
-        thread_attach_title=thread_attach_title,
-    )
-
-
 async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: DedupeResult) -> None:
     _write_item(extracted, "DUPLICATE_SUSPECTED")
 
@@ -286,22 +291,38 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
 
 async def _start_clarification(
     extracted: ExtractedItemMessage, thread_attach: tuple | None = None
-) -> None:
+) -> str:
+    """Runs the first conversation turn for a freshly-extracted item —
+    whether or not any fields are missing. Always calls converse() (even
+    with an empty missing_fields list) so every item gets a natural,
+    in-voice confirmation message rather than a fixed template; this is
+    what replaced the old two-branch split in /pubsub/push (a separate
+    inline "complete extraction" block that skipped the LLM call
+    entirely)."""
     _write_item(extracted, "CLARIFYING")
 
     with get_connection() as conn:
         phone, tz_name = _user_phone_and_timezone(conn, extracted.user_id)
+        history = _recent_history(conn, extracted.user_id)
 
+    resolved_fields = _initial_resolved_fields(extracted)
+    thread_attach_title = thread_attach[1] if thread_attach else None
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    result = await clarify(
-        session_id=f"{extracted.item_id}-0",
+    result = await converse(
+        session_id=f"{extracted.item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
         tz_name=tz_name,
         title=extracted.title,
+        item_type=extracted.type,
+        summary=extracted.summary,
+        effort_minutes=extracted.effort_minutes,
+        known_fields=resolved_fields,
         missing_fields=extracted.missing_fields,
+        awaiting_confirmation=False,
+        thread_attach_title=thread_attach_title,
+        history=history,
         latest_reply=None,
     )
-    resolved_fields = _initial_resolved_fields(extracted)
     if result.due_at_filled and result.due_at:
         resolved_fields["due_at"] = result.due_at
     if result.email_recipient_filled and result.email_recipient:
@@ -320,35 +341,27 @@ async def _start_clarification(
             (
                 str(extracted.user_id),
                 str(extracted.item_id),
-                1 if result.question else 0,
+                1 if result.still_missing else 0,
                 result.still_missing,
                 Json(resolved_fields),
             ),
         )
         conn.commit()
 
-    if result.question:
-        _send_sms(extracted.user_id, phone, result.question)
+    if result.still_missing:
+        _send_sms(extracted.user_id, phone, result.reply_text)
         logger.info("CLARIFYING item_id=%s sent question 1/%d", extracted.item_id, MAX_EXCHANGES)
-        return
+        return "clarifying"
 
-    # Turn 1 always has latest_reply=None, so the model should never
-    # resolve still_missing to empty here — handled anyway rather than
-    # assumed, since it's one extra branch, not extra complexity.
     with get_connection() as conn:
-        body = _finalize_awaiting_confirmation(
-            conn,
-            extracted.item_id,
-            extracted.type,
-            extracted.title,
-            extracted.summary,
-            extracted.effort_minutes,
-            resolved_fields,
-            thread_attach[1] if thread_attach else None,
+        conn.execute(
+            "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
+            (str(extracted.item_id),),
         )
         conn.commit()
-    _send_sms(extracted.user_id, phone, body)
+    _send_sms(extracted.user_id, phone, result.reply_text)
     logger.info("AWAITING_CONFIRMATION item_id=%s (resolved on first pass)", extracted.item_id)
+    return "awaiting_confirmation"
 
 
 @app.post("/pubsub/push")
@@ -414,59 +427,18 @@ async def pubsub_push(request: Request):
         else None
     )
 
-    if extracted.missing_fields:
-        try:
-            await _start_clarification(extracted, thread_attach)
-        except Exception:
-            logger.exception("failed to start clarification item_id=%s", extracted.item_id)
-            raise HTTPException(status_code=500, detail="clarification start failed") from None
-        return {"status": "clarifying", "item_id": str(extracted.item_id)}
-
-    # Complete extraction — low confidence alone (with no missing fields)
-    # doesn't get a manufactured clarifying question about nothing; the
-    # confirmation card's own "or send a correction" is the safety net
-    # for it (state-machine.md §1.2's "Resolved gap" note).
+    # Every non-duplicate item runs one conversation turn, whether or not
+    # any fields are missing — state-machine.md §1.2's "Resolved gap": low
+    # confidence alone doesn't get a manufactured question about nothing,
+    # the natural confirmation message's own implicit "or send a
+    # correction" is the safety net for it.
     try:
-        _write_item(extracted, "AWAITING_CONFIRMATION")
+        status = await _start_clarification(extracted, thread_attach)
     except Exception:
-        logger.exception("failed to write extracted fields item_id=%s", extracted.item_id)
-        raise HTTPException(status_code=500, detail="db write failed") from None
+        logger.exception("failed to start conversation item_id=%s", extracted.item_id)
+        raise HTTPException(status_code=500, detail="conversation start failed") from None
 
-    resolved_fields = _initial_resolved_fields(extracted)
-    if thread_attach:
-        resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
-        resolved_fields["_thread_attach_title"] = thread_attach[1]
-    try:
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO conversations (user_id, item_id, resolved_fields) VALUES (%s, %s, %s)",
-                (str(extracted.user_id), str(extracted.item_id), Json(resolved_fields)),
-            )
-            phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
-            conn.commit()
-    except Exception:
-        logger.exception("failed to open conversation item_id=%s", extracted.item_id)
-        raise HTTPException(status_code=500, detail="conversation open failed") from None
-
-    body = render_confirmation_card(
-        extracted.type,
-        extracted.title,
-        extracted.summary,
-        extracted.due_at,
-        extracted.effort_minutes,
-        resolved_fields.get("action_type"),
-        email_recipient=resolved_fields.get("email_recipient"),
-        email_draft=resolved_fields.get("email_draft"),
-        thread_attach_title=thread_attach[1] if thread_attach else None,
-    )
-    try:
-        _send_sms(extracted.user_id, phone, body)
-    except Exception:
-        logger.exception("failed to send confirmation card item_id=%s", extracted.item_id)
-        raise HTTPException(status_code=500, detail="sms send failed") from None
-
-    logger.info("AWAITING_CONFIRMATION item_id=%s sent confirmation card", extracted.item_id)
-    return {"status": "awaiting_confirmation", "item_id": str(extracted.item_id)}
+    return {"status": status, "item_id": str(extracted.item_id)}
 
 
 async def _handle_clarification_reply(
@@ -479,14 +451,22 @@ async def _handle_clarification_reply(
     ).fetchone()
     pending_fields, resolved_fields, exchange_count = convo_row
     thread_attach_title = resolved_fields.get("_thread_attach_title")
+    history = _recent_history(conn, user_id)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    result = await clarify(
-        session_id=f"{item_id}-{exchange_count}",
+    result = await converse(
+        session_id=f"{item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
         tz_name=tz_name,
         title=title,
+        item_type=item_type,
+        summary=summary,
+        effort_minutes=effort_minutes,
+        known_fields=resolved_fields,
         missing_fields=pending_fields,
+        awaiting_confirmation=False,
+        thread_attach_title=thread_attach_title,
+        history=history,
         latest_reply=latest_reply,
     )
     if result.due_at_filled and result.due_at:
@@ -507,7 +487,7 @@ async def _handle_clarification_reply(
                 (next_count, result.still_missing, Json(resolved_fields), str(item_id)),
             )
             conn.commit()
-            _send_sms(user_id, phone, result.question)
+            _send_sms(user_id, phone, result.reply_text)
             logger.info(
                 "CLARIFYING item_id=%s sent question %d/%d", item_id, next_count, MAX_EXCHANGES
             )
@@ -527,9 +507,9 @@ async def _handle_clarification_reply(
         logger.info("NEEDS_REVIEW item_id=%s (exhausted %d exchanges)", item_id, MAX_EXCHANGES)
         return {"status": "needs_review", "item_id": str(item_id)}
 
-    body = _finalize_awaiting_confirmation(
-        conn, item_id, item_type, title, summary, effort_minutes,
-        resolved_fields, thread_attach_title,
+    conn.execute(
+        "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
+        (str(item_id),),
     )
     conn.execute(
         "UPDATE conversations SET resolved_fields = %s, pending_fields = %s, "
@@ -537,7 +517,7 @@ async def _handle_clarification_reply(
         (Json(resolved_fields), [], str(item_id)),
     )
     conn.commit()
-    _send_sms(user_id, phone, body)
+    _send_sms(user_id, phone, result.reply_text)
     logger.info("AWAITING_CONFIRMATION item_id=%s (clarification resolved)", item_id)
     return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
@@ -570,60 +550,167 @@ async def _handle_duplicate_reply(
         # "N" proceeds to the completeness check as if no match existed
         # (state-machine.md §1.1 point 2) — pending_fields here is the
         # original missing_fields staged by _start_duplicate_suspected.
+        # Reuses the same converse()-driven conversation turn every other
+        # path uses now, rather than a separate dedicated mechanism.
         thread_attach_title = resolved_fields.get("_thread_attach_title")
+        history = _recent_history(conn, user_id)
+        now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+        result = await converse(
+            session_id=f"{item_id}-{uuid4().hex[:8]}",
+            now_local=now_local,
+            tz_name=tz_name,
+            title=title,
+            item_type=item_type,
+            summary=summary,
+            effort_minutes=effort_minutes,
+            known_fields=resolved_fields,
+            missing_fields=pending_fields,
+            awaiting_confirmation=False,
+            thread_attach_title=thread_attach_title,
+            history=history,
+            latest_reply=None,
+        )
+        if result.due_at_filled and result.due_at:
+            resolved_fields = {**resolved_fields, "due_at": result.due_at}
+        if result.email_recipient_filled and result.email_recipient:
+            resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
 
-        if pending_fields:
-            now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-            result = await clarify(
-                session_id=f"{item_id}-0", now_local=now_local, tz_name=tz_name,
-                title=title, missing_fields=pending_fields, latest_reply=None,
-            )
-            if result.due_at_filled and result.due_at:
-                resolved_fields = {**resolved_fields, "due_at": result.due_at}
-            if result.email_recipient_filled and result.email_recipient:
-                resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
-
-            if result.question:
-                conn.execute(
-                    "UPDATE items SET state = 'CLARIFYING', updated_at = now() WHERE id = %s",
-                    (str(item_id),),
-                )
-                conn.execute(
-                    "UPDATE conversations SET exchange_count = 1, pending_fields = %s, "
-                    "resolved_fields = %s, last_message_at = now() WHERE item_id = %s",
-                    (result.still_missing, Json(resolved_fields), str(item_id)),
-                )
-                conn.commit()
-                _send_sms(user_id, phone, result.question)
-                logger.info(
-                    "CLARIFYING item_id=%s sent question 1/%d (post-dedupe)", item_id, MAX_EXCHANGES
-                )
-                return {"status": "clarifying", "item_id": str(item_id)}
-
-            body = _finalize_awaiting_confirmation(
-                conn, item_id, item_type, title, summary, effort_minutes,
-                resolved_fields, thread_attach_title,
+        if result.still_missing:
+            conn.execute(
+                "UPDATE items SET state = 'CLARIFYING', updated_at = now() WHERE id = %s",
+                (str(item_id),),
             )
             conn.execute(
-                "UPDATE conversations SET pending_fields = %s, resolved_fields = %s, "
-                "last_message_at = now() WHERE item_id = %s",
-                ([], Json(resolved_fields), str(item_id)),
+                "UPDATE conversations SET exchange_count = 1, pending_fields = %s, "
+                "resolved_fields = %s, last_message_at = now() WHERE item_id = %s",
+                (result.still_missing, Json(resolved_fields), str(item_id)),
             )
             conn.commit()
-            _send_sms(user_id, phone, body)
-            logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
-            return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+            _send_sms(user_id, phone, result.reply_text)
+            logger.info(
+                "CLARIFYING item_id=%s sent question 1/%d (post-dedupe)", item_id, MAX_EXCHANGES
+            )
+            return {"status": "clarifying", "item_id": str(item_id)}
 
-        body = _finalize_awaiting_confirmation(
-            conn, item_id, item_type, title, summary, effort_minutes,
-            resolved_fields, thread_attach_title,
+        conn.execute(
+            "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
+            (str(item_id),),
+        )
+        conn.execute(
+            "UPDATE conversations SET pending_fields = %s, resolved_fields = %s, "
+            "last_message_at = now() WHERE item_id = %s",
+            ([], Json(resolved_fields), str(item_id)),
         )
         conn.commit()
-        _send_sms(user_id, phone, body)
-        logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, no missing fields)", item_id)
+        _send_sms(user_id, phone, result.reply_text)
+        logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
         return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
     logger.info("dedupe reply outside Y/N, not yet handled item_id=%s text=%r", item_id, text)
+    return {"status": "unhandled_reply", "item_id": str(item_id)}
+
+
+async def _handle_confirmation_reply(
+    conn, user_id, item_id, phone, tz_name, title, item_type, summary, effort_minutes, latest_reply
+) -> dict:
+    convo_row = conn.execute(
+        "SELECT resolved_fields FROM conversations WHERE item_id = %s "
+        "ORDER BY last_message_at DESC LIMIT 1",
+        (str(item_id),),
+    ).fetchone()
+    resolved_fields = convo_row[0] if convo_row else {}
+    thread_attach_title = resolved_fields.get("_thread_attach_title")
+    history = _recent_history(conn, user_id)
+
+    now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    result = await converse(
+        session_id=f"{item_id}-{uuid4().hex[:8]}",
+        now_local=now_local,
+        tz_name=tz_name,
+        title=title,
+        item_type=item_type,
+        summary=summary,
+        effort_minutes=effort_minutes,
+        known_fields=resolved_fields,
+        missing_fields=[],
+        awaiting_confirmation=True,
+        thread_attach_title=thread_attach_title,
+        history=history,
+        latest_reply=latest_reply,
+    )
+
+    if result.intent == "AFFIRM":
+        confirmed = ConfirmedItemMessage(
+            item_id=item_id,
+            user_id=user_id,
+            type=item_type,
+            title=title,
+            summary=summary,
+            due_at=resolved_fields.get("due_at"),
+            effort_minutes=effort_minutes,
+            action_type=resolved_fields.get("action_type"),
+            email_recipient=resolved_fields.get("email_recipient"),
+            email_draft=resolved_fields.get("email_draft"),
+        )
+        publish("items-confirmed", confirmed)
+        conn.execute(
+            "UPDATE items SET state = 'CONFIRMED', updated_at = now() WHERE id = %s",
+            (str(item_id),),
+        )
+        conn.commit()
+        _send_sms(user_id, phone, result.reply_text)
+        logger.info("CONFIRMED item_id=%s (real AFFIRM reply)", item_id)
+        return {"status": "confirmed", "item_id": str(item_id)}
+
+    if result.intent == "DENY":
+        conn.execute(
+            "UPDATE items SET state = 'CANCELLED', updated_at = now() WHERE id = %s",
+            (str(item_id),),
+        )
+        conn.commit()
+        _send_sms(user_id, phone, result.reply_text)
+        logger.info("CANCELLED item_id=%s (real DENY reply)", item_id)
+        return {"status": "cancelled", "item_id": str(item_id)}
+
+    if result.intent == "CORRECTION":
+        if result.due_at_filled and result.due_at:
+            resolved_fields = {**resolved_fields, "due_at": result.due_at}
+        if result.email_recipient_filled and result.email_recipient:
+            resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
+        conn.execute(
+            "UPDATE conversations SET resolved_fields = %s, last_message_at = now() "
+            "WHERE item_id = %s",
+            (Json(resolved_fields), str(item_id)),
+        )
+        # Deliberately stays AWAITING_CONFIRMATION — see module docstring:
+        # a correction never publishes on its own, no matter how complete
+        # the merged fields look. Only a subsequent, separate AFFIRM turn
+        # ever triggers items.confirmed.
+        conn.commit()
+        _send_sms(user_id, phone, result.reply_text)
+        logger.info("AWAITING_CONFIRMATION item_id=%s (correction applied)", item_id)
+        return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+
+    if result.intent == "ATTACH":
+        target_id = resolved_fields.get("_thread_attach_item_id")
+        if target_id:
+            conn.execute(
+                "UPDATE items SET parent_item_id = %s, updated_at = now() WHERE id = %s",
+                (target_id, str(item_id)),
+            )
+            conn.commit()
+            _send_sms(user_id, phone, result.reply_text)
+            logger.info("thread-attached item_id=%s to=%s", item_id, target_id)
+            return {"status": "attached", "item_id": str(item_id)}
+        # No candidate on record for this item — falls through to the
+        # generic reply below, same as any other stray text.
+
+    # OTHER (or ATTACH with no real candidate on record) — reply naturally,
+    # no state change, no write.
+    _send_sms(user_id, phone, result.reply_text)
+    logger.info(
+        "reply outside AFFIRM/DENY item_id=%s intent=%s", item_id, result.intent
+    )
     return {"status": "unhandled_reply", "item_id": str(item_id)}
 
 
@@ -660,87 +747,29 @@ async def reply(payload: RoutedReplyMessage):
                     payload.text,
                 )
 
-            if state != "AWAITING_CONFIRMATION":
-                logger.warning(
-                    "reply routed for item_id=%s in unexpected state=%s", payload.item_id, state
+            if state == "AWAITING_CONFIRMATION":
+                return await _handle_confirmation_reply(
+                    conn,
+                    payload.user_id,
+                    payload.item_id,
+                    phone,
+                    tz_name,
+                    title,
+                    item_type,
+                    summary,
+                    effort_minutes,
+                    payload.text,
                 )
-                return {"status": "unexpected_state", "item_id": str(payload.item_id)}
 
-            classification = classify_reply(payload.text)
-
-            if classification == "Y":
-                convo_row = conn.execute(
-                    "SELECT resolved_fields FROM conversations WHERE item_id = %s "
-                    "ORDER BY last_message_at DESC LIMIT 1",
-                    (str(payload.item_id),),
-                ).fetchone()
-                resolved_fields = convo_row[0] if convo_row else {}
-                confirmed = ConfirmedItemMessage(
-                    item_id=payload.item_id,
-                    user_id=payload.user_id,
-                    type=item_type,
-                    title=title,
-                    summary=summary,
-                    due_at=resolved_fields.get("due_at"),
-                    effort_minutes=effort_minutes,
-                    action_type=resolved_fields.get("action_type"),
-                    email_recipient=resolved_fields.get("email_recipient"),
-                    email_draft=resolved_fields.get("email_draft"),
-                )
-                publish("items-confirmed", confirmed)
-                conn.execute(
-                    "UPDATE items SET state = 'CONFIRMED', updated_at = now() WHERE id = %s",
-                    (str(payload.item_id),),
-                )
-                conn.commit()
-                logger.info("CONFIRMED item_id=%s (real Y reply)", payload.item_id)
-                return {"status": "confirmed", "item_id": str(payload.item_id)}
-
-            if classification == "N":
-                conn.execute(
-                    "UPDATE items SET state = 'CANCELLED', updated_at = now() WHERE id = %s",
-                    (str(payload.item_id),),
-                )
-                conn.commit()
-                _send_sms(payload.user_id, phone, render_cancelled())
-                logger.info("CANCELLED item_id=%s (real N reply)", payload.item_id)
-                return {"status": "cancelled", "item_id": str(payload.item_id)}
-
-            if classification == "ATTACH":
-                convo_row = conn.execute(
-                    "SELECT resolved_fields FROM conversations WHERE item_id = %s "
-                    "ORDER BY last_message_at DESC LIMIT 1",
-                    (str(payload.item_id),),
-                ).fetchone()
-                resolved_fields = convo_row[0] if convo_row else {}
-                target_id = resolved_fields.get("_thread_attach_item_id")
-                target_title = resolved_fields.get("_thread_attach_title")
-                if target_id:
-                    conn.execute(
-                        "UPDATE items SET parent_item_id = %s, updated_at = now() WHERE id = %s",
-                        (target_id, str(payload.item_id)),
-                    )
-                    conn.commit()
-                    _send_sms(payload.user_id, phone, render_attached(target_title))
-                    logger.info(
-                        "thread-attached item_id=%s to=%s", payload.item_id, target_id
-                    )
-                    return {"status": "attached", "item_id": str(payload.item_id)}
-                # No candidate on record for this item — falls through to
-                # the generic unhandled-reply logging below, same as any
-                # other stray text during AWAITING_CONFIRMATION.
+            logger.warning(
+                "reply routed for item_id=%s in unexpected state=%s", payload.item_id, state
+            )
+            return {"status": "unexpected_state", "item_id": str(payload.item_id)}
     except HTTPException:
         raise
     except Exception:
         logger.exception("reply handling failed item_id=%s", payload.item_id)
         raise HTTPException(status_code=500, detail="reply handling failed") from None
-
-    # OTHER during AWAITING_CONFIRMATION — a correction. Not built (see
-    # module docstring); logged distinctly, no action taken.
-    logger.info(
-        "reply outside Y/N, not yet handled item_id=%s text=%r", payload.item_id, payload.text
-    )
-    return {"status": "unhandled_reply", "item_id": str(payload.item_id)}
 
 
 @app.get("/health")
