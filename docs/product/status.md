@@ -2,7 +2,7 @@
 
 Read this after the PRD at the start of every session — it's the fast answer to "where are we." Update it whenever a build-order step completes, starts, or gets blocked. This is a living tracker, not a history — keep it short and current; git log is the historical record.
 
-**Last updated:** 2026-08-22 (session 2)
+**Last updated:** 2026-08-23 (session 3)
 
 ---
 
@@ -14,7 +14,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**Steps 1-3 done. Next: Step 4 — `extractor-svc`.**
+**Steps 1-4 done. Next: Step 5 — `resolver-svc` stub (auto-confirm).**
 
 | Step | Status |
 |---|---|
@@ -23,7 +23,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 | 2. DB schema + shared package | **Done** — migration applied, all 11 tests pass (8 unit + 3 integration, run for real against live Cloud SQL) |
 | 3. `ingest-svc` + real Twilio number | **Done** — deployed to Cloud Run, real Twilio number (`+14152365420`) wired to it, a real SMS from the developer's phone was confirmed end-to-end in the database (`state='RECEIVED'`, correct `user_id`). Two real deploy-time bugs found and fixed — see Notes. |
 | **Phase B — Core pipeline (auto-confirm stub)** | |
-| 4. `extractor-svc` | Not started |
+| 4. `extractor-svc` | **Done** — deployed to Cloud Run, real end-to-end verified: a real `RawItemMessage` published to `items-raw` produced a correct `ExtractedItemMessage` on `items-extracted` via the real Gemini 3.5 Flash call, `type="obligation"`, `due_at` correctly left null for ambiguous "Friday", `effort_minutes=15` (int). Three real deploy-time bugs found and fixed — see Notes. |
 | 5. `resolver-svc` stub (temporary, auto-confirm) | Not started |
 | 6. `committer-svc` | Not started |
 | **Phase C — The differentiator** | |
@@ -77,3 +77,14 @@ None.
 - Onboarding (PRD §10) is deliberately not in the critical path — bootstrap the single demo user's OAuth token and `users` row manually (see PRD §14's scope note) rather than building the real SMS onboarding flow. That flow only happens in step 19, if time allows.
 - Demo needs seeded/backdated data (`docs/product/prd.md` §13, "Demo data note" + step 16) — don't leave this until step 17.
 - CI (GitHub Actions) deliberately not set up yet — add once step 4–6 produces real code and tests to run against.
+- **Step 4 (`extractor-svc`) findings, verified empirically in a scratch venv before writing production code (`/tmp/adk-probe`), both documented in `agent-contracts.md` §2 and `infrastructure.md` §2/§3:**
+  1. Vertex AI's structured-output schema only supports **string** enum values — `Literal[15, 30, ...]` (ints) fails schema validation outright. The wire-facing Pydantic model (`_ExtractionResult` in `main.py`) uses `Literal["15", "30", "60", "120", "240"]`; cast to `int` when building the real `ExtractedItemMessage`.
+  2. `gemini-3.5-flash` 404s on every regional Vertex AI endpoint tried (`us-central1`, `us-east5`, `us-east1`, `europe-west4`) — it's only served via the **global** endpoint. `VERTEX_LOCATION`/`GOOGLE_CLOUD_LOCATION` must be `global`, confirmed with a real successful `generateContent` call.
+  3. ADK's `Event.output` attribute is `None` even with `output_schema` set on the `LlmAgent` — the actual structured JSON text is in `event.content.parts[-1].text` and has to be parsed/validated manually. `main.py`'s `_extract()` does this.
+  - Code written: `services/extractor-svc/{main.py,pyproject.toml,Dockerfile}` + 7 passing unit tests (envelope decode, error paths, string→int cast, ADK event parsing — all mocked, no live Gemini calls in CI). `scripts/deploy.sh` extended with an `extractor-svc` case: `--no-allow-unauthenticated`, no `--add-cloudsql-instances` (zero DB access, ADR 0003), and it now also grants the Pub/Sub push service agent `roles/run.invoker` on the service and creates/updates its `items-raw` push subscription (with DLQ policy + the publisher/subscriber IAM the DLQ policy needs) — all imperative, matching `pubsub.tf`'s existing "not here" comment.
+  - **Doc-hygiene fix, found while wiring this up:** `infrastructure.md` §6 and `infra/main.tf`'s header comment referenced a `cloud_run.tf` that was never actually created — Cloud Run services, their `run.invoker` bindings, and their push subscriptions are all created imperatively in `scripts/deploy.sh`, not Terraform (they need each other in sequence: service → URL → subscription). Docs corrected to match reality; no code behavior changed.
+  - **Real deploy-time bugs found and fixed, both worth remembering for `resolver-svc`/`committer-svc` (steps 5–6, same push-subscription pattern):**
+    1. Pub/Sub's dead-letter policy has a real minimum of `max_delivery_attempts=5` — the planned `3` was rejected outright by the API. Fixed in `scripts/deploy.sh` and both places in `docs/` that assumed `3` (`infrastructure.md` §1, `test-plan.md` step 13).
+    2. The project's Pub/Sub push service agent (`service-<PROJECT_NUMBER>@gcp-sa-pubsub.iam.gserviceaccount.com`) didn't exist yet — enabling `pubsub.googleapis.com` doesn't auto-create it. One-time fix: `gcloud beta services identity create --service=pubsub.googleapis.com --project=obligation-engine-hack` (documented in `infrastructure.md` §2.2's bootstrap note, not made Terraform since it needs the `google-beta` provider for one one-time call).
+    3. The originally planned "Pub/Sub push service agent only" invoker pattern doesn't actually work that way — the push subscription's OIDC token has to be minted *as the consuming service's own SA* (`sa-extractor`), not as the raw push agent, which needs a `serviceAccountUser`-style grant the developer's Owner account still can't get on a Google-managed agent. Working pattern (now in `scripts/deploy.sh` and `infrastructure.md` §2.1): grant the push agent `roles/iam.serviceAccountTokenCreator` *on* `sa-extractor`, then grant `sa-extractor` `roles/run.invoker` *on* the Cloud Run service.
+  - Deployed and verified for real: published a `RawItemMessage` directly to the live `items-raw` topic ("Bro send rent by Friday"), confirmed the correct `ExtractedItemMessage` arrived on `items-extracted` and Cloud Run logs show a clean `200 OK` with no retries.

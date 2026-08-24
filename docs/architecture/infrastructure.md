@@ -11,7 +11,7 @@ Sixth and final doc in the architecture set — see `overview.md` §0. Closes ou
 | Cloud Run services | `ingest-svc`, `extractor-svc`, `resolver-svc`, `committer-svc`, `dispatcher-svc` — one revision each, `min-instances=0` everywhere (PRD §9 cost control) |
 | Cloud SQL | One Postgres instance, smallest shared-core tier, `pgvector` enabled (ADR 0004) |
 | Pub/Sub topics | `items.raw`, `items.extracted`, `items.confirmed`, plus `items.raw.dlq`, `items.extracted.dlq`, `items.confirmed.dlq` |
-| Pub/Sub subscriptions | One push subscription per topic per consuming service, `items.*` subscriptions configured with a dead-letter policy (`max_delivery_attempts=3`) pointing at the matching `.dlq` topic |
+| Pub/Sub subscriptions | One push subscription per topic per consuming service, `items.*` subscriptions configured with a dead-letter policy (`max_delivery_attempts=5` — Pub/Sub's actual minimum, found in step 4; `3` was assumed and rejected by the API) pointing at the matching `.dlq` topic |
 | Cloud Scheduler | Two jobs — `dispatch-daily` (07:00), `dispatch-midday` — both push `POST /dispatch` on `dispatcher-svc` |
 | GCS bucket | Media storage, `raw_media_uri` targets; lifecycle rule deletes objects after 30 days (PRD §9) |
 | Secret Manager | `twilio-auth-token`, `twilio-api-key-secret` (added during step 3 — see below), `google-oauth-client-secret`, one `user-refresh-token-{user_id}` secret per onboarded user |
@@ -33,10 +33,12 @@ Two IAM layers matter here and they enforce different things:
 | Service account | Pub/Sub | Cloud SQL (`roles/cloudsql.client` + `roles/cloudsql.instanceUser`) | Secret Manager | Vertex AI | External APIs | Invocable by |
 |---|---|---|---|---|---|---|
 | `sa-ingest` | publish: `items.raw` · subscribe: none (HTTP push target, not a subscriber) | yes | `twilio-auth-token` (accessor) | none | none | public (Twilio; validated by request-signature check in code, not IAM) |
-| `sa-extractor` | subscribe: `items.raw` · publish: `items.extracted` | **none — no binding at all** | none | `roles/aiplatform.user` | none | Pub/Sub push service agent only |
-| `sa-resolver` | subscribe: `items.extracted` · publish: `items.confirmed` | yes | none | `roles/aiplatform.user` | none | Pub/Sub push service agent, `sa-ingest` (`roles/run.invoker`, for routed replies) |
-| `sa-committer` | subscribe: `items.confirmed`, `items.raw.dlq`, `items.extracted.dlq`, `items.confirmed.dlq` · publish: none | yes | `google-oauth-client-secret`, `user-refresh-token-*` (accessor) | none | Calendar (write), Gmail (send) | Pub/Sub push service agent only |
+| `sa-extractor` | subscribe: `items.raw` · publish: `items.extracted` | **none — no binding at all** | none | `roles/aiplatform.user` | none | itself, via `run.invoker` (see below — the push subscription's OIDC token is minted *as* `sa-extractor`, not as the raw Pub/Sub push service agent) |
+| `sa-resolver` | subscribe: `items.extracted` · publish: `items.confirmed` | yes | none | `roles/aiplatform.user` | none | itself (same push pattern as `sa-extractor`), `sa-ingest` (`roles/run.invoker`, for routed replies) |
+| `sa-committer` | subscribe: `items.confirmed`, `items.raw.dlq`, `items.extracted.dlq`, `items.confirmed.dlq` · publish: none | yes | `google-oauth-client-secret`, `user-refresh-token-*` (accessor) | none | Calendar (write), Gmail (send) | itself (same push pattern as `sa-extractor`) |
 | `sa-dispatcher` | subscribe: none (cron-triggered) · publish: `items.confirmed` (accept-path only) | yes | `google-oauth-client-secret`, `user-refresh-token-*` (accessor) | none | Calendar (read only) | Cloud Scheduler (`roles/run.invoker`), `sa-ingest` (routed suggestion replies), developer (manual trigger, §5) |
+
+**Resolved gap, found in step 4's real deploy — how the "Invocable by: itself" push pattern actually works.** A push subscription targeting a private (non-public) Cloud Run service needs an `oidc_token.service_account_email` — the identity Pub/Sub mints a token as before calling the endpoint, which is then the identity Cloud Run's `run.invoker` check sees. Using the raw Pub/Sub push service agent as that identity was the first thing tried; it turned out to need the developer's own `iam.serviceAccountUser` grant *on* that Google-managed service agent, which errored with `NOT_FOUND` — that agent isn't a normal listable/bindable service account in this project's IAM surface the way a project-created one is. The working pattern instead: mint the OIDC token *as the consuming service's own service account* (e.g. `sa-extractor`), which requires two grants in each direction — `roles/iam.serviceAccountTokenCreator` for the Pub/Sub push service agent *on* `sa-extractor` (letting Pub/Sub impersonate it), and `roles/run.invoker` for `sa-extractor` *on* the Cloud Run service (letting that identity actually call it). `scripts/deploy.sh`'s `extractor-svc` case does both. This also needs the push service agent to exist at all — see §2.2's bootstrap note.
 
 **Resolved bug, found in step 3 (real deploy, not caught by earlier local testing):** `roles/cloudsql.client` alone is not sufficient for IAM database authentication — it only permits opening a connection to the instance via the proxy/connector. The role that actually authorizes authenticating *as* a specific IAM database user is the separate `roles/cloudsql.instanceUser`, which the original plan omitted. Local testing throughout steps 2–3 never caught this because it ran as the developer's own Owner-level identity, which bypasses the check. `sa-ingest`'s deployed Cloud Run revision failed with `Cloud SQL IAM service account authentication failed` until this was added — a genuine gap between "works locally" and "works as the actual service identity," worth remembering when deploying `resolver-svc`/`committer-svc`/`dispatcher-svc` later (they'll need the same grant, already added to all four in `infra/cloud_sql.tf`).
 
@@ -63,6 +65,8 @@ One Postgres role per service, matching `overview.md` §3 as closely as table-le
 
 **Migration/admin bootstrap — decided during step 2, not originally specified here.** None of the four service IAM database users can run DDL: Postgres 15 revokes `CREATE` on the public schema by default, and Cloud SQL does **not** auto-grant `cloudsqlsuperuser` to IAM database users (verified empirically before assuming either way — see `docs/product/status.md` history). `infra/service_accounts.tf` adds one more IAM database user for the developer's own Google identity, granted `cloudsqlsuperuser` via a one-time bootstrap through the built-in `postgres` user (its password is set, used once, then immediately rotated to an unretained random value — nobody holds it going forward, and it can always be reset again via `gcloud sql users set-password` if ever needed). Migrations run as the developer's IAM identity through the Cloud SQL Auth Proxy, not as any service account.
 
+**Pub/Sub push service agent bootstrap — found in step 4's real deploy.** Enabling `pubsub.googleapis.com` (`main.tf`) does not by itself create the project's Pub/Sub push service agent (`service-<PROJECT_NUMBER>@gcp-sa-pubsub.iam.gserviceaccount.com`) — every push-subscription IAM grant (`scripts/deploy.sh`'s per-service `tokenCreator`/`publisher`/`subscriber` bindings, §2.1 for the invoker pattern itself) needs that identity to already exist, and `gcloud pubsub subscriptions create --push-auth-service-account=...` fails with an opaque `actAs permission` error otherwise. One-time fix, not repeated per deploy: `gcloud beta services identity create --service=pubsub.googleapis.com --project=<project>`. Not made a Terraform resource — `google_project_service_identity` needs the `google-beta` provider, not worth adding for one one-time call in a project this size.
+
 ---
 
 ## 3. Vertex AI / ADK configuration
@@ -71,11 +75,11 @@ One Postgres role per service, matching `overview.md` §3 as closely as table-le
 
 ```
 GCP_PROJECT_ID=<project>
-VERTEX_LOCATION=us-central1
-GEMINI_MODEL=<confirm exact Vertex Model Garden resource name at build time>
+VERTEX_LOCATION=global
+GEMINI_MODEL=gemini-3.5-flash
 ```
 
-The exact Gemini 3.5 Flash model resource string is deliberately left as a placeholder — Vertex AI model identifiers are confirmed against the Model Garden at the time of building, not guessed here.
+**Resolved, found in step 4's real implementation** (this was deliberately left as a placeholder until build time, not guessed): `gemini-3.5-flash` returns 404 on every regional endpoint tried (`us-central1`, `us-east5`, `us-east1`, `europe-west4`) — confirmed empirically by probing each directly, not assumed. It's only served via the **global** Vertex AI endpoint. `VERTEX_LOCATION` must be `global`, not a region — using `us-central1` (the region every other resource in this project uses) silently 404s every extraction call.
 
 ---
 
@@ -125,19 +129,20 @@ Per `docs/engineering/conventions.md`'s `infra/` directory. Terraform owns durab
 infra/
   main.tf              # provider, project APIs enabled
   cloud_sql.tf          # instance, database, pgvector extension, app_* Postgres roles
-  pubsub.tf              # 3 topics + 3 dlq topics + subscriptions + dead-letter policies
+  pubsub.tf              # 3 topics + 3 dlq topics only — no subscriptions (see below)
   gcs.tf                  # media bucket + lifecycle rule
   secret_manager.tf      # static secrets (placeholders; per-user secrets created at onboarding time, not by Terraform)
   service_accounts.tf    # 5 service accounts
-  iam.tf                  # every binding in §2.1, resource-scoped
+  iam.tf                  # every binding in §2.1 that doesn't need a live Cloud Run URL first
   cloud_scheduler.tf      # dispatch-daily, dispatch-midday
-  cloud_run.tf             # service *shells* (name, service account, min-instances=0) — revisions/images deployed separately
   variables.tf / outputs.tf
 ```
 
+**Resolved gap, found in step 4:** there is deliberately no `cloud_run.tf`. The Cloud Run service itself, its `run.invoker` bindings, and its Pub/Sub push subscription all need each other to exist in a specific order (service → URL → subscription; subscription's push service agent → service's `run.invoker`), and image tags change every deploy — so `scripts/deploy.sh` owns the whole chain imperatively per service (`gcloud run deploy`, then any `run.invoker` grants for that service's specific caller, then create-or-update its push subscription), not Terraform. This was already the intent behind `pubsub.tf`'s "not here" comment for subscriptions; it just hadn't been made explicit that the same applies to the Cloud Run service resource and its invoker IAM. `iam.tf` still owns bindings that don't depend on a live Cloud Run URL (e.g. Vertex AI access).
+
 Per-user Secret Manager secrets (`user-refresh-token-{user_id}`) are created at onboarding time by `committer-svc`'s own code path (via the Secret Manager API, `roles/secretmanager.admin` scoped narrowly to secret-creation — a small addition to `sa-committer` beyond §2.1's `secretAccessor`), not by Terraform — Terraform provisions the two static secrets and the IAM policy allowing dynamic secret creation, not the per-user secrets themselves.
 
-**Application deploys** (`scripts/deploy.sh`, one `gcloud run deploy` per service, image built via Cloud Build/Artifact Registry) plus `terraform apply` together satisfy the README requirement (PRD §12.4) of "no manual console steps" — two scripted commands, not a `gcloud` sequence for infra *and* deploys mixed together.
+**Application deploys** (`scripts/deploy.sh`, one `gcloud run deploy` per service — plus that service's `run.invoker` grants and push subscription, image built via `docker build`/Artifact Registry) plus `terraform apply` together satisfy the README requirement (PRD §12.4) of "no manual console steps" — two scripted commands, not a `gcloud` sequence for infra *and* deploys mixed together.
 
 ---
 
@@ -153,7 +158,7 @@ Restates and makes concrete what `docs/engineering/conventions.md` already named
 
 ## 8. Cost control (restates PRD §9, made concrete)
 
-- `min-instances=0` on all five Cloud Run services — Terraform default in `cloud_run.tf`.
+- `min-instances=0` on all five Cloud Run services — set per service in its `scripts/deploy.sh` case (§6).
 - Cloud SQL smallest shared-core tier; stopped after the demo is recorded:
   ```bash
   gcloud sql instances patch <instance> --activation-policy=NEVER

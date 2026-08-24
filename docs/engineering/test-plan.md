@@ -72,13 +72,14 @@ Test files live in each service's `tests/` directory, or `shared/tests/` for any
 - No-deadline input → `type: "latent"`.
 - `sa-extractor` has no Cloud SQL connectivity at all — an infra check, not a code one (confirm no `DATABASE_URL`/proxy sidecar configured for this service).
 
-**Unit tests** (`services/extractor-svc/tests/test_extractor.py`, Gemini client mocked)
-- `test_extraction_maps_fixture_response_to_message` — mocked Gemini returns a fixed valid JSON fixture, assert the resulting `ExtractedItemMessage` matches exactly.
-- `test_schema_violation_from_model_is_rejected` — mocked response with `effort_minutes: 45` is caught before publish, not passed through.
-- `test_ambiguous_date_leaves_due_at_null` — fixture response with `due_at: null, missing_fields: ["due_at"]` round-trips correctly.
+**Unit tests** (`services/extractor-svc/tests/test_pubsub_push.py` + `test_extraction.py`, Gemini/ADK mocked)
+- `test_valid_envelope_extracts_and_publishes` — mocked extraction result published to `items-extracted` with `effort_minutes` cast from the wire string (`"15"`) to `int` (`15`).
+- `test_malformed_envelope_returns_500_for_retry` / `test_extraction_failure_returns_500_for_retry` / `test_publish_failure_returns_500_for_retry` — each failure mode is caught before a bad publish and surfaces as a 500 so Pub/Sub retries (a schema-invalid model response fails inside `_extract`'s `model_validate` the same way).
+- `test_extract_parses_final_event_text` — the ADK `Runner`'s event stream is mocked; asserts `_extract` correctly reads `event.content.parts[-1].text` (not `event.output`, which is `None` even with `output_schema` set — see the "Resolved gap" note in `agent-contracts.md` §2) and that an ambiguous date stays `due_at: null` with `"due_at"` in `missing_fields`.
+- `test_extract_raises_if_no_final_response` — no final event ever arrives → `RuntimeError`, not a silent no-op.
 
-**Integration tests** (Pub/Sub emulator, Gemini mocked)
-- `test_raw_to_extracted_end_to_end` — publish `RawItemMessage` → consumer runs with mocked Gemini → assert exact `ExtractedItemMessage` on `items.extracted`.
+**Integration test** (`test_extractor_integration.py`, real Pub/Sub emulator, Gemini mocked)
+- `test_raw_to_extracted_end_to_end` — POST a real push envelope to `/pubsub/push` with `_extract` mocked → publish goes through the real emulator client → pulled back on a throwaway subscription and asserted, not just checked via a mock call.
 
 **Manual verification (real Gemini, not mocked):** send 3–5 representative real messages — clear obligation, ambiguous date, no-deadline idea, a garbled/low-confidence one — and eyeball extraction quality. This is model-output quality, not wiring; it cannot be meaningfully asserted in an automated test.
 
@@ -250,14 +251,14 @@ The cleanest step to test — no I/O, and `capacity-engine.md` §6 already hands
 ## Step 13 — DLQ + error handling
 
 **Acceptance criteria**
-- Every subscription has a dead-letter policy (`max_delivery_attempts=3`) pointing at the correct `.dlq` topic (`gcloud pubsub subscriptions describe`).
-- A forced technical failure → exactly 3 attempts → `.dlq` message → exactly one `dead_letters` row with correct `item_id`/`stage`/`error`/`retry_count`.
+- Every subscription has a dead-letter policy (`max_delivery_attempts=5` — Pub/Sub's actual minimum, found empirically in step 4; the API rejects anything below 5) pointing at the correct `.dlq` topic (`gcloud pubsub subscriptions describe`).
+- A forced technical failure → exactly 5 attempts → `.dlq` message → exactly one `dead_letters` row with correct `item_id`/`stage`/`error`/`retry_count`.
 - Bad-input rejections (malformed payload) never appear in `dead_letters` (regression against over-eager dead-lettering — `state-machine.md` §3's distinction).
 - Manual replay (republish stored `payload` to the correct topic) re-enters the pipeline at the failed stage, not from `RECEIVED`.
 
 **Unit tests:** the bad-input-vs-technical-failure classification in each consumer.
 
-**Integration tests** (Pub/Sub emulator, `max_delivery_attempts=2` for faster tests)
+**Integration tests** (Pub/Sub emulator, `max_delivery_attempts=5` — the emulator enforces the same minimum as the real API)
 - `test_forced_failure_reaches_dlq_after_max_attempts`.
 - `test_committer_writes_dead_letter_row_correctly`.
 - `test_replay_reenters_at_failed_stage`.

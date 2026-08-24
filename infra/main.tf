@@ -1,6 +1,7 @@
 # Terraform-owned durable infrastructure. See docs/architecture/infrastructure.md
-# for what this provisions and why. Application deploys (Cloud Run revisions/images)
-# are NOT managed here — see scripts/deploy.sh, per infrastructure.md §6.
+# for what this provisions and why. Cloud Run services themselves (and their
+# run.invoker bindings and push subscriptions) are NOT managed here — they're
+# created imperatively per service in scripts/deploy.sh, per infrastructure.md §6.
 
 terraform {
   required_version = ">= 1.9"

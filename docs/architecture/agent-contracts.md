@@ -74,6 +74,10 @@ class ConfirmedItemMessage(BaseModel):
 **Input:** media bytes (if any) + MIME type + SMS text, from `RawItemMessage`.
 **Output:** `ExtractedItemMessage` fields (minus `item_id`/`user_id`, which the service adds).
 
+**Resolved gap, found in step 4's real implementation:** Gemini's structured-output schema (via ADK's `output_schema`) only supports **string** enum values, not integer ones — `Literal[15, 30, 60, 120, 240]` fails Vertex AI's schema validation outright. The wire schema `extractor-svc` actually gives the model uses `Literal["15", "30", "60", "120", "240"]` (strings); the service casts to `int` when constructing the real `ExtractedItemMessage`. This is purely a wire-format detail — `ExtractedItemMessage` itself is unchanged, still `int`.
+
+**Resolved gap: the real Vertex AI model resource name and location.** `infrastructure.md` §3 originally left this as "confirm at build time" — confirmed now: `gemini-3.5-flash` is **not** available via any regional endpoint (`us-central1`, `us-east5`, etc. all 404) — it's only served via the **global** endpoint. `VERTEX_LOCATION` must be `global`, not a region, or every extraction call 404s. See `infrastructure.md` §3 for the corrected env var.
+
 **System prompt:**
 ```
 You are the extraction stage of a personal obligation-tracking system. You

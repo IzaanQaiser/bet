@@ -11,11 +11,12 @@ package = false
 members = ["shared", "services/*"]
 
 [dependency-groups]
-dev = ["pytest>=8.3", "ruff>=0.16", "obligation-engine-shared", "ingest-svc"]
+dev = ["pytest>=8.3", "ruff>=0.16", "obligation-engine-shared", "ingest-svc", "extractor-svc"]
 
 [tool.uv.sources]
 obligation-engine-shared = { workspace = true }
 ingest-svc = { workspace = true }
+extractor-svc = { workspace = true }
 
 [tool.ruff]
 line-length = 100
