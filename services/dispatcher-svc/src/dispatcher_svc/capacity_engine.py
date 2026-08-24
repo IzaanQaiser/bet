@@ -140,10 +140,15 @@ def booked_minutes(wh_start: time, wh_end: time, free_min: int) -> int:
 
 def load_delta(booked_today: int, trailing_booked_minutes: list[int]) -> float | None:
     """capacity-engine.md §3's cold-start rule: undefined (None) with fewer
-    than 3 days of trailing history."""
+    than 3 days of trailing history. A second, distinct edge case handled
+    here: a rolling_mean of exactly 0 (a genuinely empty trailing
+    calendar, not just short history) would otherwise divide by zero —
+    see capacity-engine.md §3's "Resolved gap" note."""
     if len(trailing_booked_minutes) < 3:
         return None
     rolling_mean = sum(trailing_booked_minutes) / len(trailing_booked_minutes)
+    if rolling_mean == 0:
+        return 0.0 if booked_today == 0 else 1.0
     return (booked_today - rolling_mean) / rolling_mean
 
 

@@ -2,15 +2,24 @@
 name = "dispatcher-svc"
 version = "0.1.0"
 requires-python = ">=3.12"
-# No runtime deps yet — step 7 is the capacity engine only (pure stdlib:
-# dataclasses, datetime, math). FastAPI/uvicorn/Calendar client land in
-# step 8 when this becomes an actual deployed service.
-dependencies = []
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "obligation-engine-shared",
+    "google-auth>=2.35",
+    "requests>=2.32",
+    "google-cloud-secret-manager>=2.20",
+    "twilio>=9.3",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=8.3",
+    "httpx2",
 ]
+
+[tool.uv.sources]
+obligation-engine-shared = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

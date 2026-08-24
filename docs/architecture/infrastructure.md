@@ -59,11 +59,13 @@ One Postgres role per service, matching `overview.md` §3 as closely as table-le
 | `app_ingest` | `INSERT` on `items` · `SELECT` on `items`, `conversations`, `suggestions`, `users` (routing check, `data-model.md` §2.5; `users` for the phone-number lookup) |
 | `app_resolver` | `SELECT, UPDATE` on `items` · `SELECT, INSERT, UPDATE` on `conversations` · `SELECT, INSERT` on `item_embeddings` · `SELECT` on `users` |
 | `app_committer` | `SELECT, UPDATE` on `items` · `INSERT` on `obligations`, `latents` · `INSERT` on `dead_letters` (§2.1) · `SELECT` on `users` |
-| `app_dispatcher` | `SELECT` on `items`, `obligations` · `UPDATE` on `obligations` (`reminder_sent_at`) · `SELECT, INSERT` on `capacity_snapshots` · `SELECT, INSERT, UPDATE` on `suggestions` · `SELECT, UPDATE` on `latents` · `SELECT` on `users` |
+| `app_dispatcher` | `SELECT` on `items`, `obligations` · `UPDATE` on `obligations` (`reminder_sent_at`) · `SELECT, INSERT, UPDATE` on `capacity_snapshots` · `SELECT, INSERT, UPDATE` on `suggestions` · `SELECT, UPDATE` on `latents` · `SELECT` on `users` |
 
 `sa-extractor` has no Postgres role because it has no Cloud SQL binding at all (§2.1) — there's nothing to grant.
 
 **Resolved gap, found in step 3's real deploy:** none of the four roles above originally had `SELECT` on `users` — `ingest-svc`'s phone-number lookup failed with `permission denied for table users` until `migrations/0003_grant_users_select.sql` added it to all four. Every service will eventually need to read `users` for something (timezone, working hours, the refresh-token reference), so it was granted broadly rather than patched one service at a time.
+
+**Resolved gap, found in step 8's real deploy:** `app_dispatcher` was originally planned as `SELECT, INSERT` only on `capacity_snapshots` — correct for a design where every `/dispatch` run always inserts fresh rows. `dispatcher-svc`'s actual implementation upserts (`INSERT ... ON CONFLICT (user_id, date) DO UPDATE`) so a second run on the same day updates that day's snapshot instead of erroring or duplicating — a real idempotency requirement the original grant didn't anticipate. Postgres requires `UPDATE` privilege for the `DO UPDATE` clause itself, not just `INSERT`; failed with `permission denied for table capacity_snapshots` until `migrations/0004_grant_dispatcher_capacity_snapshots_update.sql` added it.
 
 **Migration/admin bootstrap — decided during step 2, not originally specified here.** None of the four service IAM database users can run DDL: Postgres 15 revokes `CREATE` on the public schema by default, and Cloud SQL does **not** auto-grant `cloudsqlsuperuser` to IAM database users (verified empirically before assuming either way — see `docs/product/status.md` history). `infra/service_accounts.tf` adds one more IAM database user for the developer's own Google identity, granted `cloudsqlsuperuser` via a one-time bootstrap through the built-in `postgres` user (its password is set, used once, then immediately rotated to an unretained random value — nobody holds it going forward, and it can always be reset again via `gcloud sql users set-password` if ever needed). Migrations run as the developer's IAM identity through the Cloud SQL Auth Proxy, not as any service account.
 
@@ -121,7 +123,9 @@ curl -X POST \
   -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
   "$DISPATCHER_URL/dispatch"
 ```
-Same endpoint Cloud Scheduler hits; the developer's own `gcloud` identity satisfies `run.invoker` on `dispatcher-svc` if granted (or the demo simply runs it via `gcloud run services proxy dispatcher-svc` to avoid a separate IAM grant for the presenter). This is the mechanism that lets the capacity engine be shown live on camera without waiting for 7am.
+Same endpoint Cloud Scheduler hits; the developer's own `gcloud` identity is Owner on the project, which already satisfies `run.invoker` on `dispatcher-svc` without a separate grant. This is the mechanism that lets the capacity engine be shown live on camera without waiting for 7am.
+
+**Resolved gap, found in step 8: Scheduler jobs aren't Terraform either, same reasoning as `cloud_run.tf`'s absence (§6).** A job's `--uri` needs `dispatcher-svc`'s live Cloud Run URL, so it has the identical "needs the service to exist first" ordering problem push subscriptions have. `scripts/deploy.sh`'s `dispatcher-svc` case creates/updates both jobs imperatively after deploying the service, using `sa-dispatcher` itself as the OIDC identity (same pattern as `setup_push_subscription`: mint the token as the consuming service's own SA, not a separate one) — so the "Scheduler job's service account" in this section's opening paragraph *is* `sa-dispatcher`, not a dedicated Scheduler-only account.
 
 ---
 
@@ -138,11 +142,10 @@ infra/
   secret_manager.tf      # static secrets (placeholders; per-user secrets created at onboarding time, not by Terraform)
   service_accounts.tf    # 5 service accounts
   iam.tf                  # every binding in §2.1 that doesn't need a live Cloud Run URL first
-  cloud_scheduler.tf      # dispatch-daily, dispatch-midday
   variables.tf / outputs.tf
 ```
 
-**Resolved gap, found in step 4:** there is deliberately no `cloud_run.tf`. The Cloud Run service itself, its `run.invoker` bindings, and its Pub/Sub push subscription all need each other to exist in a specific order (service → URL → subscription; subscription's push service agent → service's `run.invoker`), and image tags change every deploy — so `scripts/deploy.sh` owns the whole chain imperatively per service (`gcloud run deploy`, then any `run.invoker` grants for that service's specific caller, then create-or-update its push subscription), not Terraform. This was already the intent behind `pubsub.tf`'s "not here" comment for subscriptions; it just hadn't been made explicit that the same applies to the Cloud Run service resource and its invoker IAM. `iam.tf` still owns bindings that don't depend on a live Cloud Run URL (e.g. Vertex AI access).
+**Resolved gap, found in step 4, extended in step 8:** there is deliberately no `cloud_run.tf` and no `cloud_scheduler.tf`. The Cloud Run service itself, its `run.invoker` bindings, its Pub/Sub push subscription, and (for `dispatcher-svc`) its two Cloud Scheduler jobs all need each other to exist in a specific order (service → URL → subscription/job; subscription or job's caller identity → service's `run.invoker`), and image tags change every deploy — so `scripts/deploy.sh` owns the whole chain imperatively per service (`gcloud run deploy`, then any `run.invoker` grants for that service's specific caller, then create-or-update its push subscription or Scheduler jobs), not Terraform. This was already the intent behind `pubsub.tf`'s "not here" comment for subscriptions; it just hadn't been made explicit that the same applies to the Cloud Run service resource, its invoker IAM, and Cloud Scheduler. `iam.tf` still owns bindings that don't depend on a live Cloud Run URL (e.g. Vertex AI access).
 
 Per-user Secret Manager secrets (`user-refresh-token-{user_id}`) are created at onboarding time by `committer-svc`'s own code path (via the Secret Manager API, `roles/secretmanager.admin` scoped narrowly to secret-creation — a small addition to `sa-committer` beyond §2.1's `secretAccessor`), not by Terraform — Terraform provisions the two static secrets and the IAM policy allowing dynamic secret creation, not the per-user secrets themselves.
 
