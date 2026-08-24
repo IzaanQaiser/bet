@@ -20,6 +20,26 @@ same mechanism as the old `if classification == "Y":`. The LlmAgent below
 has no `tools=[...]` — it cannot call anything, only return structured
 text. CORRECTION never publishes on its own, no matter how complete the
 merged fields look — only a subsequent, separate AFFIRM turn does.
+
+Conversation-continuity note (Phase G follow-up, same session as step D):
+ingest-svc routes any inbound SMS to whichever item this user has open
+(DUPLICATE_SUSPECTED/CLARIFYING/AWAITING_CONFIRMATION) purely by state —
+it has no way to know whether the message's *content* actually has
+anything to do with that item. Before this, every reply while an item was
+open got force-fed to converse() as if it must be about that item, which
+is wrong whenever it isn't (a stuck test item absorbing an unrelated
+follow-up was a real instance of this, found during step D's own live
+testing). Deliberately not fixed with a timeout — SMS threads are
+persistent on the user's screen, so a reply an hour or a day later is
+still often genuinely about the same item; only the reply's own content
+can tell related from unrelated. `relates_to_item` is that escape hatch:
+when the model says a reply doesn't relate, main.py leaves the open item
+completely untouched (no timeout-driven state change, nothing lost — it's
+still there waiting) and spins up a brand new item through the same path
+a first-contact message takes, via the new `create_raw_item` shared
+helper + `items-raw` publish. Verified empirically before wiring into
+main.py, per this project's pattern of not trusting a prompt-only change
+to a shared schema without a real Vertex AI check first.
 """
 
 import json
@@ -47,6 +67,23 @@ thread-attach candidate title if any, recent message history, and the
 user's latest reply (absent on the very first turn for a new item).
 
 Do, in order:
+
+0. Relatedness (only meaningful when a latest reply is given — on the very
+   first turn for a new item there is no reply yet, so this is trivially
+   true): decide whether the latest reply actually relates to THIS item at
+   all, or reads like a completely separate new thought/request/topic the
+   user is bringing up instead of responding to this one. Text threads are
+   persistent — a reply given a long time after the last message can still
+   obviously relate to it, so elapsed time is never a reason by itself to
+   call something unrelated. A reply that doesn't fully resolve what's
+   missing, or is vague/hesitant/off-hand, is still about the item — don't
+   call it unrelated just because it doesn't answer the question. Only set
+   relates_to_item false when the CONTENT itself reads as a genuinely
+   different topic: a new obligation, a new unconnected chat message, etc.
+   When false, leave every other field at its default (empty still_missing,
+   null intent, due_at_filled false, empty reply_text) — this item is left
+   completely alone and the reply is handled as its own separate thing
+   elsewhere; do not reference this item in reply_text.
 
 1. Field merging: if the latest reply resolves due_at (a date/time given or
    clearly implied) AND due_at is listed as missing (or this is a
@@ -106,6 +143,7 @@ Output must conform exactly to the provided schema. No text outside it.
 
 
 class ConversationTurnResult(BaseModel):
+    relates_to_item: bool = True
     due_at_filled: bool = False
     due_at: str | None = None
     email_recipient_filled: bool = False
@@ -181,4 +219,11 @@ async def converse(
     # the one choke point every caller goes through, rather than trusting
     # the prompt alone.
     result.still_missing = [f for f in result.still_missing if f in ("due_at", "email_recipient")]
+
+    # Defensive, same reasoning as above: relates_to_item is only ever
+    # meaningful when there's an actual reply to judge. Forcing it true on
+    # the first turn (no latest_reply) means a caller never has to special-
+    # case that path — it can check the field unconditionally.
+    if latest_reply is None:
+        result.relates_to_item = True
     return result

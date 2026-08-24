@@ -207,6 +207,92 @@ def test_missing_fields_starts_clarification_not_left_stalled(client):
     assert update_calls[0].args[1][-2] == "CLARIFYING"
 
 
+def test_unrelated_reply_during_clarification_routes_as_new_item(client):
+    """Conversation-continuity follow-up (main.py module docstring): a
+    reply that arrives while an item is CLARIFYING but doesn't actually
+    relate to it (converse() sets relates_to_item=False) must not be
+    force-merged into the pending field — the open item is left completely
+    untouched (no items/conversations UPDATE at all) and the text gets its
+    own brand-new item via create_raw_item + an items-raw publish, exactly
+    like a first-contact message."""
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent, deadline unclear.", 15, "CLARIFYING"),
+        conversation_row=(["due_at"], {}, 0),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.publish") as mock_publish,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
+    ):
+        mock_converse.return_value = ConversationTurnResult(relates_to_item=False, reply_text="")
+        resp = client.post(
+            "/reply",
+            json={"user_id": user_id, "item_id": item_id, "text": "remind me to call mom tomorrow"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "routed_as_new_item"
+    assert body["item_id"] == item_id
+    assert UUID(body["new_item_id"]) != UUID(item_id)
+
+    mock_sms.assert_not_called()  # the new item's own turn replies, not this one
+    mock_publish.assert_called_once()
+    topic, message = mock_publish.call_args.args
+    assert topic == "items-raw"
+    assert message.text == "remind me to call mom tomorrow"
+    assert str(message.item_id) == body["new_item_id"]
+
+    # the original CLARIFYING item is genuinely untouched
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    convo_updates = [c for c in conn.execute.call_args_list if "UPDATE conversations" in c.args[0]]
+    assert update_calls == []
+    assert convo_updates == []
+    insert_calls = [c for c in conn.execute.call_args_list if "INSERT INTO items" in c.args[0]]
+    assert len(insert_calls) == 1  # the new item's own RECEIVED row
+
+
+def test_unrelated_reply_during_confirmation_routes_as_new_item(client):
+    """Same escape hatch, at the AWAITING_CONFIRMATION stage — an unrelated
+    reply must not be forced through AFFIRM/DENY/CORRECTION/ATTACH
+    classification (and, critically, must never be misread as an AFFIRM)."""
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION"),
+        conversation_row=({"due_at": "2026-09-04T14:00:00"},),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.publish") as mock_publish,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
+    ):
+        mock_converse.return_value = ConversationTurnResult(relates_to_item=False, reply_text="")
+        resp = client.post(
+            "/reply",
+            json={
+                "user_id": user_id,
+                "item_id": item_id,
+                "text": "lol did you see the game last night",
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "routed_as_new_item"
+    mock_sms.assert_not_called()
+
+    raw_publishes = [c for c in mock_publish.call_args_list if c.args[0] == "items-raw"]
+    assert len(raw_publishes) == 1
+    confirmed_publishes = [c for c in mock_publish.call_args_list if c.args[0] == "items-confirmed"]
+    assert confirmed_publishes == []  # never misread as AFFIRM
+
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert update_calls == []  # still AWAITING_CONFIRMATION, untouched
+
+
 def test_malformed_envelope_returns_500_for_retry(client):
     resp = client.post("/pubsub/push", json={"message": {"data": "not-valid-base64json"}})
     assert resp.status_code == 500
@@ -509,6 +595,43 @@ def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):
     assert "pay rent" in mock_sms.call_args.args[2]
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "AWAITING_CONFIRMATION" in update_calls[0].args[0]
+
+
+def test_duplicate_reply_outside_yn_routes_as_new_item(client):
+    """Before this fix, a dedupe reply that classify_reply() couldn't parse
+    as Y or N was silently dropped — no SMS, no new item, nothing (found
+    while fixing the same bug class on the converse()-driven paths above).
+    Now it gets the same treatment: the pending dedupe question is left
+    alone, the text becomes its own new item."""
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
+        conversation_row=(
+            [],
+            {"_dedupe_match_item_id": str(uuid4()), "_dedupe_match_title": "Pay rent"},
+        ),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.publish") as mock_publish,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+    ):
+        resp = client.post(
+            "/reply",
+            json={"user_id": user_id, "item_id": item_id, "text": "actually book a haircut friday"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "routed_as_new_item"
+    mock_sms.assert_not_called()
+    mock_publish.assert_called_once()
+    topic, message = mock_publish.call_args.args
+    assert topic == "items-raw"
+    assert message.text == "actually book a haircut friday"
+
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert update_calls == []  # still DUPLICATE_SUSPECTED, untouched
 
 
 def test_duplicate_n_reply_with_missing_fields_resumes_clarification(client):
