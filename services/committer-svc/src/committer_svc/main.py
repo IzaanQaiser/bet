@@ -16,12 +16,31 @@ a dead-lettered message's data is the original payload unchanged, and
 Pub/Sub attaches the real delivery count as an attribute — see
 obligation_engine_shared.pubsub.decode_dead_letter_envelope.
 
-Also adds an idempotency guard on /pubsub/push: a concurrent Pub/Sub
-redelivery of the same items.confirmed message (the same class of race
-found for real in step 11's resolver-svc testing) would otherwise create
-a second real Calendar event before the second obligations INSERT ever
-had a chance to fail on the primary key — checking items.state up front
-and no-op'ing anything already past CONFIRMED closes that window.
+Also adds an idempotency guard on /pubsub/push, to catch the same class
+of concurrent-redelivery race found for real in step 11's resolver-svc
+testing. The guard is keyed on _already_committed() — whether the row
+this exact message type would write (obligations for type="obligation",
+latents for type="latent") already exists — not on items.state. An
+earlier draft checked items.state != 'CONFIRMED', and a real bug found
+verifying step 14's accept path against real infra showed why that's
+wrong: dispatcher-svc's accept publish for a latent arrives with
+items.state already 'COMMITTED' (from that item's *original* commit as
+a latent) — a second, legitimate pass through this endpoint for the
+same item, not a redelivery of anything. The state-only guard silently
+swallowed it: no obligations row was ever written, no Calendar event
+created, no error logged — the accept just vanished. See
+_already_committed()'s docstring and state-machine.md §2.3 for the full
+writeup.
+
+Step 14 also exposed a smaller, related real gap: _commit_obligation's
+items UPDATE only ever set state, never type — harmless for every path
+built before this one, since a resolver-confirmed item's type never
+changes between EXTRACTED and COMMITTED. dispatcher-svc's accept path is
+the first caller that actually needs type to change (a latent becoming
+an obligation) — committer-svc "has no way to tell the two apart, and
+doesn't need to" per that doc, so the fix is to just always write
+confirmed.type here, a no-op for the pre-existing path and correct for
+the new one.
 """
 
 import logging
@@ -121,8 +140,8 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
             (str(confirmed.item_id), confirmed.due_at, calendar_event_id, confirmed.action_type),
         )
         conn.execute(
-            "UPDATE items SET state = 'COMMITTED', updated_at = now() WHERE id = %s",
-            (str(confirmed.item_id),),
+            "UPDATE items SET type = %s, state = 'COMMITTED', updated_at = now() WHERE id = %s",
+            (confirmed.type, str(confirmed.item_id)),
         )
         conn.commit()
 
@@ -137,6 +156,27 @@ def _commit_latent(confirmed: ConfirmedItemMessage) -> None:
         conn.commit()
 
 
+def _already_committed(conn, confirmed: ConfirmedItemMessage) -> bool:
+    """Keyed on the row this exact message type would write, not on
+    items.state — state='COMMITTED' is not itself proof this message was
+    already handled. A real bug, found verifying step 14's accept path
+    against real infra: dispatcher-svc's accept publish arrives for an
+    item already state='COMMITTED' from its *original* latent commit
+    (state-machine.md §2.3 — this is a second, legitimate pass through
+    this endpoint for the same item, not a redelivery). A blanket
+    `state != 'CONFIRMED'` guard silently swallowed it — no obligations
+    row was ever written, no error logged, the accept just vanished."""
+    if confirmed.type == "obligation":
+        row = conn.execute(
+            "SELECT 1 FROM obligations WHERE item_id = %s LIMIT 1", (str(confirmed.item_id),)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM latents WHERE item_id = %s LIMIT 1", (str(confirmed.item_id),)
+        ).fetchone()
+    return row is not None
+
+
 @app.post("/pubsub/push")
 async def pubsub_push(request: Request):
     envelope = await request.json()
@@ -147,18 +187,16 @@ async def pubsub_push(request: Request):
         raise HTTPException(status_code=500, detail="malformed envelope") from None
 
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT state FROM items WHERE id = %s", (str(confirmed.item_id),)
-        ).fetchone()
-    if row is not None and row[0] != "CONFIRMED":
+        already_committed = _already_committed(conn, confirmed)
+    if already_committed:
         # A concurrent redelivery of the same items.confirmed message,
-        # arriving after the first delivery already committed (or is far
-        # enough along that reprocessing would double-write Calendar) —
-        # module docstring's real-bug-class note. Not an error: ack it as
-        # a no-op rather than retrying or dead-lettering an item that's
-        # already been handled.
+        # arriving after the first delivery already wrote the row this
+        # exact message type would write. Not an error: ack it as a
+        # no-op rather than retrying or double-writing Calendar.
         logger.info(
-            "skipping already-processed item_id=%s state=%s (redelivery)", confirmed.item_id, row[0]
+            "skipping already-committed item_id=%s type=%s (redelivery)",
+            confirmed.item_id,
+            confirmed.type,
         )
         return {"status": "already_processed", "item_id": str(confirmed.item_id)}
 

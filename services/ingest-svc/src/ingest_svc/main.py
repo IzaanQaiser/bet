@@ -5,13 +5,15 @@ publish to items.raw. Text-only — media handling is step 11.
 
 Step 9 adds the inbound-SMS routing check (state-machine.md §4): before
 treating a message as new, check for an open conversation (an item in
-CLARIFYING or AWAITING_CONFIRMATION) for that user, and forward to
-resolver-svc's /reply instead. The second branch of that routing table
-— forwarding a suggestion Y/N/Later reply to dispatcher-svc — is not
-built yet; dispatcher-svc has no accept-path endpoint until the
-feedback-loop step, so that branch would have nothing to call. Not a
-silent gap: nothing sends a suggestion that could be replied to in this
-deployment's current state either, so it can't be hit for real yet.
+DUPLICATE_SUSPECTED, CLARIFYING, or AWAITING_CONFIRMATION) for that
+user, and forward to resolver-svc's /reply instead. Step 14 completes
+the routing table's second branch: if no conversation is open, check
+for an open suggestion (outcome IS NULL) and forward a Y/N/Later reply
+to dispatcher-svc's /reply instead — dispatcher-svc has an accept-path
+endpoint as of that step. An open conversation always wins over an open
+suggestion (state-machine.md §4's stated precedence) — a pending
+suggestion just keeps waiting, bounded by its own 24h no-response
+timeout independent of whatever conversation is in progress.
 
 Step 11 adds MMS media handling (overview.md's media path): an
 image/PDF attachment is downloaded from Twilio, persisted to GCS, and
@@ -108,6 +110,32 @@ def _forward_to_resolver(user_id: UUID, item_id: UUID, text: str) -> None:
     response.raise_for_status()
 
 
+def _open_suggestion_item_id(conn, user_id: UUID) -> UUID | None:
+    # state-machine.md §4 step 2 — built in step 14, dispatcher-svc has no
+    # accept-path endpoint before this. An open conversation always wins
+    # over an open suggestion (checked first by the caller); a pending
+    # suggestion just keeps waiting, bounded by its own 24h no-response
+    # timeout independent of whatever conversation is in progress.
+    row = conn.execute(
+        "SELECT item_id FROM suggestions WHERE user_id = %s AND outcome IS NULL "
+        "ORDER BY sent_at DESC LIMIT 1",
+        (str(user_id),),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _forward_to_dispatcher(user_id: UUID, item_id: UUID, text: str) -> None:
+    dispatcher_url = os.environ["DISPATCHER_SVC_URL"]
+    id_token = fetch_id_token(GoogleAuthRequest(), dispatcher_url)
+    response = requests.post(
+        f"{dispatcher_url}/reply",
+        json={"user_id": str(user_id), "item_id": str(item_id), "text": text},
+        headers={"Authorization": f"Bearer {id_token}"},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
 def _store_media(item_id: UUID, media_url: str, content_type: str) -> str:
     response = requests.get(
         media_url,
@@ -141,10 +169,17 @@ async def sms_webhook(request: Request):
     with get_connection() as conn:
         user_id = _resolve_user_id(conn, from_number)
         open_item_id = _open_conversation_item_id(conn, user_id)
+        open_suggestion_item_id = None if open_item_id is not None else _open_suggestion_item_id(
+            conn, user_id
+        )
 
     if open_item_id is not None:
         _forward_to_resolver(user_id, open_item_id, text or "")
         return {"status": "routed_to_resolver", "item_id": str(open_item_id)}
+
+    if open_suggestion_item_id is not None:
+        _forward_to_dispatcher(user_id, open_suggestion_item_id, text or "")
+        return {"status": "routed_to_dispatcher", "item_id": str(open_suggestion_item_id)}
 
     # Media downloaded/uploaded before any DB write, not after: if this
     # fails, Twilio's retry starts clean with nothing written yet, rather

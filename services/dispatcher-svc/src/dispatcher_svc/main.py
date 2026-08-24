@@ -3,12 +3,20 @@ trigger, infrastructure.md §5): computes 7 forward `capacity_snapshots`
 rows from real Calendar reads, sends idempotent obligation reminders, and
 sends at most one latent-revival suggestion per run.
 
-Deliberately NOT built here: parsing a Y/N/Later reply to a sent
-suggestion, or moving a latent out of the SURFACED phase — those are the
-latent-lifecycle transitions (state-machine.md §2.2), which is a
-different concern from *sending* the suggestion and belongs with the
-feedback-loop step. A sent suggestion just sits as a `suggestions` row
-with `outcome IS NULL` until that step exists.
+Step 14 adds `POST /reply` — the Y/N/Later response to a sent
+suggestion (state-machine.md §2.2/§2.3), routed here by `ingest-svc`
+once a suggestion is actually reachable to reply to. `N` increments
+`dismissal_count` (>= 2 → 30d dormancy via `dormant_until`, reused from
+snoozing per §2.2's decision — one column, two callers); `Later` snoozes
+7d with no penalty; `Y` re-fetches *real, current* Calendar availability
+for the suggested day (the original snapshot can be stale by the time a
+reply arrives — hours or a day later) and publishes directly to
+`items.confirmed`, bypassing resolver-svc entirely (§2.3 — no Gemini
+call, every field is already known). Also adds the 24h no-response
+timeout (§2.2) at the top of `/dispatch`'s per-user loop, resolved
+before that same run scores any new suggestion — otherwise a stale open
+suggestion would wrongly keep excluding its own latent from
+reconsideration.
 """
 
 import logging
@@ -17,9 +25,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from google.auth.transport.requests import AuthorizedSession
 from obligation_engine_shared.db import get_connection
+from obligation_engine_shared.pubsub import publish
+from obligation_engine_shared.reply_classifier import classify_reply
+from obligation_engine_shared.schemas import ConfirmedItemMessage, RoutedReplyMessage
 from twilio.rest import Client as TwilioClient
 
 from dispatcher_svc.calendar_client import fetch_events_for_range, user_credentials
@@ -35,10 +46,18 @@ from dispatcher_svc.capacity_engine import (
     load_delta,
     select_suggestion,
 )
-from dispatcher_svc.templates import render_reminder, render_suggestion
+from dispatcher_svc.templates import (
+    render_accepted,
+    render_dismissed,
+    render_reminder,
+    render_snoozed,
+    render_suggestion,
+)
 
 logger = logging.getLogger("dispatcher_svc")
 app = FastAPI()
+
+EFFORT_BUCKETS = (15, 30, 60, 120, 240)  # ConfirmedItemMessage's Literal, schemas.py
 
 # Plain config, not secrets — same treatment as every other Twilio/OAuth
 # identifier in this project (infrastructure.md §4.1, §4's "not a secret"
@@ -134,6 +153,23 @@ def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
     if sent:
         conn.commit()
     return sent
+
+
+def _resolve_stale_suggestions(conn, user_id) -> int:
+    """SURFACED -> ELIGIBLE via outcome='no_response', no dismissal
+    penalty, after 24h of silence (state-machine.md §2.2). Must run
+    before this same run's _eligible_latents/_send_suggestion — a stale
+    open suggestion's has_open_suggestion=True would otherwise keep
+    excluding its latent from ever being reconsidered."""
+    rows = conn.execute(
+        "UPDATE suggestions SET outcome = 'no_response', responded_at = now() "
+        "WHERE user_id = %s AND outcome IS NULL AND sent_at <= now() - interval '24 hours' "
+        "RETURNING id",
+        (str(user_id),),
+    ).fetchall()
+    if rows:
+        conn.commit()
+    return len(rows)
 
 
 def _eligible_latents(conn, user_id, tz) -> list[LatentCandidate]:
@@ -250,6 +286,7 @@ async def dispatch():
             conn.commit()
 
             reminders_sent = _send_reminders(conn, user_id, phone, now_utc, tz)
+            stale_resolved = _resolve_stale_suggestions(conn, user_id)
             latents = _eligible_latents(conn, user_id, tz)
             suggestion_sent = _send_suggestion(
                 conn, user_id, phone, tz, day_context, today, latents
@@ -260,12 +297,164 @@ async def dispatch():
                 "user_id": str(user_id),
                 "snapshots_persisted": len(day_context),
                 "reminders_sent": reminders_sent,
+                "stale_suggestions_resolved": stale_resolved,
                 "suggestion_sent": suggestion_sent,
             }
         )
 
     logger.info("dispatch complete: %s", results)
     return {"status": "ok", "results": results}
+
+
+def _capped_effort_minutes(original: int, block_minutes: int) -> int:
+    """state-machine.md §2.3: "duration = effort_minutes, capped at the
+    block length." ConfirmedItemMessage.effort_minutes is a strict
+    Literal[15, 30, 60, 120, 240] (schemas.py), so "capped" is
+    reinterpreted here as the largest bucket that still fits the block —
+    falling back to the smallest bucket if even that overruns, rather
+    than refusing to schedule an explicit user Y over a small overrun."""
+    fitting = [b for b in EFFORT_BUCKETS if b <= original and b <= block_minutes]
+    return max(fitting) if fitting else EFFORT_BUCKETS[0]
+
+
+def _open_suggestion_context(conn, item_id):
+    return conn.execute(
+        """
+        SELECT s.id, s.snapshot_id, i.title, i.summary, i.effort_minutes,
+               l.dismissal_count, u.timezone, u.working_hours_start, u.working_hours_end,
+               u.google_refresh_token_ref, u.phone_e164, cs.date
+        FROM suggestions s
+        JOIN items i ON i.id = s.item_id
+        JOIN latents l ON l.item_id = s.item_id
+        JOIN users u ON u.id = s.user_id
+        JOIN capacity_snapshots cs ON cs.id = s.snapshot_id
+        WHERE s.item_id = %s AND s.outcome IS NULL
+        ORDER BY s.sent_at DESC LIMIT 1
+        """,
+        (str(item_id),),
+    ).fetchone()
+
+
+def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
+    (_id, _snapshot_id, title, summary, effort_minutes, _dismissal_count, tz_name, wh_start,
+     wh_end, refresh_ref, phone, snapshot_date) = ctx
+
+    if refresh_ref is None:
+        logger.error("user_id=%s has no linked Google account, cannot accept", payload.user_id)
+        raise HTTPException(status_code=500, detail="no linked Google account")
+
+    # Real current availability, not the (possibly stale) snapshot from
+    # when the suggestion was sent — a reply can arrive hours or a day
+    # later, and the day's Calendar state can have changed since.
+    session = AuthorizedSession(user_credentials(refresh_ref))
+    events_by_day = fetch_events_for_range(session, snapshot_date, snapshot_date, tz_name)
+    intervals = free_intervals(snapshot_date, events_by_day[snapshot_date], wh_start, wh_end)
+    largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
+
+    if largest is None:
+        # The day genuinely filled up between send and reply — a real
+        # edge case, not hypothetical. Tell the user rather than
+        # silently failing or scheduling into a conflict.
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE suggestions SET outcome = 'dismissed', responded_at = now() WHERE id = %s",
+                (suggestion_id,),
+            )
+            conn.commit()
+        _send_sms(
+            phone, f'Sorry, that day filled up — I couldn\'t find room for "{title}" anymore.'
+        )
+        logger.info("accept failed, no free block left item_id=%s", payload.item_id)
+        return {"status": "no_capacity", "item_id": str(payload.item_id)}
+
+    capped_effort = _capped_effort_minutes(effort_minutes, largest.duration_minutes)
+    due_at_local = datetime.combine(snapshot_date, largest.start, tzinfo=ZoneInfo(tz_name))
+
+    confirmed = ConfirmedItemMessage(
+        item_id=payload.item_id,
+        user_id=payload.user_id,
+        type="obligation",
+        title=title,
+        summary=summary,
+        due_at=due_at_local,
+        effort_minutes=capped_effort,
+        action_type="calendar",
+        email_draft=None,
+    )
+    publish("items-confirmed", confirmed)
+
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE suggestions SET outcome = 'accepted', responded_at = now() WHERE id = %s",
+            (suggestion_id,),
+        )
+        conn.commit()
+    _send_sms(phone, render_accepted(title, due_at_local))
+    logger.info("ACCEPTED item_id=%s due_at=%s", payload.item_id, due_at_local)
+    return {"status": "accepted", "item_id": str(payload.item_id)}
+
+
+@app.post("/reply")
+async def reply(payload: RoutedReplyMessage):
+    with get_connection() as conn:
+        ctx = _open_suggestion_context(conn, payload.item_id)
+    if ctx is None:
+        logger.warning("reply routed for item_id=%s with no open suggestion", payload.item_id)
+        return {"status": "unexpected_state", "item_id": str(payload.item_id)}
+    (
+        suggestion_id, _snapshot_id, _title, _summary, _effort_minutes, dismissal_count,
+        _tz_name, _wh_start, _wh_end, _refresh_ref, phone, _snapshot_date,
+    ) = ctx
+
+    classification = classify_reply(payload.text)
+
+    if classification == "Y":
+        return _accept_suggestion(payload, suggestion_id, ctx)
+
+    if classification == "N":
+        new_count = dismissal_count + 1
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE suggestions SET outcome = 'dismissed', responded_at = now() WHERE id = %s",
+                (suggestion_id,),
+            )
+            if new_count >= 2:
+                conn.execute(
+                    "UPDATE latents SET dismissal_count = %s, "
+                    "dormant_until = now() + interval '30 days' WHERE item_id = %s",
+                    (new_count, str(payload.item_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE latents SET dismissal_count = %s WHERE item_id = %s",
+                    (new_count, str(payload.item_id)),
+                )
+            conn.commit()
+        _send_sms(phone, render_dismissed())
+        logger.info("DISMISSED item_id=%s dismissal_count=%d", payload.item_id, new_count)
+        return {"status": "dismissed", "item_id": str(payload.item_id)}
+
+    if classification == "LATER":
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE suggestions SET outcome = 'snoozed', responded_at = now() WHERE id = %s",
+                (suggestion_id,),
+            )
+            conn.execute(
+                "UPDATE latents SET dormant_until = now() + interval '7 days' WHERE item_id = %s",
+                (str(payload.item_id),),
+            )
+            conn.commit()
+        _send_sms(phone, render_snoozed())
+        logger.info("SNOOZED item_id=%s", payload.item_id)
+        return {"status": "snoozed", "item_id": str(payload.item_id)}
+
+    logger.info(
+        "suggestion reply outside Y/N/Later, not handled item_id=%s text=%r",
+        payload.item_id,
+        payload.text,
+    )
+    return {"status": "unhandled_reply", "item_id": str(payload.item_id)}
 
 
 @app.get("/health")

@@ -1,14 +1,15 @@
 """Integration tests against the real dev Postgres (via the Cloud SQL Auth
-Proxy) — docs/engineering/test-plan.md step 8. Calendar and Twilio are
-mocked (a real Calendar-backed run is the required manual verification,
-per the test plan — mocks can't validate real OAuth/API behavior); no
-Pub/Sub emulator needed, dispatcher-svc doesn't publish in this step's
-scope (the accept-path publish, agent-contracts.md §4.4, is deferred —
-see main.py's module docstring).
+Proxy) — docs/engineering/test-plan.md steps 8 and 14. Calendar and
+Twilio are mocked throughout (a real Calendar-backed run is the required
+manual verification, per the test plan — mocks can't validate real
+OAuth/API behavior). Step 14's accept-path test also needs the real
+Pub/Sub emulator, since it's the first thing in this file that actually
+publishes.
 
 Requires DB_USER, DB_HOST, DB_PORT set. Skipped automatically otherwise.
 """
 
+import json
 import os
 import uuid
 from datetime import UTC, datetime, time, timedelta
@@ -91,13 +92,17 @@ def test_user():
 
 
 def _insert_committed_latent(user_id, created_at):
+    # summary included from step 14 on — a real committed latent always
+    # has one (extractor-svc's schema requires it, never optional), and
+    # the accept path (unlike step 8's suggestion template) actually
+    # needs it to build a real ConfirmedItemMessage.
     with get_connection() as conn:
         row = conn.execute(
             """
             INSERT INTO items (user_id, raw_channel, ingested_at, created_at, state, type, title,
-                                effort_minutes, focus_depth)
+                                summary, effort_minutes, focus_depth)
             VALUES (%s, 'sms', now(), %s, 'COMMITTED', 'latent',
-                    'Rewrite the ingest pipeline in Rust', 120, 'deep')
+                    'Rewrite the ingest pipeline in Rust', 'Someday, no rush.', 120, 'deep')
             RETURNING id
             """,
             (str(user_id), created_at),
@@ -212,3 +217,105 @@ def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
         c for c in mock_sms_second_run.call_args_list if "is due" in c.kwargs["body"]
     ]
     assert len(reminder_calls_second) == 0
+
+
+# --- step 14: accept-path full cycle --------------------------------------
+
+
+@pytest.fixture
+def confirmed_subscription():
+    from google.cloud import pubsub_v1
+
+    subscriber = pubsub_v1.SubscriberClient()
+    project_id = os.environ["GCP_PROJECT_ID"]
+    topic_path = subscriber.topic_path(project_id, "items-confirmed")
+    sub_name = f"test-dispatcher-reply-{uuid.uuid4().hex[:8]}"
+    sub_path = subscriber.subscription_path(project_id, sub_name)
+    subscriber.create_subscription(name=sub_path, topic=topic_path)
+    yield subscriber, sub_path
+    subscriber.delete_subscription(subscription=sub_path)
+
+
+def test_accept_path_full_cycle(client, test_user, confirmed_subscription):
+    """SURFACED -> Y -> items.confirmed published with type flipped to
+    obligation and due_at computed as the real current block start,
+    capped at the block length (state-machine.md §2.3). committer-svc
+    consuming this correctly is covered by its own test suite — this
+    test's boundary is dispatcher-svc's real publish."""
+    user_id, _phone = test_user
+    subscriber, sub_path = confirmed_subscription
+    item_id = _insert_committed_latent(
+        user_id, datetime.now(UTC) - timedelta(days=18, hours=1)
+    )
+
+    # One consistent local "tomorrow" for the snapshot row, the mocked
+    # Calendar events, and the final assertion — computed once so this
+    # doesn't flake near UTC/local-date boundaries.
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).astimezone(ZoneInfo(TZ_NAME)).date()
+
+    with get_connection() as conn:
+        snapshot_row = conn.execute(
+            """
+            INSERT INTO capacity_snapshots
+                (user_id, date, free_minutes, largest_contiguous_block,
+                 fragmentation_index, load_delta)
+            VALUES (%s, %s, 180, 180, 0.0, -0.3)
+            RETURNING id
+            """,
+            (str(user_id), tomorrow),
+        ).fetchone()
+        snapshot_id = snapshot_row[0]
+        conn.execute(
+            "INSERT INTO suggestions (item_id, user_id, snapshot_id) VALUES (%s, %s, %s)",
+            (str(item_id), str(user_id), snapshot_id),
+        )
+        conn.commit()
+
+    # A single 3h free block from 12:00-15:00 — matches capacity-engine.md
+    # §6's worked example exactly (a 120min deep item fits under it).
+    events_by_day = {
+        tomorrow: [
+            Event(start=time(9, 0), end=time(12, 0)),
+            Event(start=time(15, 0), end=time(18, 0)),
+        ]
+    }
+
+    with (
+        patch("dispatcher_svc.main.user_credentials", return_value=MagicMock()),
+        patch("dispatcher_svc.main.AuthorizedSession", return_value=MagicMock()),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main._send_sms") as mock_sms,
+    ):
+        resp = client.post(
+            "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "y"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "accepted", "item_id": str(item_id)}
+    mock_sms.assert_called_once()
+
+    with get_connection() as conn:
+        item_type = conn.execute(
+            "SELECT type FROM items WHERE id = %s", (str(item_id),)
+        ).fetchone()[0]
+        outcome = conn.execute(
+            "SELECT outcome FROM suggestions WHERE item_id = %s", (str(item_id),)
+        ).fetchone()[0]
+    # items.type only flips once committer-svc consumes the message and
+    # writes it (this step's own "Resolved gap" fix) — not yet at this
+    # point, since nothing here runs committer-svc. Still 'latent' here
+    # is correct; the outcome column is dispatcher-svc's own write.
+    assert item_type == "latent"
+    assert outcome == "accepted"
+
+    pulled = subscriber.pull(subscription=sub_path, max_messages=1, timeout=15)
+    assert len(pulled.received_messages) == 1
+    confirmed_data = json.loads(pulled.received_messages[0].message.data)
+    subscriber.acknowledge(
+        subscription=sub_path, ack_ids=[m.ack_id for m in pulled.received_messages]
+    )
+    assert confirmed_data["item_id"] == str(item_id)
+    assert confirmed_data["type"] == "obligation"
+    assert confirmed_data["action_type"] == "calendar"
+    assert confirmed_data["effort_minutes"] == 120  # fits under the 180min block untouched
+    assert confirmed_data["due_at"].startswith(tomorrow.isoformat() + "T12:00:00")

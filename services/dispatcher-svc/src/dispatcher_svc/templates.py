@@ -77,3 +77,15 @@ def render_suggestion(
         f"   (you mentioned this {days_since_capture} days ago)\n\n"
         f"Want it on the calendar? Y / N / Later"
     )
+
+
+def render_accepted(title: str, due_at: datetime) -> str:
+    return f"📅 {title}\n{format_due_at(due_at)} — added to your calendar."
+
+
+def render_dismissed() -> str:
+    return "Got it, I won't suggest that again for a while."
+
+
+def render_snoozed() -> str:
+    return "OK, I'll check back in about a week."
