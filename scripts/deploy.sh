@@ -177,7 +177,7 @@ case "$SERVICE" in
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
       --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL},DISPATCHER_SVC_URL=${DISPATCHER_SVC_URL},TWILIO_ACCOUNT_SID=AC3292d4a7944b87b2fe3db562856e32bd" \
       --set-secrets="TWILIO_AUTH_TOKEN=twilio-auth-token:latest" \
-      --min-instances=0 \
+      --min-instances=1 \
       --allow-unauthenticated \
       --account=waslyrideshare@gmail.com
     ;;
@@ -193,7 +193,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,VERTEX_LOCATION=global,GEMINI_MODEL=gemini-3.5-flash" \
-      --min-instances=0 \
+      --min-instances=1 \
       --no-allow-unauthenticated \
       --account=waslyrideshare@gmail.com
 
@@ -220,7 +220,7 @@ case "$SERVICE" in
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
       --set-env-vars="DB_USER=sa-resolver@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,VERTEX_LOCATION=global,GEMINI_MODEL=gemini-3.5-flash" \
       --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
-      --min-instances=0 \
+      --min-instances=1 \
       --no-allow-unauthenticated \
       --account=waslyrideshare@gmail.com
 

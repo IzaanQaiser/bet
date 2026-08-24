@@ -2,7 +2,7 @@
 
 Read this after the PRD at the start of every session — it's the fast answer to "where are we." Update it whenever a build-order step completes, starts, or gets blocked. This is a living tracker, not a history — keep it short and current; git log is the historical record.
 
-**Last updated:** 2026-08-24 (session 5)
+**Last updated:** 2026-08-24 (session 6)
 
 ---
 
@@ -14,7 +14,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**Steps 1-15 done. Next: Phase F — ship (steps 16-19).**
+**Steps 1-15 done. Phase F (ship) paused — user live-tested the system and redirected toward a conversational UX redesign first (Phase G, in progress). Plan: `/Users/izaan/.claude/plans/spicy-purring-karp.md`.**
 
 | Step | Status |
 |---|---|
@@ -39,10 +39,16 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 | 14. Feedback loop / dismissal scoring | **Done** — deployed to Cloud Run (`dispatcher-svc` + `ingest-svc` + `committer-svc`), real end-to-end verified: a real `Y` reply produced a real Calendar event and flipped a latent to a committed obligation, a real `N` incremented `dismissal_count`, a real `Later` set `dormant_until = now()+7d` — all via real signed webhooks routed live through `ingest-svc` → `dispatcher-svc`. Two real bugs found in the process (both in step 13's idempotency guard, not new step-14 code) and a real DB grant migration — see Notes. |
 | 15. Email draft + send action (stretch) | **Done** — deployed to Cloud Run (`extractor-svc` + `resolver-svc` + `committer-svc`), real end-to-end verified: a real self-addressed SMS was classified `action_type="email"`, drafted a real body, showed the real draft on a real confirmation card, and a real `Y` reply triggered a real Gmail send (`obligations.email_sent_at` set, no exception from the real API call). Spec written before any code (agent-contracts.md §2.1/§3.2/§3.3, state-machine.md §1.5), resolving the "Open gap, flagged rather than invented" note carried since step 9. Found and fixed a real Gemini prompt gap and a real, systemic Pub/Sub ack-deadline bug along the way — see Notes. |
 | **Phase F — Ship** | |
-| 16. Seed demo data script | Not started |
-| 17. Record demo | Not started |
-| 18. README, diagram export, write-up | Not started |
-| 19. Bonus (blog, social, Veo, Lyria, real onboarding) | Not started |
+| 16. Seed demo data script | Not started — paused for Phase G |
+| 17. Record demo | Not started — paused for Phase G |
+| 18. README, diagram export, write-up | Not started — paused for Phase G |
+| 19. Bonus (blog, social, Veo, Lyria, real onboarding) | Not started — paused for Phase G |
+| **Phase G — Conversational redesign (new, user-directed)** | |
+| A. Latency fix (`--min-instances=1`) | **Done** — see Notes |
+| B. Chat detection (`is_actionable`/`chat_reply`, new `CHATTED` state) | Not started |
+| C. `messages` table (tone-mirroring plumbing) | Not started |
+| D. Unified conversational turn (resolver-svc) — replaces `clarification.py`/`templates.py`/`reply_classifier.py` for the main confirm flow | Not started |
+| Phase 2 follow-up — dispatcher-svc suggestion flow gets the same treatment | Not started (explicit follow-up, not in this pass) |
 
 ## Blockers
 
@@ -154,3 +160,8 @@ None.
   - **Real bug #1, found in a scratch test against real Vertex AI before ever deploying:** the first prompt draft didn't override the general "obligation implies a deadline" assumption every other rule relies on — a real, fully-specified email obligation with no date mentioned at all still got `due_at` added to `missing_fields`, wrongly asking a clarifying question about a date nobody implied. Fixed with an explicit carve-out in the prompt (`agent-contracts.md` §2.1), reconfirmed on two more real Vertex AI calls (a complete case → `missing_fields=[]`; a name-only recipient case → `missing_fields=["email_recipient"]` alone, not also `due_at`).
   - **Real bug #2, found live-testing the deployed pipeline end to end — and not really a step-15 bug at all, a latent, project-wide gap step 15 happened to be slow enough to trigger for the first time:** a real self-addressed test message hit the exact concurrent-Pub/Sub-redelivery race step 11 first found in `resolver-svc`, except this time in `extractor-svc` — which has **zero** database access (ADR 0003) and therefore cannot have the same kind of idempotency guard `resolver-svc`/`committer-svc` do. Root-caused to something that had been silently wrong since step 1: every push subscription's ack deadline was still Pub/Sub's **default 10 seconds**, never once explicitly set. A real email-drafting extraction call (classify + compose a full body, slower than a plain classify) was consistently slow enough to exceed it, triggering concurrent redeliveries that raced on ADK's session id and burned through enough real delivery attempts to reach `dead_letters` for real — not the "wasteful but harmless, absorbed downstream" case step 11 originally documented. Fixed at the actual source rather than by trying to bolt a guard onto a service that's deliberately not allowed to have one: every push subscription now sets `--ack-deadline=60` (`scripts/deploy.sh`). Full writeup in `state-machine.md` §3.
   - Deployed and verified for real via a real self-addressed signed webhook through the actually-deployed pipeline: real extraction correctly classified `action_type="email"`, resolved the recipient, and drafted a real body with no falsely-required `due_at`; the real confirmation card showed the full draft; a real `Y` reply produced a real Gmail send (`obligations.action_type='email'`, `email_draft` matching what was shown, `email_sent_at` set, `items.type` still `obligation`, `items.state='COMMITTED'`) with zero exceptions from the real API call and zero entries in `dead_letters` this time — confirming the ack-deadline fix. Reading the sent message back via `users.messages.get` (the originally planned verification) turned out to need `gmail.readonly`, a scope never granted during step 6's bootstrap (only `gmail.send` was) — not worth a re-consent for one check, so verification relied on the real send call's own successful response instead, still fully real and non-mocked. All test DB rows cleaned up afterward.
+- **Phase G — conversational redesign, user-directed after a real live test.** The user texted "hello" and saw two real problems: a ~2 minute reply, and a rigid Y/N confirmation card treating "hello" as a fake obligation (extractor-svc's schema had no "just chat" option — every message was forced into `type="obligation"`/`"latent"`). Full plan at `/Users/izaan/.claude/plans/spicy-purring-karp.md`, approved 2026-08-24: fix latency first (cheapest, unblocks fast iteration on everything after), then chat detection, then a new `messages` table for tone-mirroring, then a unified conversational Gemini call in `resolver-svc` replacing the rigid template/keyword-classifier flow — all while preserving ADR 0001 (state machine controls flow) and ADR 0003 (IAM-scoped, confirm-gated writes): the LLM's surface area can widen freely as long as it never gets a tool to trigger a write itself and `publish("items-confirmed", ...)` stays a plain pipeline-code check on a classified intent field.
+  - **Step A (latency fix) — done.** `scripts/deploy.sh`: `--min-instances=1` for `ingest-svc`/`extractor-svc`/`resolver-svc` (the synchronous chat-reply path); `committer-svc`/`dispatcher-svc` left at 0 (not in that path). All three redeployed successfully.
+  - Verified for real via signed webhooks against the live, now-warm services, polling the real Twilio message log rather than trusting the synchronous webhook ack alone (ingest-svc's ack is just the initial receipt, not the actual reply): a fresh message with no open conversation went `RECEIVED` → real Gemini extraction → real Gemini clarification call → real Twilio send in **~13 seconds** wall-clock, down from the previously observed ~2 minutes — roughly a 10x improvement. Real ongoing cost: 3 always-warm small Cloud Run instances.
+  - **Honest scope note:** ~13s reflects a message that needed *two* real Gemini calls (extraction + clarification) plus two Pub/Sub hops — not yet the user's ~4-second target for a pure chat exchange like "yo wsg bro". That target is Step B's job (short-circuiting non-actionable messages to a single Gemini call with no clarification round), not something the latency fix alone reaches. Don't overstate this as "done, hits the 4s target" — it isn't, yet.
+  - Testing this also re-surfaced the still-unfixed pre-existing bug Step B exists to fix: repeated test messages against the demo phone's already-open conversation state produced the same "💡 Respond to greeting" nonsense card seen in the original user report, and one `OTHER`-classified reply during a `DUPLICATE_SUSPECTED` state was silently swallowed (webhook 200'd, no SMS sent) — both are exactly the rigid-classifier/no-chat-path problems Phase G exists to replace, not new regressions from the latency change. All test conversation state cleared with a real `N` cancel before moving on.
