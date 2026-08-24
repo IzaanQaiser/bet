@@ -20,11 +20,19 @@ from fastapi.testclient import TestClient
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.schemas import ExtractedItemMessage
 from resolver_svc.clarification import ClarificationResult
+from resolver_svc.dedupe import DedupeResult
 
 pytestmark = pytest.mark.skipif(
     "PUBSUB_EMULATOR_HOST" not in os.environ or "DB_USER" not in os.environ,
     reason="requires a live Pub/Sub emulator and Cloud SQL Auth Proxy connection",
 )
+
+# The real dedupe check (step 12) hits Vertex AI's embedding API — mocked
+# here to a guaranteed no-match, same as clarify() is mocked below, so
+# these steps-9/10-scoped tests stay about what they're actually testing.
+# test_dedupe_integration.py covers the real dedupe path against real
+# Postgres/pgvector.
+_no_duplicate = patch("resolver_svc.main._check_duplicate", return_value=DedupeResult())
 
 
 @pytest.fixture
@@ -85,7 +93,7 @@ def test_conversations_row_created_on_zero_clarification_path(client, test_user)
         missing_fields=[],
         reasoning="Clear latent, no deadline.",
     )
-    with patch("resolver_svc.main._send_sms") as mock_sms:
+    with patch("resolver_svc.main._send_sms") as mock_sms, _no_duplicate:
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
     assert resp.status_code == 200
     mock_sms.assert_called_once()
@@ -210,6 +218,7 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item
     with (
         patch("resolver_svc.main._send_sms") as mock_sms,
         patch("resolver_svc.main.clarify") as mock_clarify,
+        _no_duplicate,
     ):
         mock_clarify.return_value = ClarificationResult(
             due_at_filled=False, due_at=None, still_missing=["due_at"], question="When's it due?"
@@ -251,6 +260,7 @@ def test_three_exchange_exhaustion_reaches_needs_review(client, received_item):
     with (
         patch("resolver_svc.main._send_sms") as mock_sms,
         patch("resolver_svc.main.clarify", return_value=still_ambiguous),
+        _no_duplicate,
     ):
         client.post("/pubsub/push", json=_push_envelope(extracted))  # exchange 1
         for reply_text in ["soon", "idk", "no idea"]:  # exchanges 2, 3, then exhaustion

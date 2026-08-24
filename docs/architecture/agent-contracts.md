@@ -121,6 +121,10 @@ Is this the same as "{existing_title}"?
 Reply Y to merge, N if it's different.
 ```
 
+**Resolved gap, found in step 12's real testing: `text-embedding-004`'s location behavior differs from `gemini-3.5-flash`'s.** Step 4 found Gemini 3.5 Flash 404s on every regional Vertex AI endpoint and only works via `global`. Verified empirically before writing `resolver-svc/dedupe.py` (not assumed to be the same): `text-embedding-004` works identically at both `us-central1` and `global`, returns exactly 768 dimensions matching `item_embeddings.embedding`'s column type, and produces sane cosine similarities on a real call (a close paraphrase of the same fact scored 0.92, clearly separated from an unrelated sentence at 0.29) — no new env var needed, it reuses whichever `GOOGLE_CLOUD_LOCATION` `resolver-svc` is already deployed with.
+
+**Implementation note:** no `pgvector` Python package/adapter is used — `dedupe.py`'s `vector_literal()` formats the embedding as pgvector's plain text literal (`[v1,v2,...]`) and the SQL casts it with `::vector` server-side. A write-only, single-column use like this doesn't need the adapter package's registration machinery.
+
 ### 3.2 Clarification loop — the second (and last) Gemini call
 
 **Resolved ambiguity:** PRD §5.2 describes this as "Gemini 3.5 Flash for question generation only." Read literally that undersells it — you cannot write a sensible next question without first interpreting what the user's last reply actually answered. This call does both in one pass: merge the reply into the item, then decide the next question (or that none is needed).
