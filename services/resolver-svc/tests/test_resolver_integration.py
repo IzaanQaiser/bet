@@ -243,7 +243,7 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item
             (str(item_id),),
         ).fetchone()
     assert state == "AWAITING_CONFIRMATION"
-    assert resolved_fields == {"due_at": "2026-08-28T14:00:00"}
+    assert resolved_fields["due_at"] == "2026-08-28T14:00:00"
     assert exchange_count == 1  # the resolving reply itself never increments it
 
 

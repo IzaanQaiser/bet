@@ -3,6 +3,13 @@ agent-contracts.md §2). Step 11 adds real media handling: an image/PDF's
 gs:// URI on RawItemMessage gets downloaded and passed to Gemini as an
 inline Part alongside (or instead of) the SMS text.
 
+Step 15 (ADR 0008, agent-contracts.md §2.1) adds email-action classification
+and drafting to this same call — action_type/email_recipient/email_draft —
+rather than a third LLM call site (agent-contracts.md §0's "exactly two call
+sites"). An email-intent message with no real address in the text never gets
+a guessed recipient: "email_recipient" joins missing_fields instead, same
+pattern as an ambiguous due_at.
+
 Zero DB access, zero Calendar/Gmail scope (ADR 0003) — this is the one service
 in the whole system that ever touches untrusted, unconfirmed user input, and
 it can write to nothing but the items.extracted topic.
@@ -42,6 +49,9 @@ class _ExtractionResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     missing_fields: list[str]
     reasoning: str
+    action_type: Literal["calendar", "email"] = "calendar"
+    email_recipient: str | None = None
+    email_draft: str | None = None
 
 
 _SYSTEM_PROMPT = """You are the extraction stage of a personal obligation-tracking system. You
@@ -66,6 +76,26 @@ Rules:
   fields, not any single field in isolation.
 - reasoning is one sentence explaining the classification, for logs only —
   it is never shown to the user.
+- action_type is "email" only if the message is unambiguously asking to send
+  an email (e.g. "email X about...", "send Sarah an email saying...") AND
+  the message itself contains a literal, syntactically valid email address
+  for the recipient. Otherwise action_type is "calendar" — this covers
+  every non-email obligation, which is most of them.
+- If the message is clearly email-intent but no valid address is present
+  (e.g. "email Sarah about the delay" — a name, not an address), still set
+  action_type to "email", leave email_recipient null, and add
+  "email_recipient" to missing_fields. Never guess an address from a name.
+- Whenever action_type is "email", classify type as "obligation" even if no
+  deadline is present or implied — sending a message is an immediate action
+  someone asked for, not a someday idea. If the message implies no deadline
+  at all, leave due_at null and do NOT add "due_at" to missing_fields —
+  there is nothing to ask about. Only add "due_at" to missing_fields for an
+  email action if a date is implied but genuinely ambiguous, same as any
+  other obligation.
+- When action_type is "email", draft email_draft: a complete, sendable email
+  body in the user's own voice, based on what the message says — a greeting,
+  the substance, a sign-off. Keep it concise. Never draft a body for
+  action_type "calendar".
 
 Output must conform exactly to the provided schema. No text outside it.
 """
@@ -140,6 +170,9 @@ async def pubsub_push(request: Request):
         confidence=result.confidence,
         missing_fields=result.missing_fields,
         reasoning=result.reasoning,
+        action_type=result.action_type,
+        email_recipient=result.email_recipient,
+        email_draft=result.email_draft,
     )
 
     try:

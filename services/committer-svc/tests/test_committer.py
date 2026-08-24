@@ -160,20 +160,91 @@ def test_no_linked_google_account_fails_without_writing(client):
     assert resp.status_code == 500
 
 
-def test_email_action_type_not_implemented(client):
-    confirmed = _confirmed_message(action_type="email", email_draft="Draft body.")
+def test_email_missing_recipient_fails_loudly(client):
+    """Should never happen for real — resolver-svc/dispatcher-svc only
+    ever publish action_type="email" with both fields already resolved
+    (agent-contracts.md §2.1/§3.2) — but if it somehow did, this must
+    fail loudly rather than silently send a blank/unaddressed email."""
+    confirmed = _confirmed_message(
+        action_type="email", email_draft="Draft body.", email_recipient=None
+    )
     conn = _mock_connection(
         user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
     )
 
-    with patch("committer_svc.main.get_connection", return_value=conn):
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 500
-    # Only the idempotency guard's already-committed check happened —
-    # the NotImplementedError is raised before any real DB write.
-    assert conn.execute.call_count == 1
-    assert "FROM obligations" in conn.execute.call_args_list[0][0][0]
+    mock_session_cls.assert_not_called()
+
+
+def test_email_branch_sends_via_gmail_and_writes_obligation(client):
+    confirmed = _confirmed_message(
+        action_type="email",
+        due_at=None,
+        email_recipient="sarah@example.com",
+        email_draft="Hi Sarah,\n\nConfirming the delay.\n\nThanks",
+    )
+    conn = _mock_connection(
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
+    )
+    gmail_response = MagicMock()
+    gmail_response.json.return_value = {"id": "gmail-msg-123"}
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.post.return_value = gmail_response
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "committed", "item_id": str(confirmed.item_id)}
+
+    mock_session_cls.return_value.post.assert_called_once()
+    args, kwargs = mock_session_cls.return_value.post.call_args
+    assert args[0] == "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+    raw = kwargs["json"]["raw"]
+    decoded = base64.urlsafe_b64decode(raw).decode()
+    assert "sarah@example.com" in decoded
+    assert "Confirming the delay" in decoded
+
+    # call 0 is the idempotency guard; 1 is the credentials SELECT;
+    # 2 is the obligations INSERT; 3 is the items UPDATE.
+    insert_sql, insert_params = conn.execute.call_args_list[2][0]
+    assert "INSERT INTO obligations" in insert_sql
+    assert "email_draft" in insert_sql
+    assert insert_params[2] == "email"  # action_type
+    assert insert_params[3] == "Hi Sarah,\n\nConfirming the delay.\n\nThanks"  # email_draft
+
+    update_sql, update_params = conn.execute.call_args_list[3][0]
+    assert "state = 'COMMITTED'" in update_sql
+    assert update_params == ("obligation", str(confirmed.item_id))
+
+
+def test_email_redelivery_after_success_is_a_noop(client):
+    """_already_committed() generalizes to the email branch with no
+    email-specific code — an obligations row existing is enough,
+    regardless of which branch originally wrote it."""
+    confirmed = _confirmed_message(
+        action_type="email", email_recipient="sarah@example.com", email_draft="Hi Sarah."
+    )
+    conn = _mock_connection(already_committed=True)
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "already_processed", "item_id": str(confirmed.item_id)}
+    mock_session_cls.assert_not_called()
 
 
 def test_malformed_envelope_returns_500_for_retry(client):

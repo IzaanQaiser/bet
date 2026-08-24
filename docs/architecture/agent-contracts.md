@@ -48,6 +48,9 @@ class ExtractedItemMessage(BaseModel):
     confidence: float                 # 0.0-1.0
     missing_fields: list[str]
     reasoning: str                    # log-only, never shown to the user
+    action_type: Literal["calendar", "email"] = "calendar"   # step 15, §2.1
+    email_recipient: str | None = None    # a real address, never a guessed name — §2.1
+    email_draft: str | None = None        # set only when action_type == "email"
 
 # items.confirmed — published by resolver-svc (normal path) or
 #                    dispatcher-svc (accepted-suggestion path, state-machine.md §2.3)
@@ -57,10 +60,11 @@ class ConfirmedItemMessage(BaseModel):
     type: Literal["obligation", "latent"]   # a surfaced latent arrives here already flipped to "obligation"
     title: str
     summary: str
-    due_at: datetime | None                 # required (non-null) iff type == "obligation"; always null for a latent
+    due_at: datetime | None                 # required for a calendar obligation; may be null for an email one (§2.1); always null for a latent
     effort_minutes: Literal[15, 30, 60, 120, 240]
-    action_type: Literal["calendar", "email"] | None   # null for a latent; "calendar" for every MVP obligation (§3.2)
-    email_draft: str | None                 # null unless the email-action stretch sets action_type == "email" — see §3.2's open flag
+    action_type: Literal["calendar", "email"] | None   # null for a latent; "calendar" for a dispatcher-accepted latent (§1.5's scope note)
+    email_recipient: str | None              # step 15 — carries a resolved recipient one hop from conversations.resolved_fields to committer-svc (§3.2); null unless action_type == "email"
+    email_draft: str | None                 # null unless action_type == "email" — see §2.1
 ```
 
 **Resolved bug:** `due_at` was originally typed as required (non-null) — wrong, since a latent legitimately has no due date and this message type also carries latents through the normal confirm path (a latent gets confirmed too, per PRD §2 item 4 — confirmation applies to every item, not just obligations). `committer-svc` branches on `type`: for `"obligation"` it writes Calendar (and Gmail if `action_type == "email"`) and `INSERT`s into `obligations`; for `"latent"` it does no external write at all and just `INSERT`s into `latents`.
@@ -108,6 +112,54 @@ Output must conform exactly to the provided schema. No text outside it.
 ```
 
 If a message plausibly contains **more than one item** (e.g. a screenshot with two separate deadlines), the extractor still emits exactly one — the most salient one, by its own judgment — and folds the rest into `summary` as context. Splitting one message into multiple items is out of scope; noted here so it isn't rediscovered as a bug later, it's a boundary.
+
+### 2.1 Email action — resolved, step 15 (ADR 0008)
+
+This resolves the "Open gap, flagged rather than invented" note this doc used to carry in §3.2 (kept below, struck through in spirit — see the note there for what was deliberately *not* decided before now).
+
+**Resolved gap: how `action_type`/`email_draft`/`email_recipient` ever get set.** Extended in the *same* extraction call, not a third LLM call site — §0's "exactly two call sites" stays true. `ExtractedItemMessage` gains three fields:
+
+```python
+action_type: Literal["calendar", "email"] = "calendar"
+email_recipient: str | None = None   # a real address, never a name — see below
+email_draft: str | None = None       # only set when action_type == "email"
+```
+
+**System prompt addition:**
+```
+- action_type is "email" only if the message is unambiguously asking to send
+  an email (e.g. "email X about...", "send Sarah an email saying...") AND
+  the message itself contains a literal, syntactically valid email address
+  for the recipient. Otherwise action_type is "calendar" — this covers
+  every non-email obligation, which is most of them.
+- If the message is clearly email-intent but no valid address is present
+  (e.g. "email Sarah about the delay" — a name, not an address), still set
+  action_type to "email", leave email_recipient null, and add
+  "email_recipient" to missing_fields. Never guess an address from a name —
+  there is no contacts lookup in this system, and guessing an address risks
+  sending to the wrong person, the one failure mode worse than not sending
+  at all.
+- Whenever action_type is "email", classify type as "obligation" even if no
+  deadline is present or implied — sending a message is an immediate action
+  someone asked for, not a someday idea, so it never becomes a latent
+  regardless of the usual obligation/latent deadline rule. If the message
+  implies no deadline at all, leave due_at null and do NOT add "due_at" to
+  missing_fields — there is nothing to ask about. Only add "due_at" to
+  missing_fields for an email action if a date is implied but genuinely
+  ambiguous, same as any other obligation.
+- When action_type is "email", draft email_draft: a complete, sendable email
+  body in the user's own voice, based on what the message says — a greeting,
+  the substance, a sign-off. Keep it concise. Never draft a body for
+  action_type "calendar".
+```
+
+**Real finding, verified in a scratch test against real Vertex AI before deploying this:** the first draft of the due_at rule above didn't explicitly override the general "an obligation implies a deadline" assumption baked into every other rule — Gemini kept adding `due_at` to `missing_fields` for a fully-specified email action with a real recipient and no deadline mentioned at all ("email sarah@example.com and tell her the delivery will be late" → `missing_fields=["due_at"]`, wrongly triggering a clarifying question about a date nobody implied). The explicit "if the message implies no deadline at all... do NOT add due_at to missing_fields" sentence above fixed it, reconfirmed on two more real calls: the same complete case now correctly returns `missing_fields=[]`, and a name-only case ("email Sarah about the delay", no real address) correctly returns `missing_fields=["email_recipient"]` alone, not also `due_at`. The ambiguous-date case wasn't separately re-verified after this fix (a later scratch call hung on a real Vertex AI quota limit and was killed) — not treated as a gap, since that branch just falls through to the pre-existing, already-proven "ambiguous date → missing_fields" rule (verified for real back in step 4) rather than adding new logic of its own.
+
+**Why no recipient lookup/contacts feature:** out of scope for a hackathon stretch, and more importantly a real safety boundary — this system already refuses to guess a `due_at` (PRD's non-negotiable "never write on inference alone"); guessing an email recipient from a bare name is the same category of mistake with a worse failure mode (a real message sent to a real stranger, not just a wrong calendar time). The user must include the actual address in their text.
+
+**Why `missing_fields` and not a hard rejection:** matches the existing precedent exactly — `due_at` already uses `missing_fields` + the clarification loop rather than rejecting an incomplete obligation outright. `email_recipient` is now the second field this mechanism handles (§3.2 below).
+
+**Resolved gap: does an email action need a `due_at` at all?** No — unlike a calendar obligation, where `due_at` is the entire point (it's what gets scheduled) and is effectively always present by the time an item reaches `AWAITING_CONFIRMATION`, an email action's `due_at` (if any) only describes context *inside* the draft, not a send time — `committer-svc` sends synchronously on `Y`, exactly like it writes a Calendar event synchronously on `Y`, so there's no "scheduled for later" concept to support. `due_at` stays legitimately nullable for `action_type == "email"`; the completeness check (`state-machine.md` §1.2) only ever required it because `missing_fields` said so, and the extractor now simply doesn't add `due_at` to `missing_fields` when there's genuinely no deadline to ask about.
 
 ---
 
@@ -168,11 +220,15 @@ Output must conform exactly to the provided schema. No text outside it.
 
 **Resolved gap, found in step 10's real implementation: `dict[str, Any]` doesn't work as a Vertex AI structured-output field.** Tried both `ClarificationResponse.filled_fields: dict[str, Any]` as specified above and a narrower `dict[str, str]` — both reproducibly made the model emit a huge run of whitespace padding inside an otherwise-empty object instead of real key-value content (confirmed empirically in a scratch test, not assumed), on every attempt. The actual `resolver-svc` implementation (`clarification.py`) uses a concrete, non-dict schema instead: `due_at_filled: bool`, `due_at: str | None`, `still_missing: list[str]`, `question: str | None` — no generic `known_fields`/`filled_fields` mechanism at all. This works because `due_at` is the *only* field the extractor's own contract (§2) ever adds to `missing_fields` in the first place — the generic multi-field design above was speculative generality for a case that doesn't occur today, on top of being a shape Vertex can't reliably fill anyway. If a future extractor version ever adds a second clarifiable field, this schema needs revisiting then, not solved speculatively now.
 
+**Resolved, step 15: the second clarifiable field arrived — `email_recipient` (§2.1).** Extended, not re-genericized: `clarification.py`'s concrete schema gains `email_recipient_filled: bool` / `email_recipient: str | None`, parallel to the existing `due_at_filled`/`due_at` pair, not a return to the rejected `dict[str, Any]` shape. Which field(s) are actually asked about is still driven entirely by `missing_fields` from the extractor (now up to two concrete possible entries: `"due_at"`, `"email_recipient"`) — the system prompt's existing "ask for all of them together in one natural sentence" rule already covers batching both into one question if an item is somehow missing both at once (rare — an email obligation missing its recipient is usually not also missing its date). The prompt gets one more rule: never invent an email address, exactly the same "don't guess, ask" posture as `due_at`.
+
 **Resolved gap, found in step 10: what happens when `missing_fields` is empty but `confidence < 0.75`?** state-machine.md §1.2's rule ("`missing_fields` non-empty **or** `confidence < 0.75` → `CLARIFYING`") doesn't say what a clarifying question would even ask about when nothing is structurally missing. Decided: nothing — low confidence alone, with no missing fields, goes straight to `AWAITING_CONFIRMATION` like a fully complete item. The confirmation card's own "or send a correction" affordance is the safety net for it; manufacturing a clarifying question with no `missing_fields` content to batch would be degenerate, not more careful. `resolver-svc`'s real gate is `if extracted.missing_fields: clarify() else: confirm()` — confidence isn't consulted at all in practice.
 
 **Where `filled_fields` actually go:** `title`/`summary`/`effort_minutes`/`focus_depth`/`confidence` are columns on `items` — `resolver-svc` writes those straight there. `due_at` has no `items` column (`data-model.md` §2.4) — it's written into `conversations.resolved_fields` instead. `resolver-svc` creates the `conversations` row the moment it consumes `items.extracted`, *unconditionally* — even on the path where extraction was already complete and confident and goes straight to `AWAITING_CONFIRMATION` with no clarifying question ever sent — specifically so a `due_at` the extractor already produced has somewhere to be staged before commit. `conversations.pending_fields` is set to `still_missing` either way, and `resolver-svc` either sends `question` (incrementing `exchange_count`, per `state-machine.md` §1.2) or transitions to `AWAITING_CONFIRMATION` if `still_missing` is empty. At the moment a `Y` is parsed, `resolver-svc` builds `ConfirmedItemMessage` by reading the `items` row plus `conversations.resolved_fields` and merging them — this is the one and only place those two sources come together.
 
-**Open gap, flagged rather than invented:** neither the PRD nor this doc currently specifies *how* `action_type`/`email_draft` ever get set to anything other than their MVP defaults (`"calendar"` / `null`) — the Extractor's schema and prompt (§2) have no notion of an email-type obligation at all. This only matters once the email-action stretch (ADR 0008, PRD §2 item 11) is actually being built — it's the lowest item in the cut order and may never be reached. Do not invent the drafting mechanism now; spec it as its own small addition to the Extractor contract (or a discriminator in the clarification call) at the point the stretch is actually started, not before.
+**Step 15 addition, same pattern:** `action_type`, `email_draft`, and a resolved `email_recipient` all stage into `conversations.resolved_fields` right alongside `due_at`, for the same reason — none of them have an `items` column, and (for `email_recipient` specifically) resolving it can take a full clarification exchange, so it needs to survive across turns exactly like `due_at` does. `email_recipient` never gets a **durable `obligations` column** — `committer-svc` only needs it transiently, to address the one Gmail send, and the durable record of what was actually sent is `email_draft` + `email_sent_at` (`state-machine.md` §1.5) — but it does need to travel from `resolved_fields` onto `ConfirmedItemMessage` at `Y`-time just like `due_at` does, so `ConfirmedItemMessage` gains a matching `email_recipient: str | None = None` field (§1's schema, updated) purely to carry it that one hop to `committer-svc`.
+
+**Resolved, step 15 (was flagged as an open gap through step 14):** `action_type`/`email_recipient`/`email_draft` are now set by the Extractor's own schema/prompt — §2.1. This call's role is unchanged except for the one new possible `missing_fields` entry (`email_recipient`) — no drafting or recipient-guessing happens here; a missing recipient is asked for exactly like a missing `due_at`, never invented.
 
 **A correction during `AWAITING_CONFIRMATION`** (`state-machine.md` §1.4) is handled by the same call: `known_fields` includes the current (possibly wrong) value, `missing_fields` is set to just the field the correction plausibly targets — inferred by a cheap heuristic (does the reply contain a time/date pattern → `due_at`; a duration pattern → `effort_minutes`; otherwise → whichever field is most recently confirmed and shortest, defaulting to `title`) — and `latest_reply` is the correction text. This reuses one schema instead of building a second "correction interpreter."
 
@@ -195,7 +251,17 @@ Reply Y to confirm, N to cancel, or send a correction.
 Reply Y to confirm, N to cancel, or send a correction.
 ```
 
-Both variants share the thread-attach suffix below when applicable.
+**Email** (step 15, `action_type == "email"`) — a third variant, not a decoration on the obligation one: the PRD requires the draft itself go back over SMS for review ("sends the draft back over SMS for review"), which the title-only obligation card was never designed to show.
+```
+✉️ Email to {email_recipient}:
+
+{email_draft}
+
+Reply Y to send, N to cancel, or send a correction.
+```
+No due-date line even if `due_at` is present (§2.1 — it's context, not a send time, and showing it here would wrongly imply the send is scheduled for then rather than immediate on `Y`). A correction reply during this card is **not built** — same deliberate deferral as the general `AWAITING_CONFIRMATION` correction mechanism (§1.4 note, carried from step 9 through this step): `Y` sends as-is, `N` cancels, anything else is logged and ignored. Revisit only once the general correction mechanism is actually built.
+
+Both non-email variants share the thread-attach suffix below when applicable; the email variant does not (an email obligation was never a latent, so it never has a thread-attach candidate to offer — `state-machine.md` §1.1's dedupe/thread-attach path runs identically upstream of this and simply never finds one).
 
 Thread-attach suffix, appended as its own paragraph when a `0.82 ≤ similarity < 0.92` latent match exists:
 ```

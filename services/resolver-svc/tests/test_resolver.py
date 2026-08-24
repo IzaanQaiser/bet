@@ -109,6 +109,43 @@ def test_complete_item_awaits_confirmation(client):
     assert "Pay rent" in mock_sms.call_args.args[1]
 
 
+def test_complete_email_item_shows_email_confirmation_card(client):
+    """Step 15 — a fully-resolved email action (recipient already present
+    at extraction) goes straight to AWAITING_CONFIRMATION with the email
+    confirmation-card variant, not the calendar one."""
+    extracted = _extracted_message(
+        title="Reply to Sarah",
+        summary="Confirm the delay.",
+        due_at=None,
+        missing_fields=[],
+        action_type="email",
+        email_recipient="sarah@example.com",
+        email_draft="Hi Sarah,\n\nConfirming the delay.\n\nThanks",
+    )
+    conn = _mock_connection()
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        _no_duplicate(),
+    ):
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "awaiting_confirmation"
+    mock_sms.assert_called_once()
+    body = mock_sms.call_args.args[1]
+    assert body.startswith("✉️ Email to sarah@example.com:")
+    assert "Confirming the delay" in body
+    assert "Reply Y to send" in body
+
+    insert_calls = [
+        c for c in conn.execute.call_args_list if "INSERT INTO conversations" in c.args[0]
+    ]
+    resolved_fields = insert_calls[0].args[1][2].obj  # Json wrapper
+    assert resolved_fields["action_type"] == "email"
+    assert resolved_fields["email_recipient"] == "sarah@example.com"
+
+
 def test_low_confidence_complete_item_still_awaits_confirmation(client):
     """state-machine.md §1.2's "Resolved gap": low confidence alone (no
     missing fields) isn't a field-completeness problem — the confirmation
@@ -219,7 +256,7 @@ def test_y_reply_publishes_confirmed_and_marks_confirmed(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
         item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION"),
-        conversation_row=({"due_at": "2026-09-04T14:00:00"},),
+        conversation_row=({"due_at": "2026-09-04T14:00:00", "action_type": "calendar"},),
     )
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),

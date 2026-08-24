@@ -34,6 +34,9 @@ class ExtractedItemMessage(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     missing_fields: list[str]
     reasoning: str  # log-only, never shown to the user
+    action_type: Literal["calendar", "email"] = "calendar"  # step 15, agent-contracts.md §2.1
+    email_recipient: str | None = None  # a real address, never a guessed name
+    email_draft: str | None = None  # set only when action_type == "email"
 
 
 class ConfirmedItemMessage(BaseModel):
@@ -42,7 +45,9 @@ class ConfirmedItemMessage(BaseModel):
 
     due_at/action_type/email_draft are Optional, not required: a latent
     flows through this same message shape and legitimately has none of
-    them. See agent-contracts.md §1's "Resolved bug" note.
+    them. See agent-contracts.md §1's "Resolved bug" note. due_at may
+    also be null for an email-type obligation (agent-contracts.md §2.1 —
+    it's context inside the draft, not a send time).
     """
 
     item_id: UUID
@@ -53,6 +58,7 @@ class ConfirmedItemMessage(BaseModel):
     due_at: datetime | None = None
     effort_minutes: Literal[15, 30, 60, 120, 240]
     action_type: Literal["calendar", "email"] | None = None
+    email_recipient: str | None = None  # step 15 — carries a resolved recipient to committer-svc
     email_draft: str | None = None
 
 

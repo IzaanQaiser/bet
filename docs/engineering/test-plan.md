@@ -343,9 +343,27 @@ Full writeup of both in `state-machine.md` §3 (search "step 14"). Also fixed, s
 
 ## Step 15 — Email draft + send action (stretch)
 
-**Not yet specifiable.** The drafting mechanism itself is an open design gap (`agent-contracts.md` §3.2's flagged note) — write the spec first, following the same doc-before-code pattern as everything else, then fill in this section's acceptance criteria and test names. Do not invent tests against an unspecified mechanism.
+Spec written before any code, per this section's own instruction: `agent-contracts.md` §2.1 (extractor schema/prompt), §3.2 (clarification's second concrete field, `email_recipient`), §3.3 (the email confirmation-card variant); `state-machine.md` §1.5 (commit mechanics, idempotency, the dispatcher-accept-path scope boundary); ADR 0008 updated to point at the resolved design instead of flagging it open.
 
-What's already fixed regardless of the mechanism: the same confirm-gate applies (no send without `Y`), and `email_sent_at` is set exactly once — no duplicate sends on retry or DLQ replay.
+**Acceptance criteria**
+- A message with unambiguous email intent + a real address (e.g. "email sarah@co.com about the delay") → `action_type="email"`, `type="obligation"` even with no deadline present, a drafted `email_draft`.
+- Email intent with no address (e.g. "email Sarah about the delay") → `"email_recipient"` in `missing_fields`, a real clarifying question asking for it — never a guessed address.
+- The confirmation card shows the full draft body and recipient (agent-contracts.md §3.3's email variant), not just a title.
+- `Y` → a real Gmail send, `obligations.email_draft` + `email_sent_at` written in the same transaction as the row `INSERT`, `items.state='COMMITTED'`.
+- `N` → cancelled, no send attempted.
+- A redelivered `items.confirmed` message for an already-sent email is a no-op — `_already_committed()` (steps 13/14) already covers this generically, regression-tested here rather than assumed.
+- A resurfaced-latent accept (`dispatcher-svc`, state-machine.md §2.3) never produces `action_type="email"` — confirmed as a deliberate scope boundary, not silently missing.
+
+**Unit tests**
+- `services/extractor-svc/tests/test_extraction.py` (or a new `test_email_action.py` alongside it) — the classification/missing-field rules above, Gemini mocked.
+- `services/resolver-svc/tests/test_clarification.py` — `email_recipient_filled`/`email_recipient` alongside the existing `due_at` cases.
+- `services/resolver-svc/tests/test_confirmation_card.py` — the email variant's exact rendering, including the no-thread-attach-suffix and no-due-date-line rules.
+- `services/committer-svc/tests/test_committer.py` — the Gmail-send branch (Gmail API mocked): correct MIME/base64url construction, correct `obligations` row, `_already_committed()` blocking a redelivery of an already-sent email exactly like it already does for Calendar.
+
+**Integration tests** (real Postgres; Gemini/Gmail mocked, matching every other step's integration-test boundary)
+- `test_email_obligation_full_cycle` — extraction → confirmation → `Y` → real `obligations` row with `email_draft`/`email_sent_at` set, `items.type` still `obligation`, real `items.confirmed` publish observed on the emulator.
+
+**Manual verification:** a real message with a real recipient address (the developer's own, self-addressed) sent through the actually-deployed pipeline, confirmed `Y`. **Adjusted from the original plan, found while running it:** `users.messages.get` needs `gmail.readonly`, a scope never requested during step 6's bootstrap (only `gmail.send` was) — re-consenting for read access wasn't worth it for one verification, so success was instead confirmed via the real `users.messages.send` call's own successful response (no exception, matching `committer-svc`'s existing `raise_for_status()` pattern) plus the real `obligations.email_sent_at`/`items.state='COMMITTED'` write that only happens after that call succeeds — still a real, non-mocked call against the real Gmail API, just verified from the sender's side rather than by reading the message back.
 
 ---
 

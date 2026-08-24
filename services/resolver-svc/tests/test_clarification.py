@@ -11,10 +11,23 @@ import pytest
 from fastapi.testclient import TestClient
 from obligation_engine_shared.schemas import ExtractedItemMessage
 from psycopg.types.json import Json
+from resolver_svc.dedupe import DedupeResult
 
 
 def _push_envelope(message) -> dict:
     return {"message": {"data": base64.b64encode(message.model_dump_json().encode()).decode()}}
+
+
+def _no_duplicate():
+    """Real bug found running the full suite: these tests never mocked
+    _check_duplicate (added in step 12, after this file was written) —
+    _FakeConn's default None result for the hash-lookup query let every
+    /pubsub/push call here fall through to a *real* Vertex AI embedding
+    call, unconditionally. Harmless when it succeeded fast, but a real
+    quota error (429 RESOURCE_EXHAUSTED) surfaced it running the full
+    suite repeatedly in one session — these are meant to be offline unit
+    tests, matching test_resolver.py's own established pattern."""
+    return patch("resolver_svc.main._check_duplicate", return_value=DedupeResult())
 
 
 @pytest.fixture
@@ -141,12 +154,21 @@ def _unwrap(value):
     return value.obj if isinstance(value, Json) else value
 
 
-def _clarify_result(due_at_filled=False, due_at=None, still_missing=None, question=None):
+def _clarify_result(
+    due_at_filled=False,
+    due_at=None,
+    email_recipient_filled=False,
+    email_recipient=None,
+    still_missing=None,
+    question=None,
+):
     from resolver_svc.clarification import ClarificationResult
 
     return ClarificationResult(
         due_at_filled=due_at_filled,
         due_at=due_at,
+        email_recipient_filled=email_recipient_filled,
+        email_recipient=email_recipient,
         still_missing=still_missing if still_missing is not None else ["due_at"],
         question=question,
     )
@@ -165,6 +187,7 @@ def test_exchange_counting_table(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.clarify") as mock_clarify,
         patch("resolver_svc.main._send_sms") as mock_sms,
+        _no_duplicate(),
     ):
         # Turn 1 (via /pubsub/push): first question sent, exchange_count -> 1.
         mock_clarify.return_value = _clarify_result(question="When's rent due?")
@@ -215,6 +238,7 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.clarify") as mock_clarify,
         patch("resolver_svc.main._send_sms") as mock_sms,
+        _no_duplicate(),
     ):
         mock_clarify.return_value = _clarify_result(question="When's rent due?")
         client.post("/pubsub/push", json=_push_envelope(extracted))
@@ -236,6 +260,51 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client):
     assert "Pay rent" in mock_sms.call_args.args[1]
 
 
+def test_missing_email_recipient_resolves_via_clarification(client):
+    """Step 15 — email_recipient is the second concrete clarifiable field
+    (agent-contracts.md §3.2), asked for and resolved the same way due_at
+    is, never guessed from a name."""
+    item_id, user_id = uuid4(), uuid4()
+    conn = _FakeConn(item_id, user_id)
+    extracted = _extracted_message(
+        item_id=item_id,
+        user_id=user_id,
+        title="Reply to Sarah",
+        summary="Confirm the delay.",
+        due_at=None,
+        missing_fields=["email_recipient"],
+        action_type="email",
+        email_draft="Hi Sarah,\n\nConfirming the delay.\n\nThanks",
+    )
+
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.clarify") as mock_clarify,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        _no_duplicate(),
+    ):
+        mock_clarify.return_value = _clarify_result(
+            still_missing=["email_recipient"], question="Who should this go to?"
+        )
+        client.post("/pubsub/push", json=_push_envelope(extracted))
+
+        # First call's `missing_fields` argument came from the extractor.
+        assert mock_clarify.call_args.kwargs["missing_fields"] == ["email_recipient"]
+
+        mock_clarify.return_value = _clarify_result(
+            email_recipient_filled=True, email_recipient="sarah@example.com", still_missing=[]
+        )
+        resp = client.post(
+            "/reply",
+            json={"user_id": str(user_id), "item_id": str(item_id), "text": "sarah@example.com"},
+        )
+
+    assert resp.json()["status"] == "awaiting_confirmation"
+    assert conn.convo["resolved_fields"]["email_recipient"] == "sarah@example.com"
+    body = mock_sms.call_args.args[1]
+    assert body.startswith("✉️ Email to sarah@example.com:")
+
+
 def test_due_at_lands_only_in_conversations_never_an_items_column(client):
     """agent-contracts.md §1: due_at has no items column at all — the
     UPDATE items statement must never reference it."""
@@ -247,6 +316,7 @@ def test_due_at_lands_only_in_conversations_never_an_items_column(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.clarify") as mock_clarify,
         patch("resolver_svc.main._send_sms"),
+        _no_duplicate(),
     ):
         mock_clarify.return_value = _clarify_result(question="When's rent due?")
         client.post("/pubsub/push", json=_push_envelope(extracted))
@@ -265,4 +335,4 @@ def test_due_at_lands_only_in_conversations_never_an_items_column(client):
     items_updates = [sql for sql, _params in conn.calls if sql.strip().startswith("UPDATE items")]
     assert items_updates, "expected at least one UPDATE items call"
     assert all("due_at" not in sql for sql in items_updates)
-    assert conn.convo["resolved_fields"] == {"due_at": "2026-08-28T14:00:00"}
+    assert conn.convo["resolved_fields"]["due_at"] == "2026-08-28T14:00:00"

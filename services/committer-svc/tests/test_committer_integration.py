@@ -118,6 +118,62 @@ def test_confirmed_obligation_full_cycle(client, test_item):
     assert obligation_row == ("gcal-event-integration-test", "calendar")
 
 
+def test_confirmed_email_obligation_full_cycle(client, test_item):
+    """Step 15 — real Postgres, Gmail mocked (real verification is
+    manual, per the test plan). Confirms the obligations row gets
+    email_draft/email_sent_at, not calendar_event_id."""
+    item_id, user_id = test_item
+    confirmed = ConfirmedItemMessage(
+        item_id=item_id,
+        user_id=user_id,
+        type="obligation",
+        title="Reply to Sarah",
+        summary="Confirm the delay.",
+        due_at=None,
+        effort_minutes=15,
+        action_type="email",
+        email_recipient="sarah@example.com",
+        email_draft="Hi Sarah,\n\nConfirming the delay.\n\nThanks",
+    )
+    envelope = {
+        "message": {"data": base64.b64encode(confirmed.model_dump_json().encode()).decode()}
+    }
+
+    gmail_response = MagicMock()
+    gmail_response.json.return_value = {"id": "gmail-msg-integration-test"}
+    secret_client = MagicMock()
+    secret_client.access_secret_version.return_value.payload.data = b"fake-refresh-token"
+
+    with (
+        patch("committer_svc.main._secret_client", return_value=secret_client),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.post.return_value = gmail_response
+        resp = client.post("/pubsub/push", json=envelope)
+    assert resp.status_code == 200
+
+    mock_session_cls.return_value.post.assert_called_once()
+    assert mock_session_cls.return_value.post.call_args[0][0] == (
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+    )
+
+    with get_connection() as conn:
+        item_row = conn.execute(
+            "SELECT state, type FROM items WHERE id = %s", (str(item_id),)
+        ).fetchone()
+        obligation_row = conn.execute(
+            "SELECT calendar_event_id, action_type, email_draft, email_sent_at "
+            "FROM obligations WHERE item_id = %s",
+            (str(item_id),),
+        ).fetchone()
+    assert item_row == ("COMMITTED", "obligation")
+    calendar_event_id, action_type, email_draft, email_sent_at = obligation_row
+    assert calendar_event_id is None
+    assert action_type == "email"
+    assert email_draft == "Hi Sarah,\n\nConfirming the delay.\n\nThanks"
+    assert email_sent_at is not None
+
+
 def test_confirmed_latent_full_cycle(client, test_item):
     item_id, user_id = test_item
     confirmed = ConfirmedItemMessage(
