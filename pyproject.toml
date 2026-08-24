@@ -27,6 +27,7 @@ dev = [
     "ingest-svc",
     "extractor-svc",
     "resolver-svc",
+    "committer-svc",
 ]
 
 [tool.uv.sources]
@@ -34,6 +35,7 @@ obligation-engine-shared = { workspace = true }
 ingest-svc = { workspace = true }
 extractor-svc = { workspace = true }
 resolver-svc = { workspace = true }
+committer-svc = { workspace = true }
 
 [tool.ruff]
 line-length = 100

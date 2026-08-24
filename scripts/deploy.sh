@@ -16,6 +16,11 @@ REGION="us-central1"
 REPO="us-central1-docker.pkg.dev/${PROJECT_ID}/obligation-engine"
 IMAGE="${REPO}/${SERVICE}:latest"
 SA="sa-${SERVICE%-svc}@${PROJECT_ID}.iam.gserviceaccount.com"
+# Not a secret — an OAuth client ID is a public identifier by design (same
+# treatment as the Twilio Account SID, infrastructure.md §4.1). Only the
+# client *secret* goes through Secret Manager (google-oauth-client-secret).
+# Created via the manual bootstrap in infrastructure.md §4.
+GOOGLE_OAUTH_CLIENT_ID="665100673712-md4toevjbouvfemojkne9ito237av8hk.apps.googleusercontent.com"
 
 echo "Building and pushing ${IMAGE}..."
 # --platform linux/amd64 explicitly: Cloud Run requires amd64, but a local
@@ -136,6 +141,22 @@ case "$SERVICE" in
       --account=waslyrideshare@gmail.com
 
     setup_push_subscription "items-extracted-resolver-push" "items-extracted" "items-extracted-dlq"
+    ;;
+  committer-svc)
+    echo "Deploying ${SERVICE}..."
+    gcloud run deploy "$SERVICE" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --image="$IMAGE" \
+      --service-account="$SA" \
+      --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
+      --set-env-vars="DB_USER=sa-committer@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}" \
+      --set-secrets="GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest" \
+      --min-instances=0 \
+      --no-allow-unauthenticated \
+      --account=waslyrideshare@gmail.com
+
+    setup_push_subscription "items-confirmed-committer-push" "items-confirmed" "items-confirmed-dlq"
     ;;
   *)
     echo "No deploy config yet for ${SERVICE} — add a case in scripts/deploy.sh." >&2
