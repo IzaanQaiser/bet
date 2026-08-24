@@ -1821,6 +1821,7 @@ version = "0.1.0"
 source = { editable = "services/resolver-svc" }
 dependencies = [
     { name = "fastapi" },
+    { name = "google-adk" },
     { name = "obligation-engine-shared" },
     { name = "twilio" },
     { name = "uvicorn", extra = ["standard"] },
@@ -1835,6 +1836,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "google-adk", specifier = ">=2.7.1" },
     { name = "obligation-engine-shared", editable = "shared" },
     { name = "twilio", specifier = ">=9.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },

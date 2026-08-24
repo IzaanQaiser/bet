@@ -1,19 +1,26 @@
-"""resolver-svc — step 9: the real AWAITING_CONFIRMATION gate, replacing
-step 5's auto-confirm stub. Consumes items.extracted; a complete AND
-confident item (state-machine.md §1.2's threshold, confidence >= 0.75)
-gets a real confirmation card sent via SMS and waits for a real Y/N
-reply (POST /reply, called synchronously by ingest-svc's routing check,
-state-machine.md §4) instead of auto-confirming. An incomplete or
-low-confidence item is still left in EXTRACTED exactly as the stub
-already handled it — the real clarification loop is step 10.
+"""resolver-svc — step 10: the real clarification loop, replacing step
+9's "leave incomplete items in EXTRACTED, do nothing" placeholder.
 
-A reply that isn't Y/N (a correction) is logged but not acted on yet —
-full correction-handling reuses the clarification call built in step 10,
-per test-plan.md's step 9 scope note.
+An item with missing_fields (in practice, always just ["due_at"] — see
+clarification.py's module docstring) now gets a real clarifying question
+via SMS instead of stalling. Up to 3 exchanges (state-machine.md §1.2);
+if still incomplete after the 3rd, the item terminates at NEEDS_REVIEW
+with no 4th question. A complete/confident item still goes straight to
+AWAITING_CONFIRMATION exactly as step 9 built it.
+
+Still deliberately not built: a correction reply during
+AWAITING_CONFIRMATION (a reply that isn't Y/N) is still just logged, no
+action taken. Step 9's comment called this "step 10's job"; on closer
+look it needs its own field-targeting heuristic (agent-contracts.md
+§3.2's "cheap heuristic" paragraph) that doesn't reuse this step's
+due_at-only clarification model cleanly, so it's deferred again here,
+explicitly, rather than bolted on halfway.
 """
 
 import logging
 import os
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
 from obligation_engine_shared.db import get_connection
@@ -27,12 +34,18 @@ from obligation_engine_shared.schemas import (
 from psycopg.types.json import Json
 from twilio.rest import Client as TwilioClient
 
-from resolver_svc.templates import render_cancelled, render_confirmation_card
+from resolver_svc.clarification import clarify
+from resolver_svc.templates import (
+    render_cancelled,
+    render_confirmation_card,
+    render_needs_review,
+)
 
 logger = logging.getLogger("resolver_svc")
 app = FastAPI()
 
 CONFIDENCE_THRESHOLD = 0.75  # state-machine.md §1.2
+MAX_EXCHANGES = 3  # state-machine.md §1.2
 
 # Plain config, not secrets — same treatment as every other Twilio
 # identifier in this project (infrastructure.md §4.1). Only the API key
@@ -73,9 +86,69 @@ def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
         conn.commit()
 
 
-def _user_phone(conn, user_id) -> str:
-    row = conn.execute("SELECT phone_e164 FROM users WHERE id = %s", (str(user_id),)).fetchone()
-    return row[0]
+def _user_phone_and_timezone(conn, user_id) -> tuple[str, str]:
+    row = conn.execute(
+        "SELECT phone_e164, timezone FROM users WHERE id = %s", (str(user_id),)
+    ).fetchone()
+    return row[0], row[1]
+
+
+def _action_type(item_type: str) -> str | None:
+    return "calendar" if item_type == "obligation" else None
+
+
+async def _start_clarification(extracted: ExtractedItemMessage) -> None:
+    _write_item(extracted, "CLARIFYING")
+
+    with get_connection() as conn:
+        phone, tz_name = _user_phone_and_timezone(conn, extracted.user_id)
+
+    now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    result = await clarify(
+        session_id=f"{extracted.item_id}-0",
+        now_local=now_local,
+        tz_name=tz_name,
+        title=extracted.title,
+        latest_reply=None,
+    )
+    resolved_fields = {"due_at": result.due_at} if result.due_at_filled and result.due_at else {}
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations
+                (user_id, item_id, exchange_count, pending_fields, resolved_fields)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                str(extracted.user_id),
+                str(extracted.item_id),
+                1 if result.question else 0,
+                result.still_missing,
+                Json(resolved_fields),
+            ),
+        )
+        conn.commit()
+
+    if result.question:
+        _send_sms(phone, result.question)
+        logger.info("CLARIFYING item_id=%s sent question 1/%d", extracted.item_id, MAX_EXCHANGES)
+        return
+
+    # Turn 1 always has latest_reply=None, so the model should never
+    # resolve still_missing to empty here — handled anyway rather than
+    # assumed, since it's one extra branch, not extra complexity.
+    _write_item(extracted, "AWAITING_CONFIRMATION")
+    body = render_confirmation_card(
+        extracted.type,
+        extracted.title,
+        extracted.summary,
+        result.due_at and datetime.fromisoformat(result.due_at),
+        extracted.effort_minutes,
+        _action_type(extracted.type),
+    )
+    _send_sms(phone, body)
+    logger.info("AWAITING_CONFIRMATION item_id=%s (resolved on first pass)", extracted.item_id)
 
 
 @app.post("/pubsub/push")
@@ -87,30 +160,24 @@ async def pubsub_push(request: Request):
         logger.exception("malformed push envelope, could not decode ExtractedItemMessage")
         raise HTTPException(status_code=500, detail="malformed envelope") from None
 
-    complete_and_confident = (
-        not extracted.missing_fields and extracted.confidence >= CONFIDENCE_THRESHOLD
-    )
-    target_state = "AWAITING_CONFIRMATION" if complete_and_confident else "EXTRACTED"
+    if extracted.missing_fields:
+        try:
+            await _start_clarification(extracted)
+        except Exception:
+            logger.exception("failed to start clarification item_id=%s", extracted.item_id)
+            raise HTTPException(status_code=500, detail="clarification start failed") from None
+        return {"status": "clarifying", "item_id": str(extracted.item_id)}
+
+    # Complete extraction — low confidence alone (with no missing fields)
+    # doesn't get a manufactured clarifying question about nothing; the
+    # confirmation card's own "or send a correction" is the safety net
+    # for it (state-machine.md §1.2's "Resolved gap" note).
     try:
-        _write_item(extracted, target_state)
+        _write_item(extracted, "AWAITING_CONFIRMATION")
     except Exception:
         logger.exception("failed to write extracted fields item_id=%s", extracted.item_id)
         raise HTTPException(status_code=500, detail="db write failed") from None
 
-    if not complete_and_confident:
-        logger.info(
-            "item left in EXTRACTED (real clarification is step 10) item_id=%s "
-            "missing_fields=%s confidence=%s",
-            extracted.item_id,
-            extracted.missing_fields,
-            extracted.confidence,
-        )
-        return {"status": "left_in_extracted", "item_id": str(extracted.item_id)}
-
-    # due_at has no items column (data-model.md §2.4) — staged here so
-    # the eventual Y reply (a separate request, no shared memory with
-    # this one) can reconstruct it. agent-contracts.md §3.2's "creates
-    # the conversations row unconditionally" note.
     resolved_fields = {"due_at": extracted.due_at.isoformat()} if extracted.due_at else {}
     try:
         with get_connection() as conn:
@@ -118,20 +185,19 @@ async def pubsub_push(request: Request):
                 "INSERT INTO conversations (user_id, item_id, resolved_fields) VALUES (%s, %s, %s)",
                 (str(extracted.user_id), str(extracted.item_id), Json(resolved_fields)),
             )
-            phone = _user_phone(conn, extracted.user_id)
+            phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
             conn.commit()
     except Exception:
         logger.exception("failed to open conversation item_id=%s", extracted.item_id)
         raise HTTPException(status_code=500, detail="conversation open failed") from None
 
-    action_type = "calendar" if extracted.type == "obligation" else None
     body = render_confirmation_card(
         extracted.type,
         extracted.title,
         extracted.summary,
         extracted.due_at,
         extracted.effort_minutes,
-        action_type,
+        _action_type(extracted.type),
     )
     try:
         _send_sms(phone, body)
@@ -143,20 +209,117 @@ async def pubsub_push(request: Request):
     return {"status": "awaiting_confirmation", "item_id": str(extracted.item_id)}
 
 
+async def _handle_clarification_reply(
+    conn, item_id, phone, tz_name, title, item_type, summary, effort_minutes, latest_reply
+) -> dict:
+    convo_row = conn.execute(
+        "SELECT pending_fields, resolved_fields, exchange_count FROM conversations "
+        "WHERE item_id = %s ORDER BY last_message_at DESC LIMIT 1",
+        (str(item_id),),
+    ).fetchone()
+    _pending_fields, resolved_fields, exchange_count = convo_row
+
+    now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    result = await clarify(
+        session_id=f"{item_id}-{exchange_count}",
+        now_local=now_local,
+        tz_name=tz_name,
+        title=title,
+        latest_reply=latest_reply,
+    )
+    if result.due_at_filled and result.due_at:
+        resolved_fields = {**resolved_fields, "due_at": result.due_at}
+
+    if result.still_missing:
+        if exchange_count < MAX_EXCHANGES:
+            next_count = exchange_count + 1
+            conn.execute(
+                """
+                UPDATE conversations
+                SET exchange_count = %s, pending_fields = %s, resolved_fields = %s,
+                    last_message_at = now()
+                WHERE item_id = %s
+                """,
+                (next_count, result.still_missing, Json(resolved_fields), str(item_id)),
+            )
+            conn.commit()
+            _send_sms(phone, result.question)
+            logger.info(
+                "CLARIFYING item_id=%s sent question %d/%d", item_id, next_count, MAX_EXCHANGES
+            )
+            return {"status": "clarifying", "item_id": str(item_id)}
+
+        conn.execute(
+            "UPDATE items SET state = 'NEEDS_REVIEW', updated_at = now() WHERE id = %s",
+            (str(item_id),),
+        )
+        conn.execute(
+            "UPDATE conversations SET resolved_fields = %s, last_message_at = now() "
+            "WHERE item_id = %s",
+            (Json(resolved_fields), str(item_id)),
+        )
+        conn.commit()
+        _send_sms(phone, render_needs_review(title))
+        logger.info("NEEDS_REVIEW item_id=%s (exhausted %d exchanges)", item_id, MAX_EXCHANGES)
+        return {"status": "needs_review", "item_id": str(item_id)}
+
+    conn.execute(
+        "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
+        (str(item_id),),
+    )
+    conn.execute(
+        "UPDATE conversations SET resolved_fields = %s, pending_fields = %s, "
+        "last_message_at = now() WHERE item_id = %s",
+        (Json(resolved_fields), [], str(item_id)),
+    )
+    conn.commit()
+    due_at = resolved_fields.get("due_at")
+    body = render_confirmation_card(
+        item_type,
+        title,
+        summary,
+        datetime.fromisoformat(due_at) if due_at else None,
+        effort_minutes,
+        _action_type(item_type),
+    )
+    _send_sms(phone, body)
+    logger.info("AWAITING_CONFIRMATION item_id=%s (clarification resolved)", item_id)
+    return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+
+
 @app.post("/reply")
 async def reply(payload: RoutedReplyMessage):
-    classification = classify_reply(payload.text)
-
     try:
         with get_connection() as conn:
             item_row = conn.execute(
-                "SELECT type, title, summary, effort_minutes FROM items WHERE id = %s",
+                "SELECT type, title, summary, effort_minutes, state FROM items WHERE id = %s",
                 (str(payload.item_id),),
             ).fetchone()
             if item_row is None:
                 raise HTTPException(status_code=404, detail="unknown item_id")
-            item_type, title, summary, effort_minutes = item_row
-            phone = _user_phone(conn, payload.user_id)
+            item_type, title, summary, effort_minutes, state = item_row
+            phone, tz_name = _user_phone_and_timezone(conn, payload.user_id)
+
+            if state == "CLARIFYING":
+                return await _handle_clarification_reply(
+                    conn,
+                    payload.item_id,
+                    phone,
+                    tz_name,
+                    title,
+                    item_type,
+                    summary,
+                    effort_minutes,
+                    payload.text,
+                )
+
+            if state != "AWAITING_CONFIRMATION":
+                logger.warning(
+                    "reply routed for item_id=%s in unexpected state=%s", payload.item_id, state
+                )
+                return {"status": "unexpected_state", "item_id": str(payload.item_id)}
+
+            classification = classify_reply(payload.text)
 
             if classification == "Y":
                 convo_row = conn.execute(
@@ -173,7 +336,7 @@ async def reply(payload: RoutedReplyMessage):
                     summary=summary,
                     due_at=resolved_fields.get("due_at"),
                     effort_minutes=effort_minutes,
-                    action_type="calendar" if item_type == "obligation" else None,
+                    action_type=_action_type(item_type),
                     email_draft=None,
                 )
                 publish("items-confirmed", confirmed)
@@ -200,9 +363,8 @@ async def reply(payload: RoutedReplyMessage):
         logger.exception("reply handling failed item_id=%s", payload.item_id)
         raise HTTPException(status_code=500, detail="reply handling failed") from None
 
-    # OTHER — a correction. Full handling reuses the clarification call
-    # (step 10); for now, log distinctly and take no action, per
-    # test-plan.md's step 9 scope note.
+    # OTHER during AWAITING_CONFIRMATION — a correction. Not built (see
+    # module docstring); logged distinctly, no action taken.
     logger.info(
         "reply outside Y/N, not yet handled item_id=%s text=%r", payload.item_id, payload.text
     )

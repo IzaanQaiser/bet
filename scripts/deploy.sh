@@ -142,14 +142,18 @@ case "$SERVICE" in
     # confirmation card + "Cancelled." — twilio-api-key-secret, same
     # credential dispatcher-svc uses) and a second invoker: sa-ingest,
     # for the synchronous inbound-reply forward (state-machine.md §4),
-    # already anticipated in infrastructure.md §2.1's IAM matrix.
+    # already anticipated in infrastructure.md §2.1's IAM matrix. Step 10
+    # adds the real clarification Gemini call — same Vertex AI env vars
+    # as extractor-svc (GEMINI_MODEL only via global location, §3's
+    # "Resolved gap" note); sa-resolver already has aiplatform.user
+    # (iam.tf), granted back in step 1 for exactly this.
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-resolver@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID}" \
+      --set-env-vars="DB_USER=sa-resolver@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,VERTEX_LOCATION=global,GEMINI_MODEL=gemini-3.5-flash" \
       --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
       --min-instances=0 \
       --no-allow-unauthenticated \
