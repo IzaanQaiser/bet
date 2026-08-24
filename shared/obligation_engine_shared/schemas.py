@@ -54,3 +54,17 @@ class ConfirmedItemMessage(BaseModel):
     effort_minutes: Literal[15, 30, 60, 120, 240]
     action_type: Literal["calendar", "email"] | None = None
     email_draft: str | None = None
+
+
+class RoutedReplyMessage(BaseModel):
+    """Internal ingest-svc -> resolver-svc call, state-machine.md §4 — a
+    synchronous service-to-service HTTP call, not a Pub/Sub topic, but
+    still a message crossing a service boundary, so it gets the same
+    shared-schema treatment as the three above. ingest-svc has already
+    done the "is there an open conversation for this user" lookup by the
+    time this is sent; item_id is that lookup's result, not re-derived by
+    resolver-svc."""
+
+    user_id: UUID
+    item_id: UUID
+    text: str

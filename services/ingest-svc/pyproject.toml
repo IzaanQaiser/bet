@@ -8,6 +8,8 @@ dependencies = [
     "python-multipart>=0.0.12",
     "twilio>=9.3",
     "obligation-engine-shared",
+    "google-auth>=2.35",
+    "requests>=2.32",
 ]
 
 [dependency-groups]

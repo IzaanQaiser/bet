@@ -182,6 +182,8 @@ Applies uniformly across the pipeline lifecycle, per `overview.md` §4. Distingu
 
 Forwarding in steps 1–2 is a synchronous internal call (Cloud Run service-to-service IAM), because both `resolver-svc` and `dispatcher-svc` typically need to reply to the same SMS thread immediately (next question, or "got it, added to your calendar") — there's no reason to add queue latency to a live back-and-forth the way there is for the durability-sensitive forward pipeline.
 
+**Build-order note, not a spec gap:** step 1 (forward to `resolver-svc`) was built in step 9, since there's no way to do a real SMS confirm/cancel round trip — that step's own required manual verification — without it; `ingest-svc` calls `resolver-svc`'s `POST /reply` with an ID-token-authenticated request, matching the synchronous-call design above exactly. Step 2 (forward to `dispatcher-svc`) is not built yet — `dispatcher-svc` has no accept-path endpoint until the feedback-loop step (PRD build order step 14), so there's nothing for that branch to call. Not a live gap in the meantime: nothing sends a suggestion that could be replied to in the deployment's current state either, so step 2's branch can't actually be reached yet regardless.
+
 ---
 
 ## 5. Open items for sibling docs
