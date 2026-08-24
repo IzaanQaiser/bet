@@ -517,25 +517,36 @@ def test_reply_unexpected_state_does_not_crash(client):
 def test_duplicate_found_routes_to_duplicate_suspected_not_clarification(client):
     """A duplicate match short-circuits before the completeness check ever
     runs (state-machine.md §1.1) — even an item with missing_fields set
-    goes to DUPLICATE_SUSPECTED, not CLARIFYING."""
+    goes to DUPLICATE_SUSPECTED, not CLARIFYING. The dedupe question itself
+    is now converse()-driven, in voice — no fixed "Reply Y to merge" script
+    (agent-contracts.md §3.5's dedupe-question follow-up)."""
     extracted = _extracted_message(missing_fields=["due_at"], due_at=None)
     existing_id = uuid4()
     conn = _mock_connection()
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
         patch(
             "resolver_svc.main._check_duplicate",
             return_value=DedupeResult(duplicate_item_id=existing_id, duplicate_title="Pay rent"),
         ),
     ):
+        mock_converse.return_value = ConversationTurnResult(
+            reply_text="isn't this the same as pay rent you already had on there?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "duplicate_suspected", "item_id": str(extracted.item_id)}
-    mock_sms.assert_called_once()
-    assert '"Pay rent"' in mock_sms.call_args.args[2]
-    assert "Reply Y to merge" in mock_sms.call_args.args[2]
+    mock_converse.assert_called_once()
+    assert mock_converse.call_args.kwargs["dedupe_candidate_title"] == "Pay rent"
+    assert mock_converse.call_args.kwargs["awaiting_dedupe_reply"] is False
+    mock_sms.assert_called_once_with(
+        extracted.user_id,
+        "+15551234567",
+        "isn't this the same as pay rent you already had on there?",
+    )
 
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert update_calls[0].args[1][-2] == "DUPLICATE_SUSPECTED"
@@ -557,14 +568,22 @@ def test_duplicate_y_reply_merges_no_publish(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.publish") as mock_publish,
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
-        resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "y"})
+        mock_converse.return_value = ConversationTurnResult(
+            intent="AFFIRM", reply_text="sounds good, merging it with pay rent."
+        )
+        resp = client.post(
+            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "yeah same one"}
+        )
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "merged", "item_id": item_id}
+    assert mock_converse.call_args.kwargs["awaiting_dedupe_reply"] is True
+    assert mock_converse.call_args.kwargs["dedupe_candidate_title"] == "Pay rent"
     mock_publish.assert_not_called()
     mock_sms.assert_called_once_with(
-        UUID(user_id), "+15551234567", 'Got it — that\'s the same as "Pay rent". Nothing new added.'
+        UUID(user_id), "+15551234567", "sounds good, merging it with pay rent."
     )
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "MERGED" in update_calls[0].args[0]
@@ -584,10 +603,15 @@ def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):
         patch("resolver_svc.main._send_sms") as mock_sms,
         patch("resolver_svc.main.converse") as mock_converse,
     ):
-        mock_converse.return_value = ConversationTurnResult(
-            still_missing=[], reply_text="bet, pay rent friday 2pm — sound good?"
+        mock_converse.side_effect = [
+            ConversationTurnResult(intent="DENY", reply_text="got it, keeping separate."),
+            ConversationTurnResult(
+                still_missing=[], reply_text="bet, pay rent friday 2pm — sound good?"
+            ),
+        ]
+        resp = client.post(
+            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "nah different"}
         )
-        resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "n"})
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "awaiting_confirmation", "item_id": item_id}
@@ -597,12 +621,12 @@ def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):
     assert "AWAITING_CONFIRMATION" in update_calls[0].args[0]
 
 
-def test_duplicate_reply_outside_yn_routes_as_new_item(client):
-    """Before this fix, a dedupe reply that classify_reply() couldn't parse
-    as Y or N was silently dropped — no SMS, no new item, nothing (found
-    while fixing the same bug class on the converse()-driven paths above).
-    Now it gets the same treatment: the pending dedupe question is left
-    alone, the text becomes its own new item."""
+def test_duplicate_reply_unrelated_routes_as_new_item(client):
+    """Before this fix, any dedupe reply that classify_reply() couldn't
+    parse as Y or N was silently dropped — no SMS, no new item, nothing.
+    Now converse()'s relates_to_item still applies here too (same escape
+    hatch as CLARIFYING/AWAITING_CONFIRMATION): genuinely unrelated text
+    leaves the pending dedupe question alone and becomes its own new item."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
         item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
@@ -615,7 +639,9 @@ def test_duplicate_reply_outside_yn_routes_as_new_item(client):
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.publish") as mock_publish,
         patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        mock_converse.return_value = ConversationTurnResult(relates_to_item=False, reply_text="")
         resp = client.post(
             "/reply",
             json={"user_id": user_id, "item_id": item_id, "text": "actually book a haircut friday"},
@@ -634,6 +660,42 @@ def test_duplicate_reply_outside_yn_routes_as_new_item(client):
     assert update_calls == []  # still DUPLICATE_SUSPECTED, untouched
 
 
+def test_duplicate_reply_ambiguous_gets_natural_clarifying_reply(client):
+    """A dedupe reply that's ambiguous about whether it's the same item —
+    not unrelated, just unclear — gets a real natural clarifying reply
+    (converse()'s OTHER intent) instead of the old silent drop or a wrong
+    guess at Y/N."""
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
+        conversation_row=(
+            [],
+            {"_dedupe_match_item_id": str(uuid4()), "_dedupe_match_title": "Pay rent"},
+        ),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.publish") as mock_publish,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="OTHER", reply_text="wait, is this the same pay rent thing or a different one?"
+        )
+        resp = client.post(
+            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "wait what do you mean"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "unhandled_reply", "item_id": item_id}
+    mock_publish.assert_not_called()
+    mock_sms.assert_called_once_with(
+        UUID(user_id), "+15551234567", "wait, is this the same pay rent thing or a different one?"
+    )
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert update_calls == []  # still DUPLICATE_SUSPECTED, untouched
+
+
 def test_duplicate_n_reply_with_missing_fields_resumes_clarification(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
@@ -645,11 +707,16 @@ def test_duplicate_n_reply_with_missing_fields_resumes_clarification(client):
         patch("resolver_svc.main.converse") as mock_converse,
         patch("resolver_svc.main._send_sms") as mock_sms,
     ):
-        mock_converse.return_value = ConversationTurnResult(
-            due_at_filled=False, due_at=None, still_missing=["due_at"],
-            reply_text="When's it due?",
+        mock_converse.side_effect = [
+            ConversationTurnResult(intent="DENY", reply_text="got it, keeping separate."),
+            ConversationTurnResult(
+                due_at_filled=False, due_at=None, still_missing=["due_at"],
+                reply_text="When's it due?",
+            ),
+        ]
+        resp = client.post(
+            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "nah different"}
         )
-        resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "n"})
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "clarifying", "item_id": item_id}

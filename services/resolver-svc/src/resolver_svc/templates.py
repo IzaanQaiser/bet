@@ -1,21 +1,18 @@
-"""Deterministic SMS templates — agent-contracts.md §3.1/§3.4. No LLM call
-for any of this; every field is computed, never generated.
+"""Deterministic SMS templates — agent-contracts.md §3.4. No LLM call for
+any of this; every field is computed, never generated.
 
 Phase G step D retired render_confirmation_card/render_attached/
 render_cancelled: the main obligation confirm flow (including AFFIRM/DENY/
 CORRECTION/ATTACH replies) now gets its outbound text from
 resolver_svc.conversation's LLM call instead of fixed templates
-(agent-contracts.md §3.3). What's left here is the dedupe question and the
-terminal messages — deliberately untouched by step D, not what the
-redesign was about."""
-
-
-def render_dedupe_question(existing_title: str) -> str:
-    return f'Is this the same as "{existing_title}"?\nReply Y to merge, N if it\'s different.'
-
-
-def render_merged(existing_title: str) -> str:
-    return f'Got it — that\'s the same as "{existing_title}". Nothing new added.'
+(agent-contracts.md §3.3). A same-session follow-up then retired
+render_dedupe_question/render_merged too — the dedupe question's own
+fixed "Reply Y to merge, N if it's different" script, left standing
+through step D as a deliberate exception, hit a real user directly
+against the deployed demo; §3.5's converse() call absorbed that flow
+(dedupe_candidate_title/awaiting_dedupe_reply). What's left here is only
+the exhaustion terminal message — a deliberate, still-templated exception
+of its own, unrelated to either of the above."""
 
 
 def render_needs_review(title: str) -> str:
