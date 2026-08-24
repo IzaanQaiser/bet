@@ -315,18 +315,29 @@ Also required, found while building this step for real (not named in the step's 
 
 ## Step 14 — Feedback loop / dismissal scoring
 
+**Real finding, required a migration:** `sa-committer` was only ever granted `INSERT` on `obligations`/`latents` (write-only by the original design — it never needed to read either back). The idempotency guard this step's real testing required (see below) needs `SELECT` on both — `migrations/0005_grant_committer_obligations_latents_select.sql`, found via a real `permission denied for table obligations` error verifying the accept path against actually-deployed infra.
+
+**Two real bugs found completing `dispatcher-svc`'s `ingest-svc` → `/reply` accept path against real infra, both in `committer-svc`'s step-13 idempotency guard, not in anything new this step wrote:**
+1. The guard's `items.state != 'CONFIRMED'` check silently swallowed a real accept: `dispatcher-svc`'s accept publish for a latent arrives with `items.state` already `'COMMITTED'` (that item's *original* commit, `state-machine.md` §2.3) — a legitimate second pass through the endpoint, not a redelivery. No error, no `obligations` row, no Calendar event — the accept just vanished. Fixed by keying the guard on whether the row this exact message type would write (`obligations` for `type="obligation"`, `latents` for `"latent"`) already exists, instead of `items.state`.
+2. The fix above needed `SELECT` on tables `sa-committer` never had (see the migration above) — found immediately after deploying the first fix, via the real `permission denied` error.
+
+Full writeup of both in `state-machine.md` §3 (search "step 14"). Also fixed, smaller: `committer-svc`'s items UPDATE only ever wrote `state`, never `type` — harmless until this step's accept path needed a latent's `type` to actually flip to `obligation` on commit.
+
 **Acceptance criteria**
 - `N` reply: `dismissal_count` increments; `<2` → back to `ELIGIBLE`; `==2` → `dormant_until = now() + 30d`.
 - `Later` reply: `dormant_until = now() + 7d`, `dismissal_count` unchanged.
 - No reply within 24h: `outcome='no_response'`, no penalty, `dormant_until` unchanged, resolved **before** the same run scores any new suggestion.
 - `Y` reply: `outcome='accepted'`, converts to obligation via the minimal `items.confirmed` publish (`state-machine.md` §2.3), picked up correctly by step 6's committer.
 
-**Unit tests** (`services/dispatcher-svc/tests/test_feedback.py`)
-- `test_outcome_table` — table-driven over every `SURFACED` branch, matching `state-machine.md` §2's diagram exactly.
-- `test_24h_timeout_resolves_before_new_scoring`.
+**Unit tests** (`services/dispatcher-svc/tests/test_feedback.py`, DB/Twilio/Calendar all mocked)
+- `_capped_effort_minutes` boundary tests — `ConfirmedItemMessage.effort_minutes`'s strict `Literal[15,30,60,120,240]` (`schemas.py`) means "capped at the block length" needs its own resolved-gap decision, see `state-machine.md` §2.3.
+- `_resolve_stale_suggestions` — the 24h no-response timeout, resolved before scoring.
+- The full `/reply` outcome table: `N` below/at the dismissal threshold, `Later`, `Y` with a free block, `Y` with no capacity left (the day filled up between send and reply — a real edge case the accept handler re-fetches current Calendar for, not the possibly-stale snapshot), `OTHER`, and a reply against no open suggestion at all.
 
-**Integration tests**
-- `test_accept_path_full_cycle` — `SURFACED` → `Y` → routed via `ingest-svc` → `items.type` flips to `obligation`, `due_at` computed as block-start capped at block length, `items.confirmed` published, `committer-svc` commits it.
+**Integration tests** (`services/dispatcher-svc/tests/test_dispatcher_integration.py`, real Postgres + Pub/Sub emulator, Calendar/Twilio mocked)
+- `test_accept_path_full_cycle` — a real `SURFACED` suggestion → `Y` → real `items-confirmed` publish (pulled from a real subscription) with `type` flipped to `obligation`, `due_at` computed as the real block start, `effort_minutes` capped correctly. `committer-svc` actually consuming it is covered by its own test suite (including this step's two real-bug regressions), not re-run here — this test's boundary is `dispatcher-svc`'s own real publish.
+
+**Manual verification:** a real `Y`, `N`, and `Later` reply, each sent as a real signed webhook to the actually-deployed `ingest-svc`, routed through to the actually-deployed `dispatcher-svc` — see `status.md` for what was actually run and the two real bugs it caught before the final passing result.
 
 ---
 

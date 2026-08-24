@@ -24,16 +24,19 @@ def client(monkeypatch):
     return TestClient(app)
 
 
-def _mock_connection(*, item_state="CONFIRMED", user_row=None):
-    """item_state feeds the step-13 idempotency guard's `SELECT state FROM
-    items` check at the top of /pubsub/push — "CONFIRMED" (the default)
-    lets every pre-existing test reach the real commit logic unchanged;
-    tests exercising the guard itself override it."""
+def _mock_connection(*, already_committed=False, user_row=None):
+    """already_committed feeds the idempotency guard's _already_committed()
+    check (SELECT 1 FROM obligations/latents WHERE item_id=...) at the top
+    of /pubsub/push — False (the default) lets every pre-existing test
+    reach the real commit logic unchanged; tests exercising the guard
+    itself override it. Keyed on the target table, not items.state — see
+    _already_committed()'s own docstring for why (a real bug found
+    verifying step 14's accept path)."""
 
     def execute_side_effect(sql, params=None):
         result = MagicMock()
-        if "FROM items" in sql:
-            result.fetchone.return_value = (item_state,) if item_state is not None else None
+        if "FROM obligations" in sql or "FROM latents" in sql:
+            result.fetchone.return_value = (1,) if already_committed else None
         elif "FROM users" in sql:
             result.fetchone.return_value = user_row
         else:
@@ -100,7 +103,7 @@ def test_obligation_branch_calls_calendar_write(client):
 
     update_sql, update_params = conn.execute.call_args_list[3][0]
     assert "state = 'COMMITTED'" in update_sql
-    assert update_params[0] == str(confirmed.item_id)
+    assert update_params == (confirmed.type, str(confirmed.item_id))
 
 
 def test_latent_branch_does_not_call_calendar(client):
@@ -167,10 +170,10 @@ def test_email_action_type_not_implemented(client):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 500
-    # Only the idempotency guard's state check happened — the
-    # NotImplementedError is raised before any real DB write is attempted.
+    # Only the idempotency guard's already-committed check happened —
+    # the NotImplementedError is raised before any real DB write.
     assert conn.execute.call_count == 1
-    assert "FROM items" in conn.execute.call_args_list[0][0][0]
+    assert "FROM obligations" in conn.execute.call_args_list[0][0][0]
 
 
 def test_malformed_envelope_returns_500_for_retry(client):
@@ -178,7 +181,7 @@ def test_malformed_envelope_returns_500_for_retry(client):
     assert resp.status_code == 500
 
 
-# --- idempotency guard (step 13) ------------------------------------------
+# --- idempotency guard (step 13, refined by a real bug found in step 14) --
 
 
 def test_redelivered_already_committed_item_is_a_noop(client):
@@ -186,7 +189,7 @@ def test_redelivered_already_committed_item_is_a_noop(client):
     redelivery of the same items.confirmed message must not create a
     second real Calendar event."""
     confirmed = _confirmed_message()
-    conn = _mock_connection(item_state="COMMITTED")
+    conn = _mock_connection(already_committed=True)
 
     with (
         patch("committer_svc.main.get_connection", return_value=conn),
@@ -197,20 +200,35 @@ def test_redelivered_already_committed_item_is_a_noop(client):
     assert resp.status_code == 200
     assert resp.json() == {"status": "already_processed", "item_id": str(confirmed.item_id)}
     mock_session_cls.assert_not_called()
-    assert conn.execute.call_count == 1  # only the state check
+    assert conn.execute.call_count == 1  # only the already-committed check
 
 
-def test_unknown_item_id_proceeds_to_real_commit_logic(client):
-    """No items row found at all (row is None) isn't itself the
-    already-processed case — falls through to the real commit path,
-    which fails for its own reason (no linked Google account here)."""
-    confirmed = _confirmed_message()
-    conn = _mock_connection(item_state=None, user_row=None)
+def test_accepted_latent_is_not_blocked_by_its_own_prior_commit(client):
+    """The real bug found verifying step 14's accept path: an item that
+    was already COMMITTED once as a latent must not be treated as
+    already-processed when it legitimately comes through a second time
+    as an accepted obligation — _already_committed() checks the
+    obligations table specifically (empty here), not items.state or the
+    latents table (which does have a row, from the original commit)."""
+    confirmed = _confirmed_message(type="obligation")  # dispatcher-svc's accept publish
+    conn = _mock_connection(
+        already_committed=False,  # no obligations row yet, even though latents has one
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles"),
+    )
+    calendar_response = MagicMock()
+    calendar_response.json.return_value = {"id": "gcal-event-456"}
 
-    with patch("committer_svc.main.get_connection", return_value=conn):
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.post.return_value = calendar_response
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
-    assert resp.status_code == 500
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "committed", "item_id": str(confirmed.item_id)}
+    mock_session_cls.return_value.post.assert_called_once()
 
 
 # --- /pubsub/dlq (step 13) -------------------------------------------------

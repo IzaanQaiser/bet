@@ -143,8 +143,14 @@ case "$SERVICE" in
     # state" pattern setup_push_subscription already uses. Step 11 adds
     # TWILIO_ACCOUNT_SID (plain config, not a secret — same treatment as
     # every other Twilio identifier, infrastructure.md §4.1) for
-    # authenticating the MMS media download from Twilio.
+    # authenticating the MMS media download from Twilio. Step 14 adds
+    # DISPATCHER_SVC_URL, same reasoning as RESOLVER_SVC_URL — the
+    # suggestion-reply routing forward (state-machine.md §4 step 2); the
+    # run.invoker grant lives in dispatcher-svc's own case below.
     RESOLVER_SVC_URL=$(gcloud run services describe resolver-svc \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+    DISPATCHER_SVC_URL=$(gcloud run services describe dispatcher-svc \
       --project="$PROJECT_ID" --region="$REGION" \
       --format='value(status.url)' --account=waslyrideshare@gmail.com)
 
@@ -154,7 +160,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL},TWILIO_ACCOUNT_SID=AC3292d4a7944b87b2fe3db562856e32bd" \
+      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL},DISPATCHER_SVC_URL=${DISPATCHER_SVC_URL},TWILIO_ACCOUNT_SID=AC3292d4a7944b87b2fe3db562856e32bd" \
       --set-secrets="TWILIO_AUTH_TOKEN=twilio-auth-token:latest" \
       --min-instances=0 \
       --allow-unauthenticated \
@@ -267,6 +273,15 @@ case "$SERVICE" in
     gcloud run services add-iam-policy-binding "$SERVICE" \
       --project="$PROJECT_ID" --region="$REGION" \
       --member="serviceAccount:${SA}" --role="roles/run.invoker" \
+      --account=waslyrideshare@gmail.com
+
+    # Step 14: the routed suggestion-reply forward (state-machine.md §4
+    # step 2), same pattern as sa-ingest -> resolver-svc.
+    echo "Granting sa-ingest run.invoker on ${SERVICE} (for routed suggestion replies)..."
+    gcloud run services add-iam-policy-binding "$SERVICE" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --member="serviceAccount:sa-ingest@${PROJECT_ID}.iam.gserviceaccount.com" \
+      --role="roles/run.invoker" \
       --account=waslyrideshare@gmail.com
 
     for job in dispatch-daily:"0 7 * * *" dispatch-midday:"0 13 * * *"; do
