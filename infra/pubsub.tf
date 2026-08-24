@@ -9,6 +9,19 @@ locals {
   pipeline_topics = ["items-raw", "items-extracted", "items-confirmed"]
 }
 
+# Resolved gap, found in step 4: enabling pubsub.googleapis.com (main.tf)
+# does not by itself create the project's Pub/Sub push service agent
+# (service-<PROJECT_NUMBER>@gcp-sa-pubsub.iam.gserviceaccount.com) — every
+# push-subscription IAM grant in this project (deploy.sh's per-service
+# tokenCreator/publisher/subscriber bindings) needs that identity to exist
+# first. Declaring it here would need the google-beta provider
+# (google_project_service_identity isn't in the plain google provider) —
+# not worth a second provider for one one-time call. Bootstrapped once via
+# `gcloud beta services identity create --service=pubsub.googleapis.com
+# --project=<project>` instead; see infrastructure.md §2.2's bootstrap
+# note. A fresh project needs this run once, before the first
+# `./scripts/deploy.sh` that creates a push subscription.
+
 resource "google_pubsub_topic" "pipeline" {
   for_each = toset(local.pipeline_topics)
   name     = each.value
