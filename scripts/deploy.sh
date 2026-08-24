@@ -23,6 +23,69 @@ echo "Building and pushing ${IMAGE}..."
 docker build --platform linux/amd64 -f "services/${SERVICE}/Dockerfile" -t "$IMAGE" .
 docker push "$IMAGE"
 
+# Creates (or updates) a push subscription that invokes $SERVICE, and every
+# IAM grant that needs — the pattern found while deploying extractor-svc
+# (infrastructure.md §2.1's "Resolved gap" note): the push subscription's
+# OIDC token is minted AS the consuming service's own SA, not the raw
+# Pub/Sub push service agent, so Cloud Run's invoker check sees the same
+# identity every other access-control story in this system already uses.
+# Args: <subscription-name> <topic> <dlq-topic>
+setup_push_subscription() {
+  local subscription="$1" topic="$2" dlq_topic="$3"
+
+  local service_url project_number pubsub_agent
+  service_url=$(gcloud run services describe "$SERVICE" \
+    --project="$PROJECT_ID" --region="$REGION" \
+    --format='value(status.url)' --account=waslyrideshare@gmail.com)
+  project_number=$(gcloud projects describe "$PROJECT_ID" \
+    --format='value(projectNumber)' --account=waslyrideshare@gmail.com)
+  pubsub_agent="service-${project_number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+
+  echo "Granting Pub/Sub push service agent tokenCreator on ${SA}..."
+  gcloud iam service-accounts add-iam-policy-binding "$SA" \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:${pubsub_agent}" --role="roles/iam.serviceAccountTokenCreator" \
+    --account=waslyrideshare@gmail.com
+
+  echo "Granting ${SA} run.invoker on ${SERVICE}..."
+  gcloud run services add-iam-policy-binding "$SERVICE" \
+    --project="$PROJECT_ID" --region="$REGION" \
+    --member="serviceAccount:${SA}" --role="roles/run.invoker" \
+    --account=waslyrideshare@gmail.com
+
+  # Required for the dead-letter policy below: the push service agent needs
+  # publish on the DLQ topic and subscribe on this subscription, or Pub/Sub
+  # can't actually forward failed deliveries there.
+  gcloud pubsub topics add-iam-policy-binding "$dlq_topic" \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:${pubsub_agent}" --role="roles/pubsub.publisher" \
+    --account=waslyrideshare@gmail.com
+
+  echo "Creating/updating ${subscription}..."
+  if gcloud pubsub subscriptions describe "$subscription" \
+    --project="$PROJECT_ID" --account=waslyrideshare@gmail.com >/dev/null 2>&1; then
+    gcloud pubsub subscriptions update "$subscription" \
+      --project="$PROJECT_ID" \
+      --push-endpoint="${service_url}/pubsub/push" \
+      --push-auth-service-account="${SA}" \
+      --account=waslyrideshare@gmail.com
+  else
+    gcloud pubsub subscriptions create "$subscription" \
+      --project="$PROJECT_ID" \
+      --topic="$topic" \
+      --push-endpoint="${service_url}/pubsub/push" \
+      --push-auth-service-account="${SA}" \
+      --dead-letter-topic="$dlq_topic" \
+      --max-delivery-attempts=5 \
+      --account=waslyrideshare@gmail.com
+  fi
+
+  gcloud pubsub subscriptions add-iam-policy-binding "$subscription" \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:${pubsub_agent}" --role="roles/pubsub.subscriber" \
+    --account=waslyrideshare@gmail.com
+}
+
 case "$SERVICE" in
   ingest-svc)
     echo "Deploying ${SERVICE}..."
@@ -54,65 +117,25 @@ case "$SERVICE" in
       --no-allow-unauthenticated \
       --account=waslyrideshare@gmail.com
 
-    SERVICE_URL=$(gcloud run services describe "$SERVICE" \
-      --project="$PROJECT_ID" --region="$REGION" \
-      --format='value(status.url)' --account=waslyrideshare@gmail.com)
-    PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" \
-      --format='value(projectNumber)' --account=waslyrideshare@gmail.com)
-    PUBSUB_AGENT="service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
-    SUBSCRIPTION="items-raw-extractor-push"
-
-    # The push subscription's OIDC token is minted AS sa-extractor (not as
-    # the raw Pub/Sub push service agent) — Cloud Run's invoker check then
-    # sees sa-extractor as the caller, matching every other service's
-    # identity-based access story instead of a one-off special case. This
-    # needs two grants in each direction: the push agent must be allowed to
-    # mint tokens as sa-extractor (tokenCreator, on sa-extractor itself),
-    # and sa-extractor must be allowed to actually invoke the service
-    # (run.invoker, on the Cloud Run service).
-    echo "Granting Pub/Sub push service agent tokenCreator on ${SA}..."
-    gcloud iam service-accounts add-iam-policy-binding "$SA" \
+    setup_push_subscription "items-raw-extractor-push" "items-raw" "items-raw-dlq"
+    ;;
+  resolver-svc)
+    echo "Deploying ${SERVICE}..."
+    # No --allow-unauthenticated, same invoker story as extractor-svc.
+    # Unlike extractor-svc, sa-resolver does have a Cloud SQL binding
+    # (infrastructure.md §2.1 — the stub writes items directly).
+    gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
-      --member="serviceAccount:${PUBSUB_AGENT}" --role="roles/iam.serviceAccountTokenCreator" \
+      --region="$REGION" \
+      --image="$IMAGE" \
+      --service-account="$SA" \
+      --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
+      --set-env-vars="DB_USER=sa-resolver@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID}" \
+      --min-instances=0 \
+      --no-allow-unauthenticated \
       --account=waslyrideshare@gmail.com
 
-    echo "Granting ${SA} run.invoker on ${SERVICE}..."
-    gcloud run services add-iam-policy-binding "$SERVICE" \
-      --project="$PROJECT_ID" --region="$REGION" \
-      --member="serviceAccount:${SA}" --role="roles/run.invoker" \
-      --account=waslyrideshare@gmail.com
-
-    # Required for the dead-letter policy below: the push service agent
-    # needs publish on the DLQ topic and subscribe on this subscription, or
-    # Pub/Sub can't actually forward failed deliveries there.
-    gcloud pubsub topics add-iam-policy-binding items-raw-dlq \
-      --project="$PROJECT_ID" \
-      --member="serviceAccount:${PUBSUB_AGENT}" --role="roles/pubsub.publisher" \
-      --account=waslyrideshare@gmail.com
-
-    echo "Creating/updating ${SUBSCRIPTION}..."
-    if gcloud pubsub subscriptions describe "$SUBSCRIPTION" \
-      --project="$PROJECT_ID" --account=waslyrideshare@gmail.com >/dev/null 2>&1; then
-      gcloud pubsub subscriptions update "$SUBSCRIPTION" \
-        --project="$PROJECT_ID" \
-        --push-endpoint="${SERVICE_URL}/pubsub/push" \
-        --push-auth-service-account="${SA}" \
-        --account=waslyrideshare@gmail.com
-    else
-      gcloud pubsub subscriptions create "$SUBSCRIPTION" \
-        --project="$PROJECT_ID" \
-        --topic=items-raw \
-        --push-endpoint="${SERVICE_URL}/pubsub/push" \
-        --push-auth-service-account="${SA}" \
-        --dead-letter-topic=items-raw-dlq \
-        --max-delivery-attempts=5 \
-        --account=waslyrideshare@gmail.com
-    fi
-
-    gcloud pubsub subscriptions add-iam-policy-binding "$SUBSCRIPTION" \
-      --project="$PROJECT_ID" \
-      --member="serviceAccount:${PUBSUB_AGENT}" --role="roles/pubsub.subscriber" \
-      --account=waslyrideshare@gmail.com
+    setup_push_subscription "items-extracted-resolver-push" "items-extracted" "items-extracted-dlq"
     ;;
   *)
     echo "No deploy config yet for ${SERVICE} — add a case in scripts/deploy.sh." >&2

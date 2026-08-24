@@ -12,6 +12,7 @@ members = [
     "ingest-svc",
     "obligation-engine",
     "obligation-engine-shared",
+    "resolver-svc",
 ]
 
 [[package]]
@@ -1177,9 +1178,12 @@ source = { virtual = "." }
 [package.dev-dependencies]
 dev = [
     { name = "extractor-svc" },
+    { name = "httpx2" },
     { name = "ingest-svc" },
     { name = "obligation-engine-shared" },
     { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "resolver-svc" },
     { name = "ruff" },
 ]
 
@@ -1188,9 +1192,12 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "extractor-svc", editable = "services/extractor-svc" },
+    { name = "httpx2" },
     { name = "ingest-svc", editable = "services/ingest-svc" },
     { name = "obligation-engine-shared", editable = "shared" },
     { name = "pytest", specifier = ">=8.3" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "resolver-svc", editable = "services/resolver-svc" },
     { name = "ruff", specifier = ">=0.16" },
 ]
 
@@ -1707,6 +1714,35 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ac/c3/e2a2b89f2d3e2179abd6d00ebd70bff6273f37fb3e0cc209f48b39d00cbf/requests-2.34.2.tar.gz", hash = "sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed", size = 142856, upload-time = "2026-05-14T19:25:27.735Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl", hash = "sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0", size = 73075, upload-time = "2026-05-14T19:25:26.443Z" },
+]
+
+[[package]]
+name = "resolver-svc"
+version = "0.1.0"
+source = { editable = "services/resolver-svc" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "obligation-engine-shared" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "httpx2" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "obligation-engine-shared", editable = "shared" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "httpx2" },
+    { name = "pytest", specifier = ">=8.3" },
 ]
 
 [[package]]

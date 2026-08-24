@@ -11,12 +11,29 @@ package = false
 members = ["shared", "services/*"]
 
 [dependency-groups]
-dev = ["pytest>=8.3", "ruff>=0.16", "obligation-engine-shared", "ingest-svc", "extractor-svc"]
+# pytest-asyncio and httpx2 are here (not just in the individual services'
+# own dev groups) because `uv sync` run from a member directory only
+# installs that member's deps, dropping every other workspace member and
+# tool from the shared .venv — found via this exact flake in step 5.
+# Keeping every cross-cutting dev tool in the root group means a root-level
+# `uv sync` always restores the full set, regardless of which directory the
+# last `uv sync`/`uv add` ran from.
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.16",
+    "httpx2",
+    "obligation-engine-shared",
+    "ingest-svc",
+    "extractor-svc",
+    "resolver-svc",
+]
 
 [tool.uv.sources]
 obligation-engine-shared = { workspace = true }
 ingest-svc = { workspace = true }
 extractor-svc = { workspace = true }
+resolver-svc = { workspace = true }
 
 [tool.ruff]
 line-length = 100
@@ -24,3 +41,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+# Needed here too, not just in extractor-svc's own pyproject.toml — running
+# the full suite from the repo root (`uv run pytest services/ shared/`)
+# resolves this file as the pytest config, not the per-service one.
+asyncio_mode = "auto"

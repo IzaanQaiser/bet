@@ -2,7 +2,7 @@
 
 Read this after the PRD at the start of every session — it's the fast answer to "where are we." Update it whenever a build-order step completes, starts, or gets blocked. This is a living tracker, not a history — keep it short and current; git log is the historical record.
 
-**Last updated:** 2026-08-23 (session 3)
+**Last updated:** 2026-08-24 (session 3)
 
 ---
 
@@ -14,7 +14,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**Steps 1-4 done. Next: Step 5 — `resolver-svc` stub (auto-confirm).**
+**Steps 1-5 done. Next: Step 6 — `committer-svc`.**
 
 | Step | Status |
 |---|---|
@@ -24,7 +24,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 | 3. `ingest-svc` + real Twilio number | **Done** — deployed to Cloud Run, real Twilio number (`+14152365420`) wired to it, a real SMS from the developer's phone was confirmed end-to-end in the database (`state='RECEIVED'`, correct `user_id`). Two real deploy-time bugs found and fixed — see Notes. |
 | **Phase B — Core pipeline (auto-confirm stub)** | |
 | 4. `extractor-svc` | **Done** — deployed to Cloud Run, real end-to-end verified: a real `RawItemMessage` published to `items-raw` produced a correct `ExtractedItemMessage` on `items-extracted` via the real Gemini 3.5 Flash call, `type="obligation"`, `due_at` correctly left null for ambiguous "Friday", `effort_minutes=15` (int). Three real deploy-time bugs found and fixed — see Notes. |
-| 5. `resolver-svc` stub (temporary, auto-confirm) | Not started |
+| 5. `resolver-svc` stub (temporary, auto-confirm) | **Done** — deployed to Cloud Run, real end-to-end verified against the live DB: an `ExtractedItemMessage` with empty `missing_fields` produced a `CONFIRMED` `items` row (all extracted fields correctly written) and a matching `ConfirmedItemMessage` on `items.confirmed` with `action_type="calendar"`. |
 | 6. `committer-svc` | Not started |
 | **Phase C — The differentiator** | |
 | 7. Capacity engine, pure functions | Not started |
@@ -88,3 +88,9 @@ None.
     2. The project's Pub/Sub push service agent (`service-<PROJECT_NUMBER>@gcp-sa-pubsub.iam.gserviceaccount.com`) didn't exist yet — enabling `pubsub.googleapis.com` doesn't auto-create it. One-time fix: `gcloud beta services identity create --service=pubsub.googleapis.com --project=obligation-engine-hack` (documented in `infrastructure.md` §2.2's bootstrap note, not made Terraform since it needs the `google-beta` provider for one one-time call).
     3. The originally planned "Pub/Sub push service agent only" invoker pattern doesn't actually work that way — the push subscription's OIDC token has to be minted *as the consuming service's own SA* (`sa-extractor`), not as the raw push agent, which needs a `serviceAccountUser`-style grant the developer's Owner account still can't get on a Google-managed agent. Working pattern (now in `scripts/deploy.sh` and `infrastructure.md` §2.1): grant the push agent `roles/iam.serviceAccountTokenCreator` *on* `sa-extractor`, then grant `sa-extractor` `roles/run.invoker` *on* the Cloud Run service.
   - Deployed and verified for real: published a `RawItemMessage` directly to the live `items-raw` topic ("Bro send rent by Friday"), confirmed the correct `ExtractedItemMessage` arrived on `items-extracted` and Cloud Run logs show a clean `200 OK` with no retries.
+- **Step 5 (`resolver-svc` stub) — the planned proof-first pattern paid off again:**
+  - Code written: `services/resolver-svc/{main.py,pyproject.toml,Dockerfile}` + 8 tests (6 unit, DB/Pub/Sub mocked; 1 real Pub/Sub-emulator integration test; 1 real end-to-end deploy check, not counted in the automated suite). Stub logic exactly matches `test-plan.md` step 5: writes extracted fields to `items` unconditionally (the "progress" write, `state='EXTRACTED'`), and only when `missing_fields` is empty additionally sets `state='CONFIRMED'` and publishes `ConfirmedItemMessage` with `action_type="calendar"` for obligations / `null` for latents, per `agent-contracts.md` §1.
+  - `scripts/deploy.sh`'s `extractor-svc` case's push-subscription IAM chain (tokenCreator + run.invoker + DLQ grants + create/update subscription) was refactored into a shared `setup_push_subscription()` function — used by both `extractor-svc` and the new `resolver-svc` case, and ready for `committer-svc` in step 6 without a third copy-paste.
+  - **Real deploy-time finding:** IAM grant propagation is not instant — the very first live invocation attempt against the freshly deployed `resolver-svc` 403'd with `lacks {run.routes.invoke} permission` even though `gcloud ... get-iam-policy` already showed the correct bindings. Not a bug; waited ~2–3 minutes and the identical retry succeeded. Documented in `infrastructure.md` §2.1 so it isn't mistaken for a real bug again when deploying `committer-svc`/`dispatcher-svc`.
+  - Also fixed a real cross-package dependency-drift flake found while testing this step: `uv sync` run from inside a single service directory (e.g. to add a dev dep) drops every *other* workspace member and root-level dev tool from the shared `.venv` — it only installs that one package's own deps. `pytest-asyncio` and `httpx2` are now declared in the **root** `pyproject.toml`'s dev group (not just individual services'), and `asyncio_mode = "auto"` is set at the root level too (not just `extractor-svc`'s own config) — a root-level `uv sync` now always restores the full set regardless of which directory the last `uv sync`/`uv add` ran from.
+  - Deployed and verified for real against the live DB (not the emulator): inserted a real `RECEIVED` items row, published a real `ExtractedItemMessage` to `items-extracted`, confirmed the row flipped to `state='CONFIRMED'` with every extracted field written correctly, and the matching `ConfirmedItemMessage` arrived on `items.confirmed`.
