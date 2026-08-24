@@ -141,8 +141,27 @@ def _user_phone_and_timezone(conn, user_id) -> tuple[str, str]:
     return row[0], row[1]
 
 
-def _action_type(item_type: str) -> str | None:
-    return "calendar" if item_type == "obligation" else None
+def _initial_resolved_fields(extracted: ExtractedItemMessage) -> dict:
+    """Builds resolved_fields for a freshly-extracted item — every path
+    that creates a NEW conversations row from an ExtractedItemMessage
+    uses this (data-model.md §2.4/§2.7's scratchpad). due_at stages here
+    per the original design; step 15 adds action_type and, for an email
+    action, email_recipient/email_draft — none of these have an items
+    column either. action_type (and the email fields) are only staged
+    for an obligation — omitted entirely for a latent, so a later
+    `.get("action_type")` correctly reads back None, matching
+    ConfirmedItemMessage's "null for a latent" convention."""
+    fields: dict = {}
+    if extracted.due_at:
+        fields["due_at"] = extracted.due_at.isoformat()
+    if extracted.type == "obligation":
+        fields["action_type"] = extracted.action_type
+        if extracted.action_type == "email":
+            if extracted.email_recipient:
+                fields["email_recipient"] = extracted.email_recipient
+            if extracted.email_draft:
+                fields["email_draft"] = extracted.email_draft
+    return fields
 
 
 def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
@@ -181,19 +200,22 @@ def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
 
 
 def _finalize_awaiting_confirmation(
-    conn, item_id, item_type, title, summary, effort_minutes, due_at_iso, thread_attach_title
+    conn, item_id, item_type, title, summary, effort_minutes, resolved_fields, thread_attach_title
 ) -> str:
     conn.execute(
         "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
         (str(item_id),),
     )
+    due_at_iso = resolved_fields.get("due_at")
     return render_confirmation_card(
         item_type,
         title,
         summary,
         datetime.fromisoformat(due_at_iso) if due_at_iso else None,
         effort_minutes,
-        _action_type(item_type),
+        resolved_fields.get("action_type"),
+        email_recipient=resolved_fields.get("email_recipient"),
+        email_draft=resolved_fields.get("email_draft"),
         thread_attach_title=thread_attach_title,
     )
 
@@ -201,9 +223,7 @@ def _finalize_awaiting_confirmation(
 async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: DedupeResult) -> None:
     _write_item(extracted, "DUPLICATE_SUSPECTED")
 
-    resolved_fields: dict = {}
-    if extracted.due_at:
-        resolved_fields["due_at"] = extracted.due_at.isoformat()
+    resolved_fields = _initial_resolved_fields(extracted)
     resolved_fields["_dedupe_match_item_id"] = str(dedupe.duplicate_item_id)
     resolved_fields["_dedupe_match_title"] = dedupe.duplicate_title
     if dedupe.thread_attach_item_id:
@@ -246,9 +266,14 @@ async def _start_clarification(
         now_local=now_local,
         tz_name=tz_name,
         title=extracted.title,
+        missing_fields=extracted.missing_fields,
         latest_reply=None,
     )
-    resolved_fields = {"due_at": result.due_at} if result.due_at_filled and result.due_at else {}
+    resolved_fields = _initial_resolved_fields(extracted)
+    if result.due_at_filled and result.due_at:
+        resolved_fields["due_at"] = result.due_at
+    if result.email_recipient_filled and result.email_recipient:
+        resolved_fields["email_recipient"] = result.email_recipient
     if thread_attach:
         resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
         resolved_fields["_thread_attach_title"] = thread_attach[1]
@@ -286,7 +311,7 @@ async def _start_clarification(
             extracted.title,
             extracted.summary,
             extracted.effort_minutes,
-            result.due_at,
+            resolved_fields,
             thread_attach[1] if thread_attach else None,
         )
         conn.commit()
@@ -367,7 +392,7 @@ async def pubsub_push(request: Request):
         logger.exception("failed to write extracted fields item_id=%s", extracted.item_id)
         raise HTTPException(status_code=500, detail="db write failed") from None
 
-    resolved_fields = {"due_at": extracted.due_at.isoformat()} if extracted.due_at else {}
+    resolved_fields = _initial_resolved_fields(extracted)
     if thread_attach:
         resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
         resolved_fields["_thread_attach_title"] = thread_attach[1]
@@ -389,7 +414,9 @@ async def pubsub_push(request: Request):
         extracted.summary,
         extracted.due_at,
         extracted.effort_minutes,
-        _action_type(extracted.type),
+        resolved_fields.get("action_type"),
+        email_recipient=resolved_fields.get("email_recipient"),
+        email_draft=resolved_fields.get("email_draft"),
         thread_attach_title=thread_attach[1] if thread_attach else None,
     )
     try:
@@ -410,7 +437,7 @@ async def _handle_clarification_reply(
         "WHERE item_id = %s ORDER BY last_message_at DESC LIMIT 1",
         (str(item_id),),
     ).fetchone()
-    _pending_fields, resolved_fields, exchange_count = convo_row
+    pending_fields, resolved_fields, exchange_count = convo_row
     thread_attach_title = resolved_fields.get("_thread_attach_title")
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
@@ -419,10 +446,13 @@ async def _handle_clarification_reply(
         now_local=now_local,
         tz_name=tz_name,
         title=title,
+        missing_fields=pending_fields,
         latest_reply=latest_reply,
     )
     if result.due_at_filled and result.due_at:
         resolved_fields = {**resolved_fields, "due_at": result.due_at}
+    if result.email_recipient_filled and result.email_recipient:
+        resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
 
     if result.still_missing:
         if exchange_count < MAX_EXCHANGES:
@@ -459,7 +489,7 @@ async def _handle_clarification_reply(
 
     body = _finalize_awaiting_confirmation(
         conn, item_id, item_type, title, summary, effort_minutes,
-        resolved_fields.get("due_at"), thread_attach_title,
+        resolved_fields, thread_attach_title,
     )
     conn.execute(
         "UPDATE conversations SET resolved_fields = %s, pending_fields = %s, "
@@ -506,10 +536,12 @@ async def _handle_duplicate_reply(
             now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
             result = await clarify(
                 session_id=f"{item_id}-0", now_local=now_local, tz_name=tz_name,
-                title=title, latest_reply=None,
+                title=title, missing_fields=pending_fields, latest_reply=None,
             )
             if result.due_at_filled and result.due_at:
                 resolved_fields = {**resolved_fields, "due_at": result.due_at}
+            if result.email_recipient_filled and result.email_recipient:
+                resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
 
             if result.question:
                 conn.execute(
@@ -530,7 +562,7 @@ async def _handle_duplicate_reply(
 
             body = _finalize_awaiting_confirmation(
                 conn, item_id, item_type, title, summary, effort_minutes,
-                resolved_fields.get("due_at"), thread_attach_title,
+                resolved_fields, thread_attach_title,
             )
             conn.execute(
                 "UPDATE conversations SET pending_fields = %s, resolved_fields = %s, "
@@ -544,7 +576,7 @@ async def _handle_duplicate_reply(
 
         body = _finalize_awaiting_confirmation(
             conn, item_id, item_type, title, summary, effort_minutes,
-            resolved_fields.get("due_at"), thread_attach_title,
+            resolved_fields, thread_attach_title,
         )
         conn.commit()
         _send_sms(phone, body)
@@ -610,8 +642,9 @@ async def reply(payload: RoutedReplyMessage):
                     summary=summary,
                     due_at=resolved_fields.get("due_at"),
                     effort_minutes=effort_minutes,
-                    action_type=_action_type(item_type),
-                    email_draft=None,
+                    action_type=resolved_fields.get("action_type"),
+                    email_recipient=resolved_fields.get("email_recipient"),
+                    email_draft=resolved_fields.get("email_draft"),
                 )
                 publish("items-confirmed", confirmed)
                 conn.execute(

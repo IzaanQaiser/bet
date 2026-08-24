@@ -71,6 +71,34 @@ def test_valid_envelope_extracts_and_publishes(client):
     assert published.effort_minutes == 15  # cast from wire string "15"
 
 
+def test_email_action_fields_pass_through_to_published_message(client):
+    """Step 15 — action_type/email_recipient/email_draft flow from the
+    ExtractionResult straight onto the real ExtractedItemMessage, same as
+    every other extracted field."""
+    item_id, user_id = uuid4(), uuid4()
+    body = _push_envelope(_raw_message_json(item_id, user_id))
+    email_result = _extraction_result(
+        type="obligation",
+        title="Reply to Sarah",
+        summary="Confirm the delay.",
+        due_at=None,
+        missing_fields=[],
+        action_type="email",
+        email_recipient="sarah@example.com",
+        email_draft="Hi Sarah,\n\nJust confirming the delay.\n\nThanks",
+    )
+    with (
+        patch("extractor_svc.main._extract", new=AsyncMock(return_value=email_result)),
+        patch("extractor_svc.main.publish") as mock_publish,
+    ):
+        resp = client.post("/pubsub/push", json=body)
+    assert resp.status_code == 200
+    _topic, published = mock_publish.call_args[0]
+    assert published.action_type == "email"
+    assert published.email_recipient == "sarah@example.com"
+    assert published.email_draft == "Hi Sarah,\n\nJust confirming the delay.\n\nThanks"
+
+
 def test_malformed_envelope_returns_500_for_retry(client):
     with patch("extractor_svc.main.publish") as mock_publish:
         resp = client.post("/pubsub/push", json={"message": {"data": "not-valid-base64json"}})

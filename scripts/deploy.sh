@@ -66,6 +66,17 @@ setup_push_subscription() {
     --member="serviceAccount:${pubsub_agent}" --role="roles/pubsub.publisher" \
     --account=waslyrideshare@gmail.com
 
+  # ack-deadline=60: found via a real step-15 failure — the default 10s
+  # (never explicitly set before this) is too tight for a real Gemini
+  # call under load or cold start, especially the email-drafting
+  # extraction call (slower than a plain classify). Pub/Sub redelivers
+  # concurrently before the first attempt finishes, racing extractor-svc
+  # (or resolver-svc's clarification call) on ADK's session id and
+  # burning through real delivery attempts even when one eventually
+  # succeeds — the same failure class as step 11's original finding, now
+  # confirmed to sometimes exhaust all 5 attempts and reach dead_letters
+  # for real, not just "wasteful but harmless." 60s covers realistic
+  # Gemini/Calendar/Gmail latencies with real margin.
   echo "Creating/updating ${subscription}..."
   if gcloud pubsub subscriptions describe "$subscription" \
     --project="$PROJECT_ID" --account=waslyrideshare@gmail.com >/dev/null 2>&1; then
@@ -73,6 +84,7 @@ setup_push_subscription() {
       --project="$PROJECT_ID" \
       --push-endpoint="${service_url}/pubsub/push" \
       --push-auth-service-account="${SA}" \
+      --ack-deadline=60 \
       --account=waslyrideshare@gmail.com
   else
     gcloud pubsub subscriptions create "$subscription" \
@@ -82,6 +94,7 @@ setup_push_subscription() {
       --push-auth-service-account="${SA}" \
       --dead-letter-topic="$dlq_topic" \
       --max-delivery-attempts=5 \
+      --ack-deadline=60 \
       --account=waslyrideshare@gmail.com
   fi
 
@@ -116,11 +129,13 @@ setup_dlq_subscription() {
       --project="$PROJECT_ID" \
       --push-endpoint="${service_url}/pubsub/dlq?stage=${stage}" \
       --push-auth-service-account="${SA}" \
+      --ack-deadline=60 \
       --account=waslyrideshare@gmail.com
   else
     gcloud pubsub subscriptions create "$subscription" \
       --project="$PROJECT_ID" \
       --topic="$dlq_topic" \
+      --ack-deadline=60 \
       --push-endpoint="${service_url}/pubsub/dlq?stage=${stage}" \
       --push-auth-service-account="${SA}" \
       --account=waslyrideshare@gmail.com

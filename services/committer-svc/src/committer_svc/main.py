@@ -41,11 +41,24 @@ an obligation) — committer-svc "has no way to tell the two apart, and
 doesn't need to" per that doc, so the fix is to just always write
 confirmed.type here, a no-op for the pre-existing path and correct for
 the new one.
+
+Step 15 (ADR 0008, agent-contracts.md §2.1) adds the second write target
+this module's own docstring always described but never built: a real
+Gmail send, selected by action_type exactly like the calendar branch
+already was. No new OAuth bootstrap — gmail.send was already requested
+alongside calendar.events during step 6's bootstrap (state-machine.md
+§1.5), just unused by any code until now. _already_committed() already
+generalizes to this branch without changes: it checks whether an
+obligations row exists before attempting *either* external write, so
+"email_sent_at set exactly once" (test-plan.md step 15) needs no
+email-specific mechanism.
 """
 
+import base64
 import logging
 import os
 from datetime import timedelta
+from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
@@ -62,17 +75,23 @@ app = FastAPI()
 
 CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
 def _secret_client() -> secretmanager.SecretManagerServiceClient:
     return secretmanager.SecretManagerServiceClient()
 
 
-def _user_credentials(user_id) -> tuple[Credentials, str]:
+def _user_credentials(user_id, scope: str) -> tuple[Credentials, str]:
     """Returns (Credentials, timezone) for the given user, or raises if the
     user has no linked Google account — real error, no fallback (per PRD
     §15: never write to the calendar on inference alone, and there's
-    nothing to infer a missing OAuth grant with)."""
+    nothing to infer a missing OAuth grant with). `scope` picks which of
+    the two already-granted scopes (state-machine.md §1.5 — both were
+    requested together during step 6's bootstrap, gmail.send unused by
+    any code until step 15) this particular call needs; the refresh
+    token itself carries both regardless of which one is requested here."""
     with get_connection() as conn:
         row = conn.execute(
             "SELECT google_refresh_token_ref, timezone FROM users WHERE id = %s",
@@ -91,7 +110,7 @@ def _user_credentials(user_id) -> tuple[Credentials, str]:
         token_uri="https://oauth2.googleapis.com/token",
         client_id=os.environ["GOOGLE_OAUTH_CLIENT_ID"],
         client_secret=os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
-        scopes=[CALENDAR_SCOPE],
+        scopes=[scope],
     )
     return creds, timezone
 
@@ -121,29 +140,80 @@ def _write_calendar_event(
     return response.json()["id"]
 
 
+def _send_email(confirmed: ConfirmedItemMessage, creds: Credentials) -> None:
+    """state-machine.md §1.5 — a base64url-encoded RFC 2822 message via
+    Gmail's users.messages.send, same AuthorizedSession/refresh-token
+    pattern already used for Calendar, just a different requested scope
+    (agent-contracts.md §2.1's drafted body, sent as-is)."""
+    message = EmailMessage()
+    message["To"] = confirmed.email_recipient
+    message["Subject"] = confirmed.title
+    message.set_content(confirmed.email_draft)
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+    session = AuthorizedSession(creds)
+    response = session.post(GMAIL_SEND_URL, json={"raw": raw})
+    response.raise_for_status()
+
+
 def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
-    if confirmed.action_type != "calendar":
-        # action_type == "email" is the step 15 stretch (ADR 0008) — not
-        # built yet, and nothing in the pipeline sets it today. Fail loudly
-        # rather than silently treating it as a calendar write.
-        raise NotImplementedError(f"action_type={confirmed.action_type!r} not yet implemented")
+    if confirmed.action_type == "calendar":
+        creds, timezone = _user_credentials(confirmed.user_id, CALENDAR_SCOPE)
+        calendar_event_id = _write_calendar_event(confirmed, timezone, creds)
 
-    creds, timezone = _user_credentials(confirmed.user_id)
-    calendar_event_id = _write_calendar_event(confirmed, timezone, creds)
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO obligations (item_id, due_at, calendar_event_id, action_type)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    str(confirmed.item_id),
+                    confirmed.due_at,
+                    calendar_event_id,
+                    confirmed.action_type,
+                ),
+            )
+            conn.execute(
+                "UPDATE items SET type = %s, state = 'COMMITTED', updated_at = now() WHERE id = %s",
+                (confirmed.type, str(confirmed.item_id)),
+            )
+            conn.commit()
+        return
 
-    with get_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO obligations (item_id, due_at, calendar_event_id, action_type)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (str(confirmed.item_id), confirmed.due_at, calendar_event_id, confirmed.action_type),
-        )
-        conn.execute(
-            "UPDATE items SET type = %s, state = 'COMMITTED', updated_at = now() WHERE id = %s",
-            (confirmed.type, str(confirmed.item_id)),
-        )
-        conn.commit()
+    if confirmed.action_type == "email":
+        if not confirmed.email_recipient or not confirmed.email_draft:
+            # Should never happen — resolver-svc/dispatcher-svc only ever
+            # publish action_type="email" with both already resolved
+            # (agent-contracts.md §2.1/§3.2). Fail loudly rather than
+            # silently sending a blank or unaddressed email.
+            raise RuntimeError(
+                f"action_type=email missing email_recipient/email_draft item_id={confirmed.item_id}"
+            )
+        creds, _timezone = _user_credentials(confirmed.user_id, GMAIL_SCOPE)
+        _send_email(confirmed, creds)
+
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO obligations (item_id, due_at, action_type, email_draft, email_sent_at)
+                VALUES (%s, %s, %s, %s, now())
+                """,
+                (
+                    str(confirmed.item_id),
+                    confirmed.due_at,
+                    confirmed.action_type,
+                    confirmed.email_draft,
+                ),
+            )
+            conn.execute(
+                "UPDATE items SET type = %s, state = 'COMMITTED', updated_at = now() WHERE id = %s",
+                (confirmed.type, str(confirmed.item_id)),
+            )
+            conn.commit()
+        return
+
+    raise NotImplementedError(f"action_type={confirmed.action_type!r} not supported")
 
 
 def _commit_latent(confirmed: ConfirmedItemMessage) -> None:

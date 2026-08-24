@@ -16,12 +16,25 @@ def render_confirmation_card(
     due_at: datetime | None,
     effort_minutes: int,
     action_type: str | None,
+    email_recipient: str | None = None,
+    email_draft: str | None = None,
     thread_attach_title: str | None = None,
 ) -> str:
+    # Email is a third variant, not a decoration on the obligation one
+    # (agent-contracts.md §3.3, step 15) — checked first since due_at can
+    # legitimately be None here (§2.1), which the obligation branch below
+    # can't handle (format_due_at requires a real datetime). Never gets
+    # the thread-attach suffix: an email obligation was never a latent,
+    # so it never has a thread-attach candidate to offer.
+    if action_type == "email":
+        return (
+            f"✉️ Email to {email_recipient}:\n\n"
+            f"{email_draft}\n\n"
+            f"Reply Y to send, N to cancel, or send a correction."
+        )
     if item_type == "obligation":
-        icon = "✉️" if action_type == "email" else "📅"
         body = (
-            f"{icon} {title}\n"
+            f"📅 {title}\n"
             f"{format_due_at(due_at)} · {effort_minutes} min\n"
             f"Reply Y to confirm, N to cancel, or send a correction."
         )
