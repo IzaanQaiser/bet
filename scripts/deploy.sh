@@ -94,13 +94,23 @@ setup_push_subscription() {
 case "$SERVICE" in
   ingest-svc)
     echo "Deploying ${SERVICE}..."
+    # RESOLVER_SVC_URL needs resolver-svc already deployed (step 5+) —
+    # used for the step 9 inbound-reply routing forward call
+    # (state-machine.md §4). The run.invoker grant that lets sa-ingest
+    # actually call it lives in resolver-svc's own case below, matching
+    # the "this resource's case fully describes its own finished IAM
+    # state" pattern setup_push_subscription already uses.
+    RESOLVER_SVC_URL=$(gcloud run services describe resolver-svc \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID}" \
+      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL}" \
       --set-secrets="TWILIO_AUTH_TOKEN=twilio-auth-token:latest" \
       --min-instances=0 \
       --allow-unauthenticated \
@@ -128,7 +138,11 @@ case "$SERVICE" in
     echo "Deploying ${SERVICE}..."
     # No --allow-unauthenticated, same invoker story as extractor-svc.
     # Unlike extractor-svc, sa-resolver does have a Cloud SQL binding
-    # (infrastructure.md §2.1 — the stub writes items directly).
+    # (infrastructure.md §2.1). Step 9 adds real Twilio sends (the
+    # confirmation card + "Cancelled." — twilio-api-key-secret, same
+    # credential dispatcher-svc uses) and a second invoker: sa-ingest,
+    # for the synchronous inbound-reply forward (state-machine.md §4),
+    # already anticipated in infrastructure.md §2.1's IAM matrix.
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
@@ -136,8 +150,16 @@ case "$SERVICE" in
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
       --set-env-vars="DB_USER=sa-resolver@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID}" \
+      --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
       --min-instances=0 \
       --no-allow-unauthenticated \
+      --account=waslyrideshare@gmail.com
+
+    echo "Granting sa-ingest run.invoker on ${SERVICE} (for routed replies)..."
+    gcloud run services add-iam-policy-binding "$SERVICE" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --member="serviceAccount:sa-ingest@${PROJECT_ID}.iam.gserviceaccount.com" \
+      --role="roles/run.invoker" \
       --account=waslyrideshare@gmail.com
 
     setup_push_subscription "items-extracted-resolver-push" "items-extracted" "items-extracted-dlq"

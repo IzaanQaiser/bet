@@ -1,5 +1,6 @@
 """Unit tests — DB and Pub/Sub mocked out, per docs/engineering/test-plan.md
-step 3. Signature validation and payload parsing only."""
+step 3 (signature validation, payload parsing) and step 9 (inbound-reply
+routing, state-machine.md §4)."""
 
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -29,9 +30,23 @@ def _signed_headers(form: dict[str, str]) -> dict[str, str]:
     return {"X-Twilio-Signature": validator.compute_signature(WEBHOOK_URL, form)}
 
 
-def _mock_connection(user_id):
+def _mock_connection(user_id, open_item_id=None):
+    """Differentiates by query text — the webhook now runs two SELECTs
+    against the same connection (user lookup, then open-conversation
+    check), not one."""
+
+    def execute_side_effect(sql, params=None):
+        result = MagicMock()
+        if "FROM users" in sql:
+            result.fetchone.return_value = (user_id,)
+        elif "FROM conversations" in sql:
+            result.fetchone.return_value = (open_item_id,) if open_item_id else None
+        else:
+            result.fetchone.return_value = None
+        return result
+
     conn = MagicMock()
-    conn.execute.return_value.fetchone.return_value = (user_id,)
+    conn.execute.side_effect = execute_side_effect
     conn.__enter__ = MagicMock(return_value=conn)
     conn.__exit__ = MagicMock(return_value=False)
     return conn
@@ -89,3 +104,37 @@ def test_parses_text_only_payload(client):
     assert published_message.text == "pay rent by friday"
     assert published_message.media_uri is None
     assert published_message.mime_type is None
+
+
+def test_no_open_conversation_creates_new_item(client):
+    user_id = uuid4()
+    form = {"From": "+15551234567", "Body": "pay rent by friday"}
+    with (
+        patch("ingest_svc.main.get_connection", return_value=_mock_connection(user_id)),
+        patch("ingest_svc.main.publish") as mock_publish,
+        patch("ingest_svc.main._forward_to_resolver") as mock_forward,
+    ):
+        resp = client.post("/webhook/sms", data=form, headers=_signed_headers(form))
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "received"
+    mock_publish.assert_called_once()
+    mock_forward.assert_not_called()
+
+
+def test_open_conversation_routes_to_resolver_not_new_item(client):
+    user_id = uuid4()
+    open_item_id = uuid4()
+    form = {"From": "+15551234567", "Body": "yes"}
+    with (
+        patch(
+            "ingest_svc.main.get_connection",
+            return_value=_mock_connection(user_id, open_item_id=open_item_id),
+        ),
+        patch("ingest_svc.main.publish") as mock_publish,
+        patch("ingest_svc.main._forward_to_resolver") as mock_forward,
+    ):
+        resp = client.post("/webhook/sms", data=form, headers=_signed_headers(form))
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "routed_to_resolver", "item_id": str(open_item_id)}
+    mock_publish.assert_not_called()
+    mock_forward.assert_called_once_with(user_id, open_item_id, "yes")

@@ -188,21 +188,29 @@ Deliberately NOT built here: parsing a `Y`/`N`/`Later` reply to a sent suggestio
 
 ## Step 9 — Real `resolver-svc` — confirmation
 
+This step's scope turned out to include a hard prerequisite not named in its one-line build-order description: the inbound-SMS routing check (state-machine.md §4) in `ingest-svc`, since there's no way to do a real SMS confirm/cancel round trip — this step's own required manual verification — without it. Built here, not deferred: `ingest-svc` now checks for an open conversation (an item in `CLARIFYING`/`AWAITING_CONFIRMATION`) before treating an inbound message as new, and forwards to `resolver-svc`'s new `POST /reply` via a synchronous, authenticated (ID-token) service-to-service call. The second branch of that routing table — forwarding a suggestion reply to `dispatcher-svc` — is still not built; `dispatcher-svc` has no accept-path endpoint until the feedback-loop step, so nothing exists yet for that branch to call.
+
+Also gates on confidence, not just `missing_fields`: `EXTRACTED --> CLARIFYING: resolver, missing_fields or confidence < 0.75` (state-machine.md §1.2) — a complete-but-low-confidence item is left in `EXTRACTED` exactly like an incomplete one (step 10 still owns clarification for both).
+
 **Acceptance criteria**
 - Complete/confident extraction → correct confirmation card variant (obligation vs. latent, `agent-contracts.md` §3.3) instead of auto-confirming.
 - `AFFIRMATIVE`-set reply → `items.confirmed` published. `NEGATIVE`-set reply → `CANCELLED`, terminal message sent, no publish.
 - A reply outside `Y`/`N` doesn't crash and is logged distinctly (full correction-handling completeness is step 10's job, since it reuses the clarification call).
 - `classify_reply` (shared) is unit-tested once and reused identically here and by `dispatcher-svc` — no duplicated logic.
+- An inbound SMS with an open conversation is forwarded to `resolver-svc`, not treated as a new item (`ingest-svc`).
 
 **Unit tests**
 - `shared/tests/test_classify_reply.py` — every string in each set maps correctly, case-insensitive/whitespace-trimmed; arbitrary strings map to `"OTHER"`.
-- `services/resolver-svc/tests/test_confirmation_card.py` — obligation variant includes date/duration; latent variant has no date line; thread-attach suffix appears only when applicable.
+- `services/resolver-svc/tests/test_confirmation_card.py` — obligation variant includes date/duration; latent variant has no date line. (Thread-attach suffix not tested — needs the embedding search dedupe isn't built until step 12.)
+- `services/resolver-svc/tests/test_resolver.py` — `/pubsub/push`'s complete+confident/incomplete/low-confidence branches, and `/reply`'s `Y`/`N`/`OTHER`/unknown-item branches, DB and Twilio mocked.
+- `services/ingest-svc/tests/test_webhook.py` — `test_no_open_conversation_creates_new_item` / `test_open_conversation_routes_to_resolver_not_new_item`.
 
-**Integration tests** (Pub/Sub emulator + local Postgres)
+**Integration tests** (`services/resolver-svc/tests/test_resolver_integration.py`, real dev Postgres + real Pub/Sub emulator; Twilio mocked)
+- `test_extracted_to_awaiting_confirmation`.
 - `test_y_reply_publishes_confirmed`.
 - `test_n_reply_cancels_no_publish`.
 
-**Manual verification:** one real SMS confirm/cancel round trip.
+**Manual verification:** one real SMS confirm/cancel round trip. Done via a signed webhook request straight to the deployed `ingest-svc` (same signature scheme a real inbound SMS carries, so it exercises the identical code path) rather than physically texting from a phone — the full real chain (routing → forward → resolver → publish → committer → real Calendar write) was verified for both `Y` and `N`, see `docs/product/status.md`.
 
 ---
 
