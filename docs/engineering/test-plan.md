@@ -216,19 +216,24 @@ Also gates on confidence, not just `missing_fields`: `EXTRACTED --> CLARIFYING: 
 
 ## Step 10 — Real `resolver-svc` — clarification loop
 
+`agent-contracts.md` §3.2's generic `filled_fields: dict[str, Any]` design doesn't work on Vertex AI's structured output (verified empirically — see its "Resolved gap" note); the real implementation uses a concrete `due_at`-only schema instead, since `due_at` is the only field the extractor's contract ever adds to `missing_fields`. "Multiple missing fields batch into one question" is consequently not a live scenario today — noted as a design narrowing, not a missed test.
+
+Still not built, despite step 9's comment: a correction reply during `AWAITING_CONFIRMATION` (agent-contracts.md §3.2's "cheap heuristic" for field-targeting) — it doesn't reuse this step's due_at-only clarification model cleanly and needs its own pass. Deferred again, explicitly (`resolver_svc/main.py`'s module docstring).
+
 **Acceptance criteria**
 - `exchange_count` increments only on outbound questions, never inbound replies (`state-machine.md` §1.2).
 - After the 3rd unresolved exchange → `NEEDS_REVIEW`, correct terminal message, no 4th question sent.
 - `conversations` row created unconditionally at `EXTRACTED` consumption — verified even for an item that never enters `CLARIFYING` (the zero-clarification path still gets a row, for `due_at` staging).
 - Resolved `due_at` lands in `conversations.resolved_fields`, never attempted against an `items` column.
-- Multiple missing fields batch into exactly one question, never one message per field.
 
-**Unit tests** (`services/resolver-svc/tests/test_clarification.py`)
-- `test_exchange_counting_table` — table-driven over `(reply, missing_fields_before) → (exchange_count_after, state_after)`, matching the `state-machine.md` §1 diagram exactly for the 0/1/2/3-exchange cases.
-- `test_filled_fields_routing` — mocked `ClarificationResponse`, assert `title`/`summary`/`effort_minutes`/`focus_depth` go to `items`, `due_at` goes to `conversations.resolved_fields`.
-- `test_needs_review_sends_no_fourth_question`.
+**Unit tests** (`services/resolver-svc/tests/test_clarification.py`, Gemini mocked via a stateful fake DB connection tracking one item across a real multi-call sequence — a plain `MagicMock` can't track state between calls)
+- `test_exchange_counting_table` — a full 3-exchange exhaustion sequence, asserting `exchange_count` and `items.state` after every single step, matching `state-machine.md` §1.2 exactly: increments only on sent questions, never on the reply that finally exhausts the budget.
+- `test_single_exchange_resolves_to_awaiting_confirmation`.
+- `test_due_at_lands_only_in_conversations_never_an_items_column` — asserts directly against every `UPDATE items` call's SQL text across the whole exchange, not just final state.
 
-**Integration tests** (Pub/Sub emulator + local Postgres)
+Also extended (`test_resolver.py`): `test_missing_fields_starts_clarification_not_left_stalled` — step 10 replaces step 9's "left in `EXTRACTED`, do nothing" for incomplete items.
+
+**Integration tests** (`test_resolver_integration.py`, real dev Postgres + real Pub/Sub emulator; Gemini mocked)
 - `test_conversations_row_created_on_zero_clarification_path`.
 - `test_three_exchange_exhaustion_reaches_needs_review`.
 - `test_single_exchange_resolves_to_awaiting_confirmation`.

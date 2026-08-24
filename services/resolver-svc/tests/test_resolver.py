@@ -1,5 +1,8 @@
-"""docs/engineering/test-plan.md step 9 — DB and Twilio mocked, per
-endpoint. Templates are covered in test_confirmation_card.py."""
+"""docs/engineering/test-plan.md step 9 (confirmation) + step 10
+(clarification) — DB and Twilio mocked, per endpoint. Templates are
+covered in test_confirmation_card.py; the multi-turn clarification
+sequence itself (exchange counting, NEEDS_REVIEW) is covered in
+test_clarification.py."""
 
 import base64
 from datetime import datetime
@@ -23,11 +26,13 @@ def client(monkeypatch):
     return TestClient(app)
 
 
-def _mock_connection(*, phone="+15551234567", item_row=None, conversation_row=None):
+def _mock_connection(
+    *, phone="+15551234567", tz="America/Los_Angeles", item_row=None, conversation_row=None
+):
     def execute_side_effect(sql, params=None):
         result = MagicMock()
         if "FROM users" in sql:
-            result.fetchone.return_value = (phone,)
+            result.fetchone.return_value = (phone, tz)
         elif "FROM items" in sql:
             result.fetchone.return_value = item_row
         elif "FROM conversations" in sql:
@@ -66,10 +71,10 @@ def _extracted_message(**overrides):
     return ExtractedItemMessage(**defaults)
 
 
-# --- /pubsub/push ------------------------------------------------------
+# --- /pubsub/push, complete-extraction path -----------------------------
 
 
-def test_complete_confident_item_awaits_confirmation(client):
+def test_complete_item_awaits_confirmation(client):
     extracted = _extracted_message()
     conn = _mock_connection()
     with (
@@ -93,33 +98,44 @@ def test_complete_confident_item_awaits_confirmation(client):
     assert "Pay rent" in mock_sms.call_args.args[1]
 
 
-def test_incomplete_item_left_in_extracted(client):
-    extracted = _extracted_message(missing_fields=["due_at"])
+def test_low_confidence_complete_item_still_awaits_confirmation(client):
+    """state-machine.md §1.2's "Resolved gap": low confidence alone (no
+    missing fields) isn't a field-completeness problem — the confirmation
+    card's own "or send a correction" is the safety net for it, not a
+    manufactured clarifying question about nothing."""
+    extracted = _extracted_message(confidence=0.4)
     conn = _mock_connection()
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main._send_sms") as mock_sms,
     ):
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+    assert resp.json()["status"] == "awaiting_confirmation"
+    mock_sms.assert_called_once()
+
+
+def test_missing_fields_starts_clarification_not_left_stalled(client):
+    """Step 10 replaces step 9's "left in EXTRACTED, do nothing" — an
+    incomplete item now gets a real clarifying question."""
+    extracted = _extracted_message(missing_fields=["due_at"], due_at=None)
+    conn = _mock_connection()
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.clarify") as mock_clarify,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+    ):
+        from resolver_svc.clarification import ClarificationResult
+
+        mock_clarify.return_value = ClarificationResult(
+            due_at_filled=False, due_at=None, still_missing=["due_at"], question="When's it due?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "left_in_extracted"
+    assert resp.json() == {"status": "clarifying", "item_id": str(extracted.item_id)}
+    mock_sms.assert_called_once_with("+15551234567", "When's it due?")
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
-    assert update_calls[0].args[1][-2] == "EXTRACTED"
-    mock_sms.assert_not_called()
-
-
-def test_low_confidence_item_left_in_extracted_despite_no_missing_fields(client):
-    extracted = _extracted_message(missing_fields=[], confidence=0.5)
-    conn = _mock_connection()
-    with (
-        patch("resolver_svc.main.get_connection", return_value=conn),
-        patch("resolver_svc.main._send_sms") as mock_sms,
-    ):
-        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
-
-    assert resp.json()["status"] == "left_in_extracted"
-    mock_sms.assert_not_called()
+    assert update_calls[0].args[1][-2] == "CLARIFYING"
 
 
 def test_malformed_envelope_returns_500_for_retry(client):
@@ -138,13 +154,13 @@ def test_sms_send_failure_returns_500(client):
     assert resp.status_code == 500
 
 
-# --- /reply --------------------------------------------------------------
+# --- /reply, AWAITING_CONFIRMATION path ----------------------------------
 
 
 def test_y_reply_publishes_confirmed_and_marks_confirmed(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15),
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION"),
         conversation_row=({"due_at": "2026-09-04T14:00:00"},),
     )
     with (
@@ -169,7 +185,9 @@ def test_y_reply_publishes_confirmed_and_marks_confirmed(client):
 
 def test_n_reply_cancels_no_publish(client):
     item_id, user_id = str(uuid4()), str(uuid4())
-    conn = _mock_connection(item_row=("latent", "Learn pottery", "Someday.", 120))
+    conn = _mock_connection(
+        item_row=("latent", "Learn pottery", "Someday.", 120, "AWAITING_CONFIRMATION")
+    )
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.publish") as mock_publish,
@@ -186,9 +204,11 @@ def test_n_reply_cancels_no_publish(client):
     assert "CANCELLED" in update_calls[0].args[0]
 
 
-def test_other_reply_logged_not_acted_on(client):
+def test_other_reply_during_confirmation_logged_not_acted_on(client):
     item_id, user_id = str(uuid4()), str(uuid4())
-    conn = _mock_connection(item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15))
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION")
+    )
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
         patch("resolver_svc.main.publish") as mock_publish,
@@ -212,6 +232,17 @@ def test_reply_unknown_item_returns_404(client):
     with patch("resolver_svc.main.get_connection", return_value=conn):
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "y"})
     assert resp.status_code == 404
+
+
+def test_reply_unexpected_state_does_not_crash(client):
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "COMMITTED")
+    )
+    with patch("resolver_svc.main.get_connection", return_value=conn):
+        resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "y"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "unexpected_state"
 
 
 def test_health(client):

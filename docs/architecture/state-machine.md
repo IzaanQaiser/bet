@@ -79,6 +79,8 @@ Runs once, immediately, before the completeness check — per PRD §5.2 ordering
 - `missing_fields` non-empty **or** `confidence < 0.75` → `CLARIFYING`.
 - Otherwise → `AWAITING_CONFIRMATION` directly.
 
+**Resolved gap, found in step 10 building this for real:** in practice this collapses to `missing_fields` non-empty, full stop — see `agent-contracts.md` §3.2's "Resolved gap" note on why a confidence-only trigger (empty `missing_fields`, `confidence < 0.75`) goes straight to `AWAITING_CONFIRMATION` instead of `CLARIFYING`, since there'd be nothing for a clarifying question to ask about.
+
 **Exchange counting**, precisely (PRD §5.2 says "max 3 exchanges" without defining the unit — defined here):
 - One exchange = one outbound clarification question from `resolver-svc`. `conversations.exchange_count` increments **when the question is sent**, not when the reply arrives.
 - On each inbound reply, `resolver-svc` merges the answer into the item's fields and re-checks `missing_fields`.

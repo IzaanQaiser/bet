@@ -37,3 +37,10 @@ def render_confirmation_card(
 
 def render_cancelled() -> str:
     return "Cancelled."
+
+
+def render_needs_review(title: str) -> str:
+    return (
+        f"I couldn't get all the details for \"{title}\" — I've saved what I have. "
+        f"Send it again with more detail if you'd like me to try again."
+    )

@@ -1,7 +1,9 @@
 """Integration tests against the real dev Postgres (via the Cloud SQL Auth
 Proxy) + the real Pub/Sub emulator (for the Y-reply publish only) —
-docs/engineering/test-plan.md step 9. Twilio is mocked (a real SMS
-confirm/cancel round trip is the required manual verification, per the
+docs/engineering/test-plan.md steps 9 (confirmation) and 10
+(clarification). Twilio and the clarification Gemini call are both
+mocked (a real SMS confirm/cancel round trip and a real multi-turn
+clarification exchange are the required manual verifications, per the
 test plan).
 
 Requires PUBSUB_EMULATOR_HOST, GCP_PROJECT_ID, DB_USER, DB_HOST, DB_PORT.
@@ -17,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.schemas import ExtractedItemMessage
+from resolver_svc.clarification import ClarificationResult
 
 pytestmark = pytest.mark.skipif(
     "PUBSUB_EMULATOR_HOST" not in os.environ or "DB_USER" not in os.environ,
@@ -58,7 +61,7 @@ def _push_envelope(message) -> dict:
     return {"message": {"data": base64.b64encode(message.model_dump_json().encode()).decode()}}
 
 
-def test_extracted_to_awaiting_confirmation(client, test_user):
+def test_conversations_row_created_on_zero_clarification_path(client, test_user):
     user_id, _phone = test_user
     with get_connection() as conn:
         row = conn.execute(
@@ -168,3 +171,102 @@ def test_n_reply_cancels_no_publish(client, awaiting_confirmation_item):
     with get_connection() as conn:
         state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
     assert state == "CANCELLED"
+
+
+@pytest.fixture
+def received_item(test_user):
+    user_id, phone = test_user
+    with get_connection() as conn:
+        row = conn.execute(
+            "INSERT INTO items (user_id, raw_channel, ingested_at, state) "
+            "VALUES (%s, 'sms', now(), 'RECEIVED') RETURNING id",
+            (str(user_id),),
+        ).fetchone()
+        item_id = row[0]
+        conn.commit()
+    return item_id, user_id, phone
+
+
+def _extracted_missing_due_at(item_id, user_id):
+    return ExtractedItemMessage(
+        item_id=item_id,
+        user_id=user_id,
+        type="obligation",
+        title="Pay rent",
+        summary="Pay rent, deadline unclear.",
+        due_at=None,
+        effort_minutes=15,
+        focus_depth="shallow",
+        confidence=0.95,
+        missing_fields=["due_at"],
+        reasoning="Deadline missing.",
+    )
+
+
+def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item):
+    item_id, user_id, phone = received_item
+    extracted = _extracted_missing_due_at(item_id, user_id)
+
+    with (
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.clarify") as mock_clarify,
+    ):
+        mock_clarify.return_value = ClarificationResult(
+            due_at_filled=False, due_at=None, still_missing=["due_at"], question="When's it due?"
+        )
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+        assert resp.json()["status"] == "clarifying"
+
+        mock_clarify.return_value = ClarificationResult(
+            due_at_filled=True, due_at="2026-08-28T14:00:00", still_missing=[]
+        )
+        resp = client.post(
+            "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "friday"}
+        )
+
+    assert resp.json()["status"] == "awaiting_confirmation"
+    assert mock_sms.call_count == 2  # one question, one confirmation card
+
+    with get_connection() as conn:
+        state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
+        resolved_fields, exchange_count = conn.execute(
+            "SELECT resolved_fields, exchange_count FROM conversations WHERE item_id = %s",
+            (str(item_id),),
+        ).fetchone()
+    assert state == "AWAITING_CONFIRMATION"
+    assert resolved_fields == {"due_at": "2026-08-28T14:00:00"}
+    assert exchange_count == 1  # the resolving reply itself never increments it
+
+
+def test_three_exchange_exhaustion_reaches_needs_review(client, received_item):
+    item_id, user_id, phone = received_item
+    extracted = _extracted_missing_due_at(item_id, user_id)
+    still_ambiguous = ClarificationResult(
+        due_at_filled=False,
+        due_at=None,
+        still_missing=["due_at"],
+        question="Still not sure — when?",
+    )
+
+    with (
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.clarify", return_value=still_ambiguous),
+    ):
+        client.post("/pubsub/push", json=_push_envelope(extracted))  # exchange 1
+        for reply_text in ["soon", "idk", "no idea"]:  # exchanges 2, 3, then exhaustion
+            resp = client.post(
+                "/reply",
+                json={"user_id": str(user_id), "item_id": str(item_id), "text": reply_text},
+            )
+
+    assert resp.json()["status"] == "needs_review"
+    assert mock_sms.call_count == 4  # 3 questions + 1 terminal message, not a 4th question
+    assert "couldn't get all the details" in mock_sms.call_args.args[1]
+
+    with get_connection() as conn:
+        state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
+        exchange_count = conn.execute(
+            "SELECT exchange_count FROM conversations WHERE item_id = %s", (str(item_id),)
+        ).fetchone()[0]
+    assert state == "NEEDS_REVIEW"
+    assert exchange_count == 3  # capped, never incremented past the 3rd sent question
