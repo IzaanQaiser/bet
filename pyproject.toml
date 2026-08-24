@@ -28,6 +28,7 @@ dev = [
     "extractor-svc",
     "resolver-svc",
     "committer-svc",
+    "dispatcher-svc",
 ]
 
 [tool.uv.sources]
@@ -36,6 +37,7 @@ ingest-svc = { workspace = true }
 extractor-svc = { workspace = true }
 resolver-svc = { workspace = true }
 committer-svc = { workspace = true }
+dispatcher-svc = { workspace = true }
 
 [tool.ruff]
 line-length = 100

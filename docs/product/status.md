@@ -14,7 +14,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**Steps 1-6 done. Next: Step 7 — Capacity engine, pure functions.**
+**Steps 1-7 done. Next: Step 8 — `dispatcher-svc`.**
 
 | Step | Status |
 |---|---|
@@ -27,7 +27,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 | 5. `resolver-svc` stub (temporary, auto-confirm) | **Done** — deployed to Cloud Run, real end-to-end verified against the live DB: an `ExtractedItemMessage` with empty `missing_fields` produced a `CONFIRMED` `items` row (all extracted fields correctly written) and a matching `ConfirmedItemMessage` on `items.confirmed` with `action_type="calendar"`. |
 | 6. `committer-svc` | **Done** — deployed to Cloud Run, real end-to-end verified against the live Calendar API: a `ConfirmedItemMessage` produced a real Google Calendar event (read back via the API to confirm — title, `start`/`end` correct, `status="confirmed"`), a matching `obligations` row with the real `calendar_event_id`, and `items.state='COMMITTED'`. Required a one-time manual GCP Console OAuth bootstrap — see Notes. |
 | **Phase C — The differentiator** | |
-| 7. Capacity engine, pure functions | Not started |
+| 7. Capacity engine, pure functions | **Done** — `services/dispatcher-svc/src/dispatcher_svc/capacity_engine.py`, 25 tests, all passing, no I/O. Worked example reproduced exactly (`fit_score=0.875`, `revival_score≈0.633`), contrast example reproduces `fit_score=0`. |
 | 8. `dispatcher-svc` | Not started |
 | **Phase D — Trust and quality features** | |
 | 9. Real `resolver-svc` — confirmation | Not started |
@@ -100,3 +100,4 @@ None.
   - `scripts/bootstrap_oauth_token.py` (new, one-time local script — needs `google-auth-oauthlib`, not a project dependency, run via `uv run --with`) ran the consent flow, minted a refresh token, created `user-refresh-token-{user_id}`, and updated the demo user's row. **Real bug in the script itself, fixed in-session:** `InstalledAppFlow.run_local_server()`'s printed auth URL and the `webbrowser.open()` call were both silently swallowed by Python's default stdout block-buffering when run non-interactively — looked like the script hung with no browser opening. Fixed by running with `python -u`/`PYTHONUNBUFFERED=1`; the auth URL was then visible and could be opened manually.
   - **Resolved gap, documented in `agent-contracts.md` §1:** neither the PRD nor any doc specified how long the written Calendar event actually runs for. Decided: `due_at` to `due_at + effort_minutes` — the block represents the time set aside to do the task, consistent with the capacity engine treating obligations as real occupied time. Also decided: a naive (no-UTC-offset) `due_at` from Gemini is treated as already being in the user's `users.timezone`, not UTC.
   - Deployed and verified for real: same IAM-propagation-delay finding as step 5 hit again (first delivery attempt 403'd, a republish after the grants settled succeeded) — reconfirms `infrastructure.md` §2.1's note rather than being a new issue. The real, live-published `ConfirmedItemMessage` produced an actual Google Calendar event, **read back via the Calendar API** (not just "no error" — `summary`, `start`/`end` spanning exactly `due_at` to `due_at+15min` in `America/Toronto`, `status="confirmed"`), a matching `obligations` row with the real `calendar_event_id`, and `items.state='COMMITTED'`. Test event and DB rows cleaned up afterward.
+- **Step 7 (capacity engine) — the cleanest step so far, no real findings, matched the doc exactly.** `services/dispatcher-svc/` scaffolded early (just `capacity_engine.py` + tests, no `main.py`/`Dockerfile`/FastAPI dep yet) — same pattern used for `extractor-svc`/`resolver-svc` ahead of their own build steps. Module lives in `dispatcher_svc`, not `shared`, since dispatcher-svc is its only caller. 25 tests, zero I/O, every formula transcribed directly from `capacity-engine.md`; the worked example (§6) reproduces `fit_score=0.875` and `revival_score≈0.633` to 3 decimal places by hand-verifying the arithmetic before writing any test, and the contrast example correctly reproduces `fit_score=0`. No deploy, nothing to verify manually — `capacity-engine.md` §0 called this "explicitly I/O-free" and it held.

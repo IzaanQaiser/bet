@@ -9,6 +9,7 @@ resolution-markers = [
 [manifest]
 members = [
     "committer-svc",
+    "dispatcher-svc",
     "extractor-svc",
     "ingest-svc",
     "obligation-engine",
@@ -542,6 +543,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d2/1a/efcfb02f91407149a0dacffffab791f7e19bf6385f63b3666dc8b5e5c9c8/cryptography-50.0.0-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:65c2c3add92b45fd0709db8594536aea39c2a67af0e27ffcf049c498501140b7", size = 5037050, upload-time = "2026-07-31T14:24:47.697Z" },
     { url = "https://files.pythonhosted.org/packages/57/30/4a22984d4f1bdfb8c054f07a92bc176b97a3134cc1d6c4b3bffb1f3688b4/cryptography-50.0.0-cp39-abi3-win_amd64.whl", hash = "sha256:d24fead1d4d076e1bfb006dcec392074a3cd8d7b4fc8a595aa64073b2b7a96ba", size = 3874135, upload-time = "2026-07-31T14:24:50.085Z" },
 ]
+
+[[package]]
+name = "dispatcher-svc"
+version = "0.1.0"
+source = { editable = "services/dispatcher-svc" }
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.3" }]
 
 [[package]]
 name = "distro"
@@ -1231,6 +1247,7 @@ source = { virtual = "." }
 [package.dev-dependencies]
 dev = [
     { name = "committer-svc" },
+    { name = "dispatcher-svc" },
     { name = "extractor-svc" },
     { name = "httpx2" },
     { name = "ingest-svc" },
@@ -1246,6 +1263,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "committer-svc", editable = "services/committer-svc" },
+    { name = "dispatcher-svc", editable = "services/dispatcher-svc" },
     { name = "extractor-svc", editable = "services/extractor-svc" },
     { name = "httpx2" },
     { name = "ingest-svc", editable = "services/ingest-svc" },

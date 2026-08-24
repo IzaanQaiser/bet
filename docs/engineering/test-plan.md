@@ -133,19 +133,22 @@ The cleanest step to test — no I/O, and `capacity-engine.md` §6 already hands
 - The worked example (§6) reproduces exactly: `fit_score = 0.875`, `revival_score ≈ 0.633` (assert to 3 decimal places).
 - The contrast example (§6, insufficient block) reproduces `fit_score = 0`.
 
-**Unit tests** (`services/dispatcher-svc/tests/test_capacity_engine.py` or `shared/tests/` if the module lives there)
+**Unit tests** (`services/dispatcher-svc/tests/test_capacity_engine.py` — the module lives in `services/dispatcher-svc/src/dispatcher_svc/capacity_engine.py`, not `shared/`, since dispatcher-svc is its only caller; `dispatcher-svc` scaffolded early with just this pure module, same pattern as `extractor-svc`/`resolver-svc` before their own build steps)
 - `test_free_intervals_merges_back_to_back_events`
 - `test_free_intervals_all_day_event_blocks_whole_day`
+- `test_free_intervals_excludes_declined_and_transparent`
 - `test_block_fit_deep_requires_125_percent_margin`
 - `test_block_fit_shallow_no_margin_required`
 - `test_depth_fit_deep_flat_below_threshold` / `test_depth_fit_deep_falls_off_above_threshold` (floor 0.3)
 - `test_depth_fit_shallow_rewards_fragmentation` (cap 1.2)
-- `test_load_fit_at_mean_is_half` (`load_delta=0` → `0.5`)
-- `test_load_fit_40_percent_below_is_one` (`load_delta=-0.4` → `1.0`)
-- `test_load_fit_clips_at_bounds`
+- `test_load_fit_at_mean_is_half` (`load_delta=0` → `0.5`) / `test_load_fit_40_percent_below_is_one` (`load_delta=-0.4` → `1.0`)
+- `test_load_fit_clips_at_bounds` / `test_load_fit_cold_start_is_neutral` (`None` → `0.5`)
+- `test_load_delta_cold_start_below_3_days`
+- `test_worked_example_snapshot_matches_doc_exactly` — §6's raw events reproduce `free_minutes=330`, `largest_contiguous_block=180`, `fragmentation_index=0.0`, `load_delta=-0.30`
+- `test_fit_score_worked_example_reproduces_0_875`
 - `test_revival_score_worked_example` — the full §6 scenario, asserting `0.633` to 3dp
-- `test_eligibility_excludes_young_items` (`days_since_capture < 3`)
-- `test_eligibility_excludes_recently_surfaced` (within 10 days)
+- `test_contrast_example_insufficient_block_scores_zero`
+- `test_eligibility_excludes_young_items` (`days_since_capture < 3`) / `test_eligibility_excludes_dormant` / `test_eligibility_excludes_recently_surfaced` (within 10 days) / `test_eligibility_excludes_open_suggestion`
 - `test_selection_picks_best_day_per_latent_then_argmax_across_latents`
 - `test_selection_respects_threshold` (below `0.4` → no suggestion)
 
