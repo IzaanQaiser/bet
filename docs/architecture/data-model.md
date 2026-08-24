@@ -185,6 +185,7 @@ The PRD is intentionally a first-pass sketch, not the canonical schema — this 
 | `suggestions` has no `user_id` | Added, denormalized | §2.2 — hot-path routing query needs it join-free |
 | `latents` has no explicit snooze column | `dormant_until` reused for snooze, not a new column | `state-machine.md` §2.2 — one column, two callers, documented here per that doc's own note |
 | `items.type` was `NOT NULL` | Made nullable (migration 0002) | §2.6 — unknown until `EXTRACTED`, `ingest-svc` has no legitimate value to write |
+| No service had `SELECT` on `users` | Granted to all four service roles (migration 0003) | `infrastructure.md` §2.2 — found when `ingest-svc`'s phone lookup failed live; every service needs this eventually |
 
 ---
 

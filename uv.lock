@@ -991,6 +991,7 @@ name = "obligation-engine-shared"
 version = "0.1.0"
 source = { editable = "shared" }
 dependencies = [
+    { name = "google-auth" },
     { name = "google-cloud-pubsub" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
@@ -998,6 +999,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "google-auth", specifier = ">=2.35" },
     { name = "google-cloud-pubsub", specifier = ">=2.27" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.9" },

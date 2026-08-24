@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 MIGRATIONS_DIR = Path(__file__).parents[2] / "migrations"
-MIGRATION_FILES = sorted(MIGRATIONS_DIR.glob("*.sql"))  # applied in order, matching scripts/migrate.sh
+MIGRATION_FILES = sorted(MIGRATIONS_DIR.glob("*.sql"))  # applied in order, per migrate.sh
 
 EXPECTED_TABLES = {
     "users",

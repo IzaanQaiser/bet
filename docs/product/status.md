@@ -14,14 +14,14 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**Steps 1-2 done. Step 3 in progress — code/tests/Docker all done, blocked on Twilio credentials for deploy + real verification.**
+**Steps 1-3 done. Next: Step 4 — `extractor-svc`.**
 
 | Step | Status |
 |---|---|
 | **Phase A — Foundation** | |
 | 1. Infra skeleton (Terraform) | **Done** — applied to `obligation-engine-hack`, all acceptance criteria verified (idempotent, IAM scoping confirmed, resource inventory confirmed) |
 | 2. DB schema + shared package | **Done** — migration applied, all 11 tests pass (8 unit + 3 integration, run for real against live Cloud SQL) |
-| 3. `ingest-svc` + real Twilio number | **Code done** — 6/6 tests pass (real signature validation, real emulator + Postgres integration), Docker image builds and runs. **Blocked**: needs a real Twilio account (see Blockers) before deploy + manual verification. |
+| 3. `ingest-svc` + real Twilio number | **Done** — deployed to Cloud Run, real Twilio number (`+14152365420`) wired to it, a real SMS from the developer's phone was confirmed end-to-end in the database (`state='RECEIVED'`, correct `user_id`). Two real deploy-time bugs found and fixed — see Notes. |
 | **Phase B — Core pipeline (auto-confirm stub)** | |
 | 4. `extractor-svc` | Not started |
 | 5. `resolver-svc` stub (temporary, auto-confirm) | Not started |
@@ -46,7 +46,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Blockers
 
-- **Still need a real, owned Twilio phone number.** Account SID (`AC3292d4a7944b87b2fe3db562856e32bd`) and Auth Token obtained and stored in Secret Manager. The number shown in Twilio's "Try out SMS" panel (`+17372212163`) turned out to be a **shared/pooled trial demo number, not one actually owned by the account** — confirmed empirically via three separate API calls (`IncomingPhoneNumbers` empty, a real send attempt blocked, `OutgoingCallerIds` blocked) even after a successful send through that panel. A real purchased number (via the console's actual "Buy a number" flow, not "Try it out") is still needed before deploy + webhook wiring + manual verification can happen.
+None.
 
 ## Decided
 
@@ -54,7 +54,9 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 - Billing account `01153A-78309A-856476` linked and enabled. (History: was closed due to a declined card; user paid the balance and reopened it; hit a billing-account project-quota limit next, resolved by unlinking `msa-gpt` to free a slot.)
 - `obligation-engine-db` (Cloud SQL Postgres 15, `db-f1-micro`) is live at connection name `obligation-engine-hack:us-central1:obligation-engine-db`.
 - Media bucket: `obligation-engine-hack-media`. Artifact Registry: `us-central1-docker.pkg.dev/obligation-engine-hack/obligation-engine`.
-- Twilio: Account SID `AC3292d4a7944b87b2fe3db562856e32bd`; Auth Token in Secret Manager (`twilio-auth-token`); an API Key's secret also captured and stored (`twilio-api-key-secret`) for outbound sends in later steps — see `infrastructure.md` §4.1 for why there are two separate Twilio credentials, not one. Twilio account is Trial type — 100 free messages, one number, only sends to Verified Caller IDs; fine for the whole build, revisit before final demo recording only if the trial message prefix matters for polish.
+- Twilio: Account SID `AC3292d4a7944b87b2fe3db562856e32bd`; Auth Token in Secret Manager (`twilio-auth-token`); an API Key's secret also captured and stored (`twilio-api-key-secret`) for outbound sends in later steps — see `infrastructure.md` §4.1 for why there are two separate Twilio credentials, not one.
+- Twilio account was **upgraded to paid** (not trial) — a $20 balance was added, and full A2P 10DLC brand + campaign registration was completed (Brand "Izaan Qaiser", Sole Proprietor). Real owned number: **+14152365420** (415/SF area code, Local, SMS+MMS+Voice, $1.15/mo), webhook configured to `https://ingest-svc-ns4t52sm7a-uc.a.run.app/webhook/sms`. Public compliance docs (privacy policy, terms, opt-in page — required for A2P campaign approval) are hosted at https://gist.github.com/IzaanQaiser/ee4ef5c5e3f1320287358b021f8b920f (a public gist, deliberately separate from the private project repo).
+- Demo user bootstrapped in `users` table: `+16477401694`, `timezone='America/Toronto'`, default working hours.
 
 ## Notes for the next session
 
@@ -66,6 +68,11 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 - Local Pub/Sub emulator installed (`gcloud components install pubsub-emulator` + `beta`) and OpenJDK (needed to run it) — both via Homebrew, PATH persisted in `~/.zshrc`. `scripts/setup-emulator.sh` creates the 6 topics against it, mirroring `infra/pubsub.tf`.
 - `scripts/migrate.sh` rewritten to track applied migrations in a `schema_migrations` table — it used to blindly reapply every file every time, which fails once a table exists. Real bug found via this: `items.type` was `NOT NULL`, impossible for `ingest-svc` to satisfy since type is unknown until `EXTRACTED`. Fixed via `migrations/0002_items_type_nullable.sql`.
 - Cloud SQL Auth Proxy + Pub/Sub emulator were left running in the background at the end of this session (ports 5433 and 8085) — may need restarting in a fresh session/terminal.
+- **Two real deploy-time bugs found getting `ingest-svc` actually working in Cloud Run, both worth remembering for every later service:**
+  1. `roles/cloudsql.client` alone does **not** grant IAM database authentication — the separate `roles/cloudsql.instanceUser` role is what actually authorizes connecting as a specific IAM DB user. Local testing never caught this because it ran as the developer's own Owner-level identity, which bypasses the check. Added to all four service accounts in `infra/cloud_sql.tf`.
+  2. Cloud Run's native `--add-cloudsql-instances` Unix socket does **not** transparently inject an IAM token the way the standalone `cloud-sql-proxy --auto-iam-authn` does for local dev — the application itself has to fetch a real OAuth token (scope `sqlservice.admin`) and use it as the password. `shared/obligation_engine_shared/db.py` now branches on this explicitly.
+  3. (Smaller) No service had been granted `SELECT` on `users` at all — added to all four via `migrations/0003_grant_users_select.sql`, since every service will need it eventually (timezone, working hours, refresh token ref).
+- `scripts/deploy.sh` now exists (per `infrastructure.md` §6) — `./scripts/deploy.sh <service-name>` builds (with `--platform linux/amd64`, required on Apple Silicon), pushes, and deploys. `/healthz` had to be renamed to `/health` — `/healthz` specifically collided with something at the Google Frontend layer (returned a generic Google 404 page instead of reaching the container at all); the real functional route (`/webhook/sms`) was never affected.
 - Every step now has full acceptance criteria and named unit/integration/manual tests in `docs/engineering/test-plan.md` — read that step's section before starting it, and don't consider a step done until its tests pass, not just its code.
 - Onboarding (PRD §10) is deliberately not in the critical path — bootstrap the single demo user's OAuth token and `users` row manually (see PRD §14's scope note) rather than building the real SMS onboarding flow. That flow only happens in step 19, if time allows.
 - Demo needs seeded/backdated data (`docs/product/prd.md` §13, "Demo data note" + step 16) — don't leave this until step 17.

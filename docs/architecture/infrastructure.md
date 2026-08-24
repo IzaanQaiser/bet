@@ -30,13 +30,15 @@ Two IAM layers matter here and they enforce different things:
 
 ### 2.1 Per-service GCP IAM
 
-| Service account | Pub/Sub | Cloud SQL (`roles/cloudsql.client`) | Secret Manager | Vertex AI | External APIs | Invocable by |
+| Service account | Pub/Sub | Cloud SQL (`roles/cloudsql.client` + `roles/cloudsql.instanceUser`) | Secret Manager | Vertex AI | External APIs | Invocable by |
 |---|---|---|---|---|---|---|
 | `sa-ingest` | publish: `items.raw` · subscribe: none (HTTP push target, not a subscriber) | yes | `twilio-auth-token` (accessor) | none | none | public (Twilio; validated by request-signature check in code, not IAM) |
 | `sa-extractor` | subscribe: `items.raw` · publish: `items.extracted` | **none — no binding at all** | none | `roles/aiplatform.user` | none | Pub/Sub push service agent only |
 | `sa-resolver` | subscribe: `items.extracted` · publish: `items.confirmed` | yes | none | `roles/aiplatform.user` | none | Pub/Sub push service agent, `sa-ingest` (`roles/run.invoker`, for routed replies) |
 | `sa-committer` | subscribe: `items.confirmed`, `items.raw.dlq`, `items.extracted.dlq`, `items.confirmed.dlq` · publish: none | yes | `google-oauth-client-secret`, `user-refresh-token-*` (accessor) | none | Calendar (write), Gmail (send) | Pub/Sub push service agent only |
 | `sa-dispatcher` | subscribe: none (cron-triggered) · publish: `items.confirmed` (accept-path only) | yes | `google-oauth-client-secret`, `user-refresh-token-*` (accessor) | none | Calendar (read only) | Cloud Scheduler (`roles/run.invoker`), `sa-ingest` (routed suggestion replies), developer (manual trigger, §5) |
+
+**Resolved bug, found in step 3 (real deploy, not caught by earlier local testing):** `roles/cloudsql.client` alone is not sufficient for IAM database authentication — it only permits opening a connection to the instance via the proxy/connector. The role that actually authorizes authenticating *as* a specific IAM database user is the separate `roles/cloudsql.instanceUser`, which the original plan omitted. Local testing throughout steps 2–3 never caught this because it ran as the developer's own Owner-level identity, which bypasses the check. `sa-ingest`'s deployed Cloud Run revision failed with `Cloud SQL IAM service account authentication failed` until this was added — a genuine gap between "works locally" and "works as the actual service identity," worth remembering when deploying `resolver-svc`/`committer-svc`/`dispatcher-svc` later (they'll need the same grant, already added to all four in `infra/cloud_sql.tf`).
 
 Every Pub/Sub grant above is bound **at the topic or subscription resource**, not project-wide — a project-wide `roles/pubsub.publisher` on `sa-extractor` would let it publish to `items.confirmed` directly and quietly defeat the entire confirm-before-write story (ADR 0003). This is non-negotiable in the Terraform: `google_pubsub_topic_iam_member` / `google_pubsub_subscription_iam_member`, resource-scoped, never `google_project_iam_member` for Pub/Sub roles.
 
@@ -50,12 +52,14 @@ One Postgres role per service, matching `overview.md` §3 as closely as table-le
 
 | Postgres role (shorthand) | Tables |
 |---|---|
-| `app_ingest` | `INSERT` on `items` · `SELECT` on `items`, `conversations`, `suggestions` (routing check, `data-model.md` §2.5) |
-| `app_resolver` | `SELECT, UPDATE` on `items` · `SELECT, INSERT, UPDATE` on `conversations` · `SELECT, INSERT` on `item_embeddings` |
-| `app_committer` | `SELECT, UPDATE` on `items` · `INSERT` on `obligations`, `latents` · `INSERT` on `dead_letters` (§2.1) |
-| `app_dispatcher` | `SELECT` on `items`, `obligations` · `UPDATE` on `obligations` (`reminder_sent_at`) · `SELECT, INSERT` on `capacity_snapshots` · `SELECT, INSERT, UPDATE` on `suggestions` · `SELECT, UPDATE` on `latents` |
+| `app_ingest` | `INSERT` on `items` · `SELECT` on `items`, `conversations`, `suggestions`, `users` (routing check, `data-model.md` §2.5; `users` for the phone-number lookup) |
+| `app_resolver` | `SELECT, UPDATE` on `items` · `SELECT, INSERT, UPDATE` on `conversations` · `SELECT, INSERT` on `item_embeddings` · `SELECT` on `users` |
+| `app_committer` | `SELECT, UPDATE` on `items` · `INSERT` on `obligations`, `latents` · `INSERT` on `dead_letters` (§2.1) · `SELECT` on `users` |
+| `app_dispatcher` | `SELECT` on `items`, `obligations` · `UPDATE` on `obligations` (`reminder_sent_at`) · `SELECT, INSERT` on `capacity_snapshots` · `SELECT, INSERT, UPDATE` on `suggestions` · `SELECT, UPDATE` on `latents` · `SELECT` on `users` |
 
 `sa-extractor` has no Postgres role because it has no Cloud SQL binding at all (§2.1) — there's nothing to grant.
+
+**Resolved gap, found in step 3's real deploy:** none of the four roles above originally had `SELECT` on `users` — `ingest-svc`'s phone-number lookup failed with `permission denied for table users` until `migrations/0003_grant_users_select.sql` added it to all four. Every service will eventually need to read `users` for something (timezone, working hours, the refresh-token reference), so it was granted broadly rather than patched one service at a time.
 
 **Migration/admin bootstrap — decided during step 2, not originally specified here.** None of the four service IAM database users can run DDL: Postgres 15 revokes `CREATE` on the public schema by default, and Cloud SQL does **not** auto-grant `cloudsqlsuperuser` to IAM database users (verified empirically before assuming either way — see `docs/product/status.md` history). `infra/service_accounts.tf` adds one more IAM database user for the developer's own Google identity, granted `cloudsqlsuperuser` via a one-time bootstrap through the built-in `postgres` user (its password is set, used once, then immediately rotated to an unretained random value — nobody holds it going forward, and it can always be reset again via `gcloud sql users set-password` if ever needed). Migrations run as the developer's IAM identity through the Cloud SQL Auth Proxy, not as any service account.
 

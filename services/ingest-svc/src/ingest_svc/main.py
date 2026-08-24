@@ -82,6 +82,6 @@ async def sms_webhook(request: Request):
     return {"status": "received", "item_id": str(item_id)}
 
 
-@app.get("/healthz")
-async def healthz():
+@app.get("/health")
+async def health():
     return {"status": "ok"}
