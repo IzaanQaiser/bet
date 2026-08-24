@@ -168,6 +168,50 @@ def test_sms_send_failure_returns_500(client):
     assert resp.status_code == 500
 
 
+# --- /pubsub/push, idempotency guard (step 13) ----------------------------
+
+
+def test_redelivered_already_processed_item_is_a_noop(client):
+    """The real bug found in step 11: a concurrent Pub/Sub redelivery of
+    the same items.extracted message, arriving after the first delivery
+    already finished (a real conversations row exists), must not be
+    reprocessed."""
+    extracted = _extracted_message()
+    conn = _mock_connection(conversation_row=(1,))
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main._check_duplicate") as mock_check_duplicate,
+    ):
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "already_processed", "item_id": str(extracted.item_id)}
+    mock_check_duplicate.assert_not_called()
+
+
+def test_stuck_state_with_no_conversation_is_not_swallowed(client):
+    """A second real bug, found verifying this step: items.state can
+    legitimately move past RECEIVED (_write_item's own transaction
+    commits independently) while a later write in the same request
+    still fails — e.g. the conversations INSERT itself. A guard keyed on
+    items.state alone would treat that stuck item as "already done"
+    forever, so it would never reach 5 delivery attempts and never
+    reach dead_letters — silently defeating this whole step. The guard
+    must key on the conversations row actually existing, not state."""
+    extracted = _extracted_message()
+    conn = _mock_connection(conversation_row=None)  # no conversation yet, despite any item state
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        _no_duplicate(),
+        patch("resolver_svc.main._send_sms") as mock_sms,
+    ):
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] != "already_processed"
+    mock_sms.assert_called_once()
+
+
 # --- /reply, AWAITING_CONFIRMATION path ----------------------------------
 
 

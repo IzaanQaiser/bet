@@ -134,7 +134,7 @@ CREATE INDEX idx_conversations_user ON conversations(user_id);
 CREATE TABLE dead_letters (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     item_id     uuid NOT NULL REFERENCES items(id),
-    stage       text NOT NULL,               -- topic name the message failed on, e.g. 'items.extracted'
+    stage       text NOT NULL,               -- topic name the message failed on, e.g. 'items-extracted'
     payload     jsonb NOT NULL,               -- the message body itself, inline; see §2.3
     error       text NOT NULL,
     retry_count int NOT NULL,

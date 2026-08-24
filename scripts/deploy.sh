@@ -91,6 +91,47 @@ setup_push_subscription() {
     --account=waslyrideshare@gmail.com
 }
 
+# Step 13: a push subscription on a .dlq topic itself — committer-svc's
+# /pubsub/dlq, one subscription per .dlq topic since ?stage= is the
+# simplest way to tell them apart (infrastructure.md §2.1's "Resolved
+# gap" note on why committer-svc is the dead-letter writer). No nested
+# dead-letter-policy here — a message that's already exhausted the real
+# pipeline's retries has nowhere further to escalate to.
+# Args: <subscription-name> <dlq-topic> <stage>
+setup_dlq_subscription() {
+  local subscription="$1" dlq_topic="$2" stage="$3"
+
+  local service_url project_number pubsub_agent
+  service_url=$(gcloud run services describe "$SERVICE" \
+    --project="$PROJECT_ID" --region="$REGION" \
+    --format='value(status.url)' --account=waslyrideshare@gmail.com)
+  project_number=$(gcloud projects describe "$PROJECT_ID" \
+    --format='value(projectNumber)' --account=waslyrideshare@gmail.com)
+  pubsub_agent="service-${project_number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+
+  echo "Creating/updating ${subscription}..."
+  if gcloud pubsub subscriptions describe "$subscription" \
+    --project="$PROJECT_ID" --account=waslyrideshare@gmail.com >/dev/null 2>&1; then
+    gcloud pubsub subscriptions update "$subscription" \
+      --project="$PROJECT_ID" \
+      --push-endpoint="${service_url}/pubsub/dlq?stage=${stage}" \
+      --push-auth-service-account="${SA}" \
+      --account=waslyrideshare@gmail.com
+  else
+    gcloud pubsub subscriptions create "$subscription" \
+      --project="$PROJECT_ID" \
+      --topic="$dlq_topic" \
+      --push-endpoint="${service_url}/pubsub/dlq?stage=${stage}" \
+      --push-auth-service-account="${SA}" \
+      --account=waslyrideshare@gmail.com
+  fi
+
+  gcloud pubsub subscriptions add-iam-policy-binding "$subscription" \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:${pubsub_agent}" --role="roles/pubsub.subscriber" \
+    --account=waslyrideshare@gmail.com
+}
+
 case "$SERVICE" in
   ingest-svc)
     echo "Deploying ${SERVICE}..."
@@ -186,6 +227,13 @@ case "$SERVICE" in
       --account=waslyrideshare@gmail.com
 
     setup_push_subscription "items-confirmed-committer-push" "items-confirmed" "items-confirmed-dlq"
+
+    # Step 13: committer-svc also owns dead-letter persistence — one
+    # push subscription per .dlq topic, all targeting the same service
+    # (run.invoker for sa-committer on itself is already granted above).
+    setup_dlq_subscription "items-raw-dlq-committer-push" "items-raw-dlq" "items-raw"
+    setup_dlq_subscription "items-extracted-dlq-committer-push" "items-extracted-dlq" "items-extracted"
+    setup_dlq_subscription "items-confirmed-dlq-committer-push" "items-confirmed-dlq" "items-confirmed"
     ;;
   dispatcher-svc)
     echo "Deploying ${SERVICE}..."

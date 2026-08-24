@@ -96,6 +96,10 @@ class _FakeConn:
                 "resolved_fields": _unwrap(resolved_fields),
                 "exchange_count": 0,
             }
+        elif sql.strip().startswith("SELECT 1 FROM conversations"):
+            # step 13's idempotency guard at the top of /pubsub/push —
+            # "no conversation yet" until one is actually created below.
+            result.row = (1,) if self.convo is not None else None
         elif "FROM conversations" in sql:
             result.row = (
                 self.convo["pending_fields"],

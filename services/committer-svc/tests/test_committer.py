@@ -24,9 +24,24 @@ def client(monkeypatch):
     return TestClient(app)
 
 
-def _mock_connection(user_row=None):
+def _mock_connection(*, item_state="CONFIRMED", user_row=None):
+    """item_state feeds the step-13 idempotency guard's `SELECT state FROM
+    items` check at the top of /pubsub/push — "CONFIRMED" (the default)
+    lets every pre-existing test reach the real commit logic unchanged;
+    tests exercising the guard itself override it."""
+
+    def execute_side_effect(sql, params=None):
+        result = MagicMock()
+        if "FROM items" in sql:
+            result.fetchone.return_value = (item_state,) if item_state is not None else None
+        elif "FROM users" in sql:
+            result.fetchone.return_value = user_row
+        else:
+            result.fetchone.return_value = None
+        return result
+
     conn = MagicMock()
-    conn.execute.return_value.fetchone.return_value = user_row
+    conn.execute.side_effect = execute_side_effect
     conn.__enter__ = MagicMock(return_value=conn)
     conn.__exit__ = MagicMock(return_value=False)
     return conn
@@ -77,12 +92,13 @@ def test_obligation_branch_calls_calendar_write(client):
     _, kwargs = mock_session_cls.return_value.post.call_args
     assert kwargs["json"]["summary"] == "Pay rent"
 
-    # call 0 is the SELECT in _user_credentials; 1 is the obligations INSERT; 2 is the items UPDATE.
-    insert_sql, insert_params = conn.execute.call_args_list[1][0]
+    # call 0 is the idempotency guard's items.state check; 1 is the SELECT
+    # in _user_credentials; 2 is the obligations INSERT; 3 is the items UPDATE.
+    insert_sql, insert_params = conn.execute.call_args_list[2][0]
     assert "INSERT INTO obligations" in insert_sql
     assert insert_params[2] == "gcal-event-123"  # calendar_event_id
 
-    update_sql, update_params = conn.execute.call_args_list[2][0]
+    update_sql, update_params = conn.execute.call_args_list[3][0]
     assert "state = 'COMMITTED'" in update_sql
     assert update_params[0] == str(confirmed.item_id)
 
@@ -102,9 +118,10 @@ def test_latent_branch_does_not_call_calendar(client):
     assert resp.status_code == 200
     mock_session_cls.assert_not_called()
 
-    insert_sql = conn.execute.call_args_list[0][0][0]
+    # call 0 is the idempotency guard's items.state check.
+    insert_sql = conn.execute.call_args_list[1][0][0]
     assert "INSERT INTO latents" in insert_sql
-    update_sql = conn.execute.call_args_list[1][0][0]
+    update_sql = conn.execute.call_args_list[2][0][0]
     assert "state = 'COMMITTED'" in update_sql
 
 
@@ -123,10 +140,11 @@ def test_calendar_failure_does_not_mark_committed(client):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 500
-    # Only the credentials SELECT happened — the calendar call raised
-    # before the obligations INSERT / items UPDATE were ever reached.
-    assert conn.execute.call_count == 1
-    assert "SELECT" in conn.execute.call_args_list[0][0][0]
+    # The idempotency guard's state check, then the credentials SELECT,
+    # happened — the calendar call raised before the obligations INSERT /
+    # items UPDATE were ever reached.
+    assert conn.execute.call_count == 2
+    assert "SELECT" in conn.execute.call_args_list[1][0][0]
 
 
 def test_no_linked_google_account_fails_without_writing(client):
@@ -149,12 +167,105 @@ def test_email_action_type_not_implemented(client):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 500
-    conn.execute.assert_not_called()
+    # Only the idempotency guard's state check happened — the
+    # NotImplementedError is raised before any real DB write is attempted.
+    assert conn.execute.call_count == 1
+    assert "FROM items" in conn.execute.call_args_list[0][0][0]
 
 
 def test_malformed_envelope_returns_500_for_retry(client):
     resp = client.post("/pubsub/push", json={"message": {"data": "not-valid-base64json"}})
     assert resp.status_code == 500
+
+
+# --- idempotency guard (step 13) ------------------------------------------
+
+
+def test_redelivered_already_committed_item_is_a_noop(client):
+    """The real bug class found in step 11: a concurrent Pub/Sub
+    redelivery of the same items.confirmed message must not create a
+    second real Calendar event."""
+    confirmed = _confirmed_message()
+    conn = _mock_connection(item_state="COMMITTED")
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "already_processed", "item_id": str(confirmed.item_id)}
+    mock_session_cls.assert_not_called()
+    assert conn.execute.call_count == 1  # only the state check
+
+
+def test_unknown_item_id_proceeds_to_real_commit_logic(client):
+    """No items row found at all (row is None) isn't itself the
+    already-processed case — falls through to the real commit path,
+    which fails for its own reason (no linked Google account here)."""
+    confirmed = _confirmed_message()
+    conn = _mock_connection(item_state=None, user_row=None)
+
+    with patch("committer_svc.main.get_connection", return_value=conn):
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 500
+
+
+# --- /pubsub/dlq (step 13) -------------------------------------------------
+
+
+def _dlq_envelope(payload: dict, retry_count: int = 5) -> dict:
+    import base64
+    import json
+
+    data = base64.b64encode(json.dumps(payload).encode()).decode()
+    return {
+        "message": {
+            "data": data,
+            "attributes": {"CloudPubSubDeadLetterSourceDeliveryCount": str(retry_count)},
+            "messageId": "123",
+        },
+        "subscription": "projects/p/subscriptions/items-raw-dlq-committer-push",
+    }
+
+
+def test_dlq_writes_dead_letter_row_and_marks_failed(client):
+    item_id = str(uuid4())
+    payload = {"item_id": item_id, "user_id": str(uuid4()), "text": "hi"}
+    conn = _mock_connection()
+
+    with patch("committer_svc.main.get_connection", return_value=conn):
+        resp = client.post(
+            "/pubsub/dlq?stage=items-raw", json=_dlq_envelope(payload, retry_count=5)
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "dead_lettered", "item_id": item_id}
+
+    insert_sql, insert_params = conn.execute.call_args_list[0][0]
+    assert "INSERT INTO dead_letters" in insert_sql
+    assert insert_params[0] == item_id
+    assert insert_params[1] == "items-raw"
+    assert insert_params[4] == 5  # retry_count
+
+    update_sql, update_params = conn.execute.call_args_list[1][0]
+    assert "state = 'FAILED'" in update_sql
+    assert update_params[0] == item_id
+
+
+def test_dlq_malformed_envelope_acked_not_retried(client):
+    """A dead-lettered message that can't even be parsed has no item_id
+    to record against — logged and acked (200), not retried forever."""
+    conn = _mock_connection()
+    with patch("committer_svc.main.get_connection", return_value=conn):
+        resp = client.post(
+            "/pubsub/dlq?stage=items-raw",
+            json={"message": {"data": "not-valid-base64json", "attributes": {}}},
+        )
+    assert resp.status_code == 200
+    conn.execute.assert_not_called()
 
 
 def test_health(client):
