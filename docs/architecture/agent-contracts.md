@@ -67,6 +67,8 @@ class ConfirmedItemMessage(BaseModel):
 
 `ExtractedItemMessage` carries the *entire* extraction result, not just `item_id` — `extractor-svc` has no DB write role (ADR 0003), so `resolver-svc` is the first service to actually persist these fields into `items`. `ConfirmedItemMessage` likewise carries its full payload rather than just `item_id` — `resolver-svc` could technically let `committer-svc` re-`SELECT` from `items`, but `due_at` has no `items` column to `SELECT` from in the first place (see `data-model.md` §2.4), so the full-payload shape stays uniform across all three messages by necessity, not just convention.
 
+**Resolved gap, found in step 6 — the Calendar event's time span.** Neither the PRD nor this doc specified how long the written Calendar event actually runs for; only that a `due_at` instant exists. Decided here: the event spans `due_at` to `due_at + effort_minutes` — the calendar block represents the time set aside to actually do the task, consistent with the capacity engine treating obligations as real occupied time (`capacity-engine.md` §2). `due_at` may arrive from Gemini as a naive datetime (no UTC offset) when the model reasons in local terms; `committer-svc` treats a naive `due_at` as already being in the user's `users.timezone` (attaching that zone, not converting) before sending `dateTime`+`timeZone` to the Calendar API — never assumes UTC for a naive value, which would silently shift the event by however many hours off UTC the user's zone is.
+
 ---
 
 ## 2. Extractor contract

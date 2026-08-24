@@ -109,15 +109,18 @@ Test files live in each service's `tests/` directory, or `shared/tests/` for any
 - `type="latent"` → zero external calls, one `latents` row (`surface_count=0`, `dismissal_count=0`, `dormant_until=null`), `items.state='COMMITTED'`.
 - A Calendar API failure does not mark `COMMITTED` — item stays recoverable, error logged with `item_id`.
 
-**Unit tests** (`services/committer-svc/tests/test_committer.py`, Calendar client mocked)
-- `test_obligation_branch_calls_calendar_write` — mock asserts calendar-write called with correct args.
-- `test_latent_branch_does_not_call_calendar` — mock asserts calendar-write **not** called.
-- `test_calendar_failure_does_not_mark_committed`.
+**Unit tests** (`services/committer-svc/tests/test_committer.py`, DB + Secret Manager + Calendar client all mocked)
+- `test_obligation_branch_calls_calendar_write` — mock asserts calendar-write called with correct args (event spans `due_at` to `due_at + effort_minutes`, per `agent-contracts.md` §1's "Resolved gap" note), `obligations` row inserted with the returned `calendar_event_id`, `items.state='COMMITTED'`.
+- `test_latent_branch_does_not_call_calendar` — mock asserts calendar-write **not** called, `latents` row inserted, `items.state='COMMITTED'`.
+- `test_calendar_failure_does_not_mark_committed` — only the credentials lookup happens; the `obligations` INSERT / `items` UPDATE are never reached.
+- `test_no_linked_google_account_fails_without_writing` — a user with no `google_refresh_token_ref` fails loudly rather than silently skipping the write.
+- `test_email_action_type_not_implemented` — `action_type="email"` fails loudly (step 15 stretch, not built yet) rather than being silently treated as a calendar write.
+- `test_malformed_envelope_returns_500_for_retry`.
 
-**Integration tests** (Pub/Sub emulator + local Postgres, Calendar mocked)
-- `test_confirmed_obligation_full_cycle` / `test_confirmed_latent_full_cycle`.
+**Integration tests** (`test_committer_integration.py`, real dev Postgres via Cloud SQL Auth Proxy; Calendar + Secret Manager mocked — no Pub/Sub emulator needed, committer-svc never publishes)
+- `test_confirmed_obligation_full_cycle` / `test_confirmed_latent_full_cycle` — real `items`/`obligations`/`latents` rows verified against the live DB.
 
-**Manual verification:** one real obligation end-to-end — actual Google Calendar event appears. Required once against the real API; mocks can't fully validate OAuth/API behavior.
+**Manual verification:** one real obligation end-to-end — actual Google Calendar event appears. Required once against the real API; mocks can't fully validate OAuth/API behavior. Needs the one-time manual OAuth bootstrap (`infrastructure.md` §4) done first.
 
 ---
 
