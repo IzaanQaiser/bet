@@ -10,6 +10,13 @@ sites"). An email-intent message with no real address in the text never gets
 a guessed recipient: "email_recipient" joins missing_fields instead, same
 pattern as an ambiguous due_at.
 
+Phase G step B (agent-contracts.md §2.2) adds a leading is_actionable triage
+flag to this same call: pure chat (banter/greeting/reaction/question) gets
+is_actionable=False and an in-voice chat_reply, with every extraction field
+left null — no fake obligation gets invented out of "hello". resolver-svc
+decides what to actually do with that (send chat_reply, mark the item
+CHATTED) since this service still has zero Twilio/DB access (ADR 0003).
+
 Zero DB access, zero Calendar/Gmail scope (ADR 0003) — this is the one service
 in the whole system that ever touches untrusted, unconfirmed user input, and
 it can write to nothing but the items.extracted topic.
@@ -40,15 +47,17 @@ app = FastAPI()
 # wire schema the model actually fills in; effort_minutes is cast to int
 # below when building the real ExtractedItemMessage.
 class _ExtractionResult(BaseModel):
-    type: Literal["obligation", "latent"]
-    title: str
-    summary: str
+    is_actionable: bool = True
+    chat_reply: str | None = None
+    type: Literal["obligation", "latent"] | None = None
+    title: str | None = None
+    summary: str | None = None
     due_at: str | None = None
-    effort_minutes: Literal["15", "30", "60", "120", "240"]
-    focus_depth: Literal["shallow", "deep"]
-    confidence: float = Field(ge=0.0, le=1.0)
-    missing_fields: list[str]
-    reasoning: str
+    effort_minutes: Literal["15", "30", "60", "120", "240"] | None = None
+    focus_depth: Literal["shallow", "deep"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    missing_fields: list[str] = Field(default_factory=list)
+    reasoning: str = ""
     action_type: Literal["calendar", "email"] = "calendar"
     email_recipient: str | None = None
     email_draft: str | None = None
@@ -56,8 +65,21 @@ class _ExtractionResult(BaseModel):
 
 _SYSTEM_PROMPT = """You are the extraction stage of a personal obligation-tracking system. You
 are given a message a user sent via SMS — text, and optionally an attached
-image or PDF (a screenshot, a scanned letter, a photo of a note). Extract
-exactly one structured item from it.
+image or PDF (a screenshot, a scanned letter, a photo of a note). The user
+texts like they'd text a friend, not like they're filling out a form.
+
+First decide is_actionable:
+- false if the message is pure chat with nothing to remember or schedule —
+  a greeting, banter, a reaction, a question about the system itself, "you
+  there?", etc. In this case leave type/title/summary/due_at/effort_minutes/
+  focus_depth/confidence null and missing_fields empty, and set chat_reply
+  to a short, casual, in-voice reply reacting to what they actually said —
+  lowercase, terse, a little slang is fine, like a real friend texting back.
+  Never invent an obligation or idea out of plain chat.
+- true if the message describes a real obligation or idea worth capturing.
+  In this case leave chat_reply null and fill every field below normally.
+
+Extract exactly one structured item when is_actionable is true.
 
 Rules:
 - Classify as "obligation" if it has or implies a deadline; otherwise
@@ -161,11 +183,13 @@ async def pubsub_push(request: Request):
     extracted = ExtractedItemMessage(
         item_id=raw.item_id,
         user_id=raw.user_id,
+        is_actionable=result.is_actionable,
+        chat_reply=result.chat_reply,
         type=result.type,
         title=result.title,
         summary=result.summary,
         due_at=result.due_at,
-        effort_minutes=int(result.effort_minutes),
+        effort_minutes=int(result.effort_minutes) if result.effort_minutes else None,
         focus_depth=result.focus_depth,
         confidence=result.confidence,
         missing_fields=result.missing_fields,
@@ -181,7 +205,12 @@ async def pubsub_push(request: Request):
         logger.exception("publish failed item_id=%s", raw.item_id)
         raise HTTPException(status_code=500, detail="publish failed") from None
 
-    logger.info("extracted item_id=%s type=%s", raw.item_id, extracted.type)
+    logger.info(
+        "extracted item_id=%s is_actionable=%s type=%s",
+        raw.item_id,
+        extracted.is_actionable,
+        extracted.type,
+    )
     return {"status": "extracted", "item_id": str(raw.item_id)}
 
 

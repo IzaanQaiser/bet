@@ -164,6 +164,30 @@ def _initial_resolved_fields(extracted: ExtractedItemMessage) -> dict:
     return fields
 
 
+async def _handle_chat(extracted: ExtractedItemMessage) -> None:
+    """Phase G step B: a pure-chat message never reaches dedupe/clarification/
+    confirmation — extractor-svc already generated the reply, this just sends
+    it and closes the item out at CHATTED (state-machine.md's own reasoning
+    for not reusing CANCELLED/NEEDS_REVIEW here — different failure/outcome
+    semantics). A conversations row is still written (empty resolved_fields)
+    purely as the existing idempotency guard's completion signal — reusing
+    that mechanism rather than inventing a second one for this one path."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE items SET state = 'CHATTED', updated_at = now() WHERE id = %s",
+            (str(extracted.item_id),),
+        )
+        conn.execute(
+            "INSERT INTO conversations (user_id, item_id, resolved_fields) VALUES (%s, %s, %s)",
+            (str(extracted.user_id), str(extracted.item_id), Json({})),
+        )
+        phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
+        conn.commit()
+
+    _send_sms(phone, extracted.chat_reply or "hey")
+    logger.info("CHATTED item_id=%s", extracted.item_id)
+
+
 def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
     dedupe_hash = compute_dedupe_hash(extracted.title, extracted.summary)
 
@@ -353,6 +377,14 @@ async def pubsub_push(request: Request):
         # so its existence is the one true completion signal.
         logger.info("skipping already-processed item_id=%s (redelivery)", extracted.item_id)
         return {"status": "already_processed", "item_id": str(extracted.item_id)}
+
+    if not extracted.is_actionable:
+        try:
+            await _handle_chat(extracted)
+        except Exception:
+            logger.exception("failed to handle chat item_id=%s", extracted.item_id)
+            raise HTTPException(status_code=500, detail="chat handling failed") from None
+        return {"status": "chatted", "item_id": str(extracted.item_id)}
 
     try:
         dedupe = _check_duplicate(extracted)
