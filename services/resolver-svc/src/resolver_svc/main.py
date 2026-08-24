@@ -49,6 +49,17 @@ item). That crash happened to be harmless purely by luck — the winning
 request had already sent its SMS first — not because anything actually
 guarded against it.
 
+Phase G follow-up (same session as step D): converse() gained
+`relates_to_item` (conversation.py's own docstring has the full design) —
+when a reply during CLARIFYING or AWAITING_CONFIRMATION doesn't actually
+relate to the open item, `_route_as_new_item()` leaves that item
+completely untouched and gives the text its own new item via the same
+path a first-contact message takes (`create_raw_item` + `items-raw`
+publish). The DUPLICATE_SUSPECTED path's plain-Y/N `classify_reply()` got
+the same fix for its own "neither Y nor N" case — that used to silently
+drop the reply with no SMS at all (found reading this code while fixing
+the converse() side of the same bug class), now routed the same way.
+
 The guard checks for an existing `conversations` row, not `items.state`
 — an earlier draft checked state, and a second real bug (found
 verifying this step, not hypothetical) showed why that's wrong:
@@ -72,12 +83,13 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
-from obligation_engine_shared.db import get_connection, log_message
+from obligation_engine_shared.db import create_raw_item, get_connection, log_message
 from obligation_engine_shared.pubsub import decode_push_envelope, publish
 from obligation_engine_shared.reply_classifier import classify_reply
 from obligation_engine_shared.schemas import (
     ConfirmedItemMessage,
     ExtractedItemMessage,
+    RawItemMessage,
     RoutedReplyMessage,
 )
 from psycopg.types.json import Json
@@ -173,6 +185,34 @@ def _recent_history(conn, user_id, limit: int = 10) -> list[str]:
         f"{'user' if direction == 'in' else 'assistant'}: {body}"
         for direction, body in reversed(rows)
     ]
+
+
+def _route_as_new_item(conn, original_item_id, user_id, text: str, *, reason: str) -> dict:
+    """Spins up a brand-new item for text that arrived while a different
+    item was open but doesn't actually relate to it (agent-contracts.md
+    §3.5's relates_to_item escape hatch, module docstring above). The open
+    item that this text was originally routed against is left completely
+    untouched — no state change, no timeout, it's just not force-fed this
+    unrelated text. Mirrors ingest-svc's own fresh-message path exactly
+    (INSERT RECEIVED row, publish items-raw) via the shared create_raw_item
+    helper, so this text gets the same real extraction/dedupe/clarification
+    treatment a first-contact message would."""
+    new_item_id = create_raw_item(conn, user_id, text)
+    conn.commit()
+    publish(
+        "items-raw",
+        RawItemMessage(
+            item_id=new_item_id, user_id=user_id, text=text, received_at=datetime.now(UTC)
+        ),
+    )
+    logger.info(
+        "item_id=%s %s, routed as new item_id=%s", original_item_id, reason, new_item_id
+    )
+    return {
+        "status": "routed_as_new_item",
+        "item_id": str(original_item_id),
+        "new_item_id": str(new_item_id),
+    }
 
 
 def _initial_resolved_fields(extracted: ExtractedItemMessage) -> dict:
@@ -469,6 +509,11 @@ async def _handle_clarification_reply(
         history=history,
         latest_reply=latest_reply,
     )
+    if not result.relates_to_item:
+        return _route_as_new_item(
+            conn, item_id, user_id, latest_reply, reason="reply unrelated during CLARIFYING"
+        )
+
     if result.due_at_filled and result.due_at:
         resolved_fields = {**resolved_fields, "due_at": result.due_at}
     if result.email_recipient_filled and result.email_recipient:
@@ -606,8 +651,17 @@ async def _handle_duplicate_reply(
         logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
         return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
-    logger.info("dedupe reply outside Y/N, not yet handled item_id=%s text=%r", item_id, text)
-    return {"status": "unhandled_reply", "item_id": str(item_id)}
+    # Not Y or N — classify_reply's own keyword set is deliberately
+    # untouched (module docstring), but the reply still has to go
+    # somewhere: swallowing it silently (the old behavior — no SMS sent
+    # at all) is exactly the "open item eats an unrelated message" bug
+    # this whole change exists to fix, just via the dedupe path's own
+    # simpler classifier instead of converse()'s relates_to_item. Same
+    # fix, same mechanism: leave the dedupe question exactly as it was,
+    # give this text its own new item.
+    return _route_as_new_item(
+        conn, item_id, user_id, text, reason=f"dedupe reply outside Y/N text={text!r}"
+    )
 
 
 async def _handle_confirmation_reply(
@@ -638,6 +692,11 @@ async def _handle_confirmation_reply(
         history=history,
         latest_reply=latest_reply,
     )
+    if not result.relates_to_item:
+        return _route_as_new_item(
+            conn, item_id, user_id, latest_reply,
+            reason="reply unrelated during AWAITING_CONFIRMATION",
+        )
 
     if result.intent == "AFFIRM":
         confirmed = ConfirmedItemMessage(

@@ -18,7 +18,7 @@ during step 3's first live deploy, worth being explicit about:
 
 import os
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import google.auth
 import google.auth.transport.requests
@@ -63,3 +63,24 @@ def log_message(conn: psycopg.Connection, user_id: UUID, direction: Literal["in"
         "INSERT INTO messages (user_id, direction, body) VALUES (%s, %s, %s)",
         (str(user_id), direction, body),
     )
+
+
+def create_raw_item(conn: psycopg.Connection, user_id: UUID, text: str) -> UUID:
+    """Inserts a new text-only RECEIVED items row — the same shape
+    ingest-svc's fresh-message path writes for a brand-new inbound SMS.
+    Used by resolver-svc when a reply arrives while an item is open but
+    the reply's content doesn't actually relate to it (agent-contracts.md
+    §3.5's relates_to_item escape hatch): rather than force the text into
+    the open item, resolver-svc gives it its own independent item, via
+    this helper plus an items-raw publish, exactly as if it had arrived
+    with no open item at all. Does not commit or publish — same
+    convention as log_message, caller owns both."""
+    item_id = uuid4()
+    conn.execute(
+        """
+        INSERT INTO items (id, user_id, raw_channel, ingested_at, state)
+        VALUES (%s, %s, 'sms', now(), 'RECEIVED')
+        """,
+        (str(item_id), str(user_id)),
+    )
+    return item_id

@@ -52,6 +52,19 @@ resource "google_pubsub_topic_iam_member" "resolver_publishes_confirmed" {
   member = "serviceAccount:${google_service_account.resolver.email}"
 }
 
+# Phase G follow-up (conversation-continuity fix, same session as step D):
+# resolver-svc's relates_to_item escape hatch (agent-contracts.md §3.5)
+# spins up a brand-new item for a reply that doesn't relate to the one it
+# was routed against, publishing to items-raw itself — the same topic only
+# ingest-svc originated before. Found as a real bug in live testing (not
+# anticipated up front): the first live test 403'd with IAM_PERMISSION_DENIED
+# the moment this publish actually ran against the deployed service account.
+resource "google_pubsub_topic_iam_member" "resolver_publishes_raw" {
+  topic  = google_pubsub_topic.pipeline["items-raw"].name
+  role   = "roles/pubsub.publisher"
+  member = "serviceAccount:${google_service_account.resolver.email}"
+}
+
 # dispatcher-svc's publish permission on items-confirmed is narrower in spirit
 # than committer's — it's the accept-a-suggestion path only (ADR 0003 applies
 # the same confirm-before-write rule here as it does to resolver-svc). IAM
