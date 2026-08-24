@@ -79,11 +79,16 @@ def _resolve_user_id(conn, phone_e164: str) -> UUID:
 
 
 def _open_conversation_item_id(conn, user_id: UUID) -> UUID | None:
+    # DUPLICATE_SUSPECTED added in step 12 — it's a waits-on-SMS-reply
+    # state exactly like the other two (state-machine.md's state
+    # reference table), and was missing here until a real dedupe
+    # question's reply would otherwise have been misrouted as a new item.
     row = conn.execute(
         """
         SELECT c.item_id FROM conversations c
         JOIN items i ON i.id = c.item_id
-        WHERE c.user_id = %s AND i.state IN ('CLARIFYING', 'AWAITING_CONFIRMATION')
+        WHERE c.user_id = %s
+          AND i.state IN ('DUPLICATE_SUSPECTED', 'CLARIFYING', 'AWAITING_CONFIRMATION')
         ORDER BY c.last_message_at DESC LIMIT 1
         """,
         (str(user_id),),

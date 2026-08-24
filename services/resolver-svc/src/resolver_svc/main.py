@@ -1,20 +1,31 @@
-"""resolver-svc — step 10: the real clarification loop, replacing step
-9's "leave incomplete items in EXTRACTED, do nothing" placeholder.
+"""resolver-svc — step 12: dedupe via embeddings, on top of step 10's
+real clarification loop and step 9's real confirmation.
 
-An item with missing_fields (in practice, always just ["due_at"] — see
-clarification.py's module docstring) now gets a real clarifying question
-via SMS instead of stalling. Up to 3 exchanges (state-machine.md §1.2);
-if still incomplete after the 3rd, the item terminates at NEEDS_REVIEW
-with no 4th question. A complete/confident item still goes straight to
-AWAITING_CONFIRMATION exactly as step 9 built it.
+state-machine.md §1.1: on entering EXTRACTED, before the completeness
+check ever runs, check for a duplicate — a cheap dedupe_hash exact match
+first (no embedding call needed), then a text-embedding-004 cosine
+search over item_embeddings for this user. similarity >= 0.92 (or an
+exact hash match) routes to DUPLICATE_SUSPECTED and asks "is this the
+same as X?" — never silently merged (ADR 0003). A 0.82-0.92 match
+against an existing *latent* is folded into the eventual confirmation
+card as a non-blocking thread-attach offer instead of its own stage.
 
-Still deliberately not built: a correction reply during
-AWAITING_CONFIRMATION (a reply that isn't Y/N) is still just logged, no
-action taken. Step 9's comment called this "step 10's job"; on closer
-look it needs its own field-targeting heuristic (agent-contracts.md
-§3.2's "cheap heuristic" paragraph) that doesn't reuse this step's
-due_at-only clarification model cleanly, so it's deferred again here,
-explicitly, rather than bolted on halfway.
+Every path that can reach AWAITING_CONFIRMATION carries a possible
+thread-attach candidate forward through conversations.resolved_fields
+(the documented scratchpad, data-model.md §2.4) under `_thread_attach_*`
+keys, since the offer is decided once at the initial dedupe check but
+may need to be rendered much later — after a full clarification
+exchange, or after the user says a dedupe match "N, it's different."
+Likewise `_dedupe_match_item_id`/`_dedupe_match_title` carry the
+matched item across the DUPLICATE_SUSPECTED Y/N round trip; there is no
+dedicated column for either, matching how `due_at` already had nowhere
+else to live pre-commit (data-model.md §2.4's original resolved bug).
+
+Still deliberately not built, carried over from step 10: a correction
+reply during AWAITING_CONFIRMATION (a reply that isn't Y/N/A) is still
+just logged, no action taken — it needs its own field-targeting
+heuristic (agent-contracts.md §3.2's "cheap heuristic" paragraph) that
+doesn't reuse the due_at-only clarification model cleanly.
 """
 
 import logging
@@ -35,9 +46,19 @@ from psycopg.types.json import Json
 from twilio.rest import Client as TwilioClient
 
 from resolver_svc.clarification import clarify
+from resolver_svc.dedupe import (
+    DedupeResult,
+    classify_match,
+    compute_dedupe_hash,
+    embed,
+    vector_literal,
+)
 from resolver_svc.templates import (
+    render_attached,
     render_cancelled,
     render_confirmation_card,
+    render_dedupe_question,
+    render_merged,
     render_needs_review,
 )
 
@@ -64,12 +85,14 @@ def _send_sms(to: str, body: str) -> None:
 
 
 def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
+    dedupe_hash = compute_dedupe_hash(extracted.title, extracted.summary)
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE items
             SET type = %s, title = %s, summary = %s, effort_minutes = %s,
-                focus_depth = %s, confidence = %s, state = %s, updated_at = now()
+                focus_depth = %s, confidence = %s, dedupe_hash = %s, state = %s,
+                updated_at = now()
             WHERE id = %s
             """,
             (
@@ -79,6 +102,7 @@ def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
                 extracted.effort_minutes,
                 extracted.focus_depth,
                 extracted.confidence,
+                dedupe_hash,
                 state,
                 str(extracted.item_id),
             ),
@@ -97,7 +121,96 @@ def _action_type(item_type: str) -> str | None:
     return "calendar" if item_type == "obligation" else None
 
 
-async def _start_clarification(extracted: ExtractedItemMessage) -> None:
+def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
+    dedupe_hash = compute_dedupe_hash(extracted.title, extracted.summary)
+
+    with get_connection() as conn:
+        exact = conn.execute(
+            "SELECT id, title FROM items "
+            "WHERE user_id = %s AND dedupe_hash = %s AND id != %s LIMIT 1",
+            (str(extracted.user_id), dedupe_hash, str(extracted.item_id)),
+        ).fetchone()
+        if exact is not None:
+            return DedupeResult(duplicate_item_id=exact[0], duplicate_title=exact[1])
+
+        vector = vector_literal(embed(extracted.title, extracted.summary))
+        match = conn.execute(
+            """
+            SELECT i.id, i.title, i.type, 1 - (e.embedding <=> %s::vector) AS similarity
+            FROM item_embeddings e JOIN items i ON i.id = e.item_id
+            WHERE i.user_id = %s
+            ORDER BY e.embedding <=> %s::vector
+            LIMIT 1
+            """,
+            (vector, str(extracted.user_id), vector),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO item_embeddings (item_id, embedding) VALUES (%s, %s::vector)",
+            (str(extracted.item_id), vector),
+        )
+        conn.commit()
+
+    if match is None:
+        return DedupeResult()
+    match_id, match_title, match_type, similarity = match
+    return classify_match(similarity, match_type, match_id, match_title)
+
+
+def _finalize_awaiting_confirmation(
+    conn, item_id, item_type, title, summary, effort_minutes, due_at_iso, thread_attach_title
+) -> str:
+    conn.execute(
+        "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
+        (str(item_id),),
+    )
+    return render_confirmation_card(
+        item_type,
+        title,
+        summary,
+        datetime.fromisoformat(due_at_iso) if due_at_iso else None,
+        effort_minutes,
+        _action_type(item_type),
+        thread_attach_title=thread_attach_title,
+    )
+
+
+async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: DedupeResult) -> None:
+    _write_item(extracted, "DUPLICATE_SUSPECTED")
+
+    resolved_fields: dict = {}
+    if extracted.due_at:
+        resolved_fields["due_at"] = extracted.due_at.isoformat()
+    resolved_fields["_dedupe_match_item_id"] = str(dedupe.duplicate_item_id)
+    resolved_fields["_dedupe_match_title"] = dedupe.duplicate_title
+    if dedupe.thread_attach_item_id:
+        resolved_fields["_thread_attach_item_id"] = str(dedupe.thread_attach_item_id)
+        resolved_fields["_thread_attach_title"] = dedupe.thread_attach_title
+
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO conversations (user_id, item_id, pending_fields, resolved_fields) "
+            "VALUES (%s, %s, %s, %s)",
+            (
+                str(extracted.user_id),
+                str(extracted.item_id),
+                extracted.missing_fields,
+                Json(resolved_fields),
+            ),
+        )
+        phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
+        conn.commit()
+
+    _send_sms(phone, render_dedupe_question(dedupe.duplicate_title))
+    logger.info(
+        "DUPLICATE_SUSPECTED item_id=%s matched_item_id=%s",
+        extracted.item_id,
+        dedupe.duplicate_item_id,
+    )
+
+
+async def _start_clarification(
+    extracted: ExtractedItemMessage, thread_attach: tuple | None = None
+) -> None:
     _write_item(extracted, "CLARIFYING")
 
     with get_connection() as conn:
@@ -112,6 +225,9 @@ async def _start_clarification(extracted: ExtractedItemMessage) -> None:
         latest_reply=None,
     )
     resolved_fields = {"due_at": result.due_at} if result.due_at_filled and result.due_at else {}
+    if thread_attach:
+        resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
+        resolved_fields["_thread_attach_title"] = thread_attach[1]
 
     with get_connection() as conn:
         conn.execute(
@@ -138,15 +254,18 @@ async def _start_clarification(extracted: ExtractedItemMessage) -> None:
     # Turn 1 always has latest_reply=None, so the model should never
     # resolve still_missing to empty here — handled anyway rather than
     # assumed, since it's one extra branch, not extra complexity.
-    _write_item(extracted, "AWAITING_CONFIRMATION")
-    body = render_confirmation_card(
-        extracted.type,
-        extracted.title,
-        extracted.summary,
-        result.due_at and datetime.fromisoformat(result.due_at),
-        extracted.effort_minutes,
-        _action_type(extracted.type),
-    )
+    with get_connection() as conn:
+        body = _finalize_awaiting_confirmation(
+            conn,
+            extracted.item_id,
+            extracted.type,
+            extracted.title,
+            extracted.summary,
+            extracted.effort_minutes,
+            result.due_at,
+            thread_attach[1] if thread_attach else None,
+        )
+        conn.commit()
     _send_sms(phone, body)
     logger.info("AWAITING_CONFIRMATION item_id=%s (resolved on first pass)", extracted.item_id)
 
@@ -160,9 +279,29 @@ async def pubsub_push(request: Request):
         logger.exception("malformed push envelope, could not decode ExtractedItemMessage")
         raise HTTPException(status_code=500, detail="malformed envelope") from None
 
+    try:
+        dedupe = _check_duplicate(extracted)
+    except Exception:
+        logger.exception("dedupe check failed item_id=%s", extracted.item_id)
+        raise HTTPException(status_code=500, detail="dedupe check failed") from None
+
+    if dedupe.duplicate_item_id is not None:
+        try:
+            await _start_duplicate_suspected(extracted, dedupe)
+        except Exception:
+            logger.exception("failed to start duplicate-suspected item_id=%s", extracted.item_id)
+            raise HTTPException(status_code=500, detail="duplicate check start failed") from None
+        return {"status": "duplicate_suspected", "item_id": str(extracted.item_id)}
+
+    thread_attach = (
+        (dedupe.thread_attach_item_id, dedupe.thread_attach_title)
+        if dedupe.thread_attach_item_id
+        else None
+    )
+
     if extracted.missing_fields:
         try:
-            await _start_clarification(extracted)
+            await _start_clarification(extracted, thread_attach)
         except Exception:
             logger.exception("failed to start clarification item_id=%s", extracted.item_id)
             raise HTTPException(status_code=500, detail="clarification start failed") from None
@@ -179,6 +318,9 @@ async def pubsub_push(request: Request):
         raise HTTPException(status_code=500, detail="db write failed") from None
 
     resolved_fields = {"due_at": extracted.due_at.isoformat()} if extracted.due_at else {}
+    if thread_attach:
+        resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
+        resolved_fields["_thread_attach_title"] = thread_attach[1]
     try:
         with get_connection() as conn:
             conn.execute(
@@ -198,6 +340,7 @@ async def pubsub_push(request: Request):
         extracted.due_at,
         extracted.effort_minutes,
         _action_type(extracted.type),
+        thread_attach_title=thread_attach[1] if thread_attach else None,
     )
     try:
         _send_sms(phone, body)
@@ -218,6 +361,7 @@ async def _handle_clarification_reply(
         (str(item_id),),
     ).fetchone()
     _pending_fields, resolved_fields, exchange_count = convo_row
+    thread_attach_title = resolved_fields.get("_thread_attach_title")
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
     result = await clarify(
@@ -263,9 +407,9 @@ async def _handle_clarification_reply(
         logger.info("NEEDS_REVIEW item_id=%s (exhausted %d exchanges)", item_id, MAX_EXCHANGES)
         return {"status": "needs_review", "item_id": str(item_id)}
 
-    conn.execute(
-        "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
-        (str(item_id),),
+    body = _finalize_awaiting_confirmation(
+        conn, item_id, item_type, title, summary, effort_minutes,
+        resolved_fields.get("due_at"), thread_attach_title,
     )
     conn.execute(
         "UPDATE conversations SET resolved_fields = %s, pending_fields = %s, "
@@ -273,18 +417,92 @@ async def _handle_clarification_reply(
         (Json(resolved_fields), [], str(item_id)),
     )
     conn.commit()
-    due_at = resolved_fields.get("due_at")
-    body = render_confirmation_card(
-        item_type,
-        title,
-        summary,
-        datetime.fromisoformat(due_at) if due_at else None,
-        effort_minutes,
-        _action_type(item_type),
-    )
     _send_sms(phone, body)
     logger.info("AWAITING_CONFIRMATION item_id=%s (clarification resolved)", item_id)
     return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+
+
+async def _handle_duplicate_reply(
+    conn, item_id, phone, tz_name, title, item_type, summary, effort_minutes, text
+) -> dict:
+    convo_row = conn.execute(
+        "SELECT pending_fields, resolved_fields FROM conversations WHERE item_id = %s "
+        "ORDER BY last_message_at DESC LIMIT 1",
+        (str(item_id),),
+    ).fetchone()
+    pending_fields, resolved_fields = convo_row
+    classification = classify_reply(text)
+
+    if classification == "Y":
+        match_title = resolved_fields.get("_dedupe_match_title") or "that item"
+        conn.execute(
+            "UPDATE items SET state = 'MERGED', updated_at = now() WHERE id = %s",
+            (str(item_id),),
+        )
+        conn.commit()
+        _send_sms(phone, render_merged(match_title))
+        logger.info(
+            "MERGED item_id=%s into=%s", item_id, resolved_fields.get("_dedupe_match_item_id")
+        )
+        return {"status": "merged", "item_id": str(item_id)}
+
+    if classification == "N":
+        # "N" proceeds to the completeness check as if no match existed
+        # (state-machine.md §1.1 point 2) — pending_fields here is the
+        # original missing_fields staged by _start_duplicate_suspected.
+        thread_attach_title = resolved_fields.get("_thread_attach_title")
+
+        if pending_fields:
+            now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+            result = await clarify(
+                session_id=f"{item_id}-0", now_local=now_local, tz_name=tz_name,
+                title=title, latest_reply=None,
+            )
+            if result.due_at_filled and result.due_at:
+                resolved_fields = {**resolved_fields, "due_at": result.due_at}
+
+            if result.question:
+                conn.execute(
+                    "UPDATE items SET state = 'CLARIFYING', updated_at = now() WHERE id = %s",
+                    (str(item_id),),
+                )
+                conn.execute(
+                    "UPDATE conversations SET exchange_count = 1, pending_fields = %s, "
+                    "resolved_fields = %s, last_message_at = now() WHERE item_id = %s",
+                    (result.still_missing, Json(resolved_fields), str(item_id)),
+                )
+                conn.commit()
+                _send_sms(phone, result.question)
+                logger.info(
+                    "CLARIFYING item_id=%s sent question 1/%d (post-dedupe)", item_id, MAX_EXCHANGES
+                )
+                return {"status": "clarifying", "item_id": str(item_id)}
+
+            body = _finalize_awaiting_confirmation(
+                conn, item_id, item_type, title, summary, effort_minutes,
+                resolved_fields.get("due_at"), thread_attach_title,
+            )
+            conn.execute(
+                "UPDATE conversations SET pending_fields = %s, resolved_fields = %s, "
+                "last_message_at = now() WHERE item_id = %s",
+                ([], Json(resolved_fields), str(item_id)),
+            )
+            conn.commit()
+            _send_sms(phone, body)
+            logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
+            return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+
+        body = _finalize_awaiting_confirmation(
+            conn, item_id, item_type, title, summary, effort_minutes,
+            resolved_fields.get("due_at"), thread_attach_title,
+        )
+        conn.commit()
+        _send_sms(phone, body)
+        logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, no missing fields)", item_id)
+        return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+
+    logger.info("dedupe reply outside Y/N, not yet handled item_id=%s text=%r", item_id, text)
+    return {"status": "unhandled_reply", "item_id": str(item_id)}
 
 
 @app.post("/reply")
@@ -299,6 +517,12 @@ async def reply(payload: RoutedReplyMessage):
                 raise HTTPException(status_code=404, detail="unknown item_id")
             item_type, title, summary, effort_minutes, state = item_row
             phone, tz_name = _user_phone_and_timezone(conn, payload.user_id)
+
+            if state == "DUPLICATE_SUSPECTED":
+                return await _handle_duplicate_reply(
+                    conn, payload.item_id, phone, tz_name, title, item_type, summary,
+                    effort_minutes, payload.text,
+                )
 
             if state == "CLARIFYING":
                 return await _handle_clarification_reply(
@@ -357,6 +581,30 @@ async def reply(payload: RoutedReplyMessage):
                 _send_sms(phone, render_cancelled())
                 logger.info("CANCELLED item_id=%s (real N reply)", payload.item_id)
                 return {"status": "cancelled", "item_id": str(payload.item_id)}
+
+            if classification == "ATTACH":
+                convo_row = conn.execute(
+                    "SELECT resolved_fields FROM conversations WHERE item_id = %s "
+                    "ORDER BY last_message_at DESC LIMIT 1",
+                    (str(payload.item_id),),
+                ).fetchone()
+                resolved_fields = convo_row[0] if convo_row else {}
+                target_id = resolved_fields.get("_thread_attach_item_id")
+                target_title = resolved_fields.get("_thread_attach_title")
+                if target_id:
+                    conn.execute(
+                        "UPDATE items SET parent_item_id = %s, updated_at = now() WHERE id = %s",
+                        (target_id, str(payload.item_id)),
+                    )
+                    conn.commit()
+                    _send_sms(phone, render_attached(target_title))
+                    logger.info(
+                        "thread-attached item_id=%s to=%s", payload.item_id, target_id
+                    )
+                    return {"status": "attached", "item_id": str(payload.item_id)}
+                # No candidate on record for this item — falls through to
+                # the generic unhandled-reply logging below, same as any
+                # other stray text during AWAITING_CONFIRMATION.
     except HTTPException:
         raise
     except Exception:

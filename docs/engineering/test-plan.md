@@ -266,20 +266,25 @@ Test files across `ingest-svc`/`extractor-svc` are named `test_ingest_*`/`test_e
 
 ## Step 12 — Dedupe via embeddings
 
+Also required, found while building this step for real (not named in the step's one-line description, same category as step 9's ingest-svc routing prerequisite): `ingest-svc`'s open-conversation routing check only listed `CLARIFYING`/`AWAITING_CONFIRMATION`, missing `DUPLICATE_SUSPECTED` — a real gap, since a reply to "is this the same as X?" would otherwise have been misrouted as a brand-new item. Fixed in `ingest-svc/main.py`'s `_open_conversation_item_id()`.
+
 **Acceptance criteria**
 - `dedupe_hash` exact-match catches identical resends **without** an embedding API call (assert the mocked embedding client is not invoked in that case).
-- `similarity ≥ 0.92` → `DUPLICATE_SUSPECTED`; `Y` → `MERGED`, no new `obligations`/`latents` row; `N` → proceeds as if no match.
-- `0.82–0.92` against an existing latent → thread-attach offer, non-blocking.
+- `similarity ≥ 0.92` → `DUPLICATE_SUSPECTED`; `Y` → `MERGED`, no new `obligations`/`latents` row; `N` → proceeds as if no match (straight to `AWAITING_CONFIRMATION`, or back into the clarification loop if fields are still missing).
+- `0.82–0.92` against an existing latent → thread-attach offer, non-blocking, rides on the eventual confirmation card; `A` reply sets `items.parent_item_id`.
 - Below `0.82` → no dedupe action (regression against false positives).
 
-**Unit tests** (`services/resolver-svc/tests/test_dedupe.py`)
-- `test_dedupe_hash_normalizes_case_and_whitespace`.
-- `test_similarity_boundary_at_0_92` / `test_similarity_boundary_at_0_82` — fixture embedding pairs at and just past each threshold.
+**Unit tests** (`services/resolver-svc/tests/test_dedupe.py` — pure, no DB/embedding API)
+- `test_dedupe_hash_normalizes_case_and_whitespace` / `test_dedupe_hash_differs_for_different_content`.
+- `test_similarity_boundary_at_0_92` / `test_similarity_boundary_at_0_82` — `classify_match()` at and just past each threshold.
+- `test_thread_attach_band_ignored_for_obligation_match`, `test_below_thread_attach_threshold_no_action`, plus `cosine_similarity()` sanity checks (identical/orthogonal/near-duplicate fixture vectors).
+- `services/resolver-svc/tests/test_resolver.py` also covers the full routing integration with the DB/Twilio mocked: a duplicate short-circuits before the completeness check even for an item with `missing_fields` set; `Y`/`N` during `DUPLICATE_SUSPECTED`; the `A` (attach) reply during `AWAITING_CONFIRMATION`, with and without a candidate on record.
 
-**Integration tests** (Pub/Sub emulator + local Postgres with `pgvector`)
-- `test_near_duplicate_caught` / `test_dissimilar_item_not_caught`.
+**Integration tests** (`services/resolver-svc/tests/test_dedupe_integration.py`, real Postgres + pgvector; the embedding call itself is mocked to a controlled fixture vector, matching how `clarify()` is mocked elsewhere)
+- `test_exact_hash_match_skips_embedding_call` — a real `dedupe_hash` lookup against a real seeded row.
+- `test_near_duplicate_caught` / `test_dissimilar_item_not_caught` — real pgvector `<=>` cosine search against a real seeded `item_embeddings` row.
 
-**Manual verification:** send a genuine near-duplicate (differently worded) real message; confirm the dedupe prompt appears.
+**Manual verification:** a real near-duplicate obligation, sent as text via a real signed webhook to the deployed `ingest-svc` (matching the established real-infra-verification pattern from steps 9-10 — see status.md for what was actually run and its result).
 
 ---
 
