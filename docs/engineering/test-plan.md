@@ -92,11 +92,13 @@ Test files live in each service's `tests/` directory, or `shared/tests/` for any
 - An item with **non-empty** `missing_fields` is left in `EXTRACTED` and logged, not force-confirmed — this step proves the happy path only, it doesn't pretend to solve incomplete items.
 - Every auto-confirm is logged distinctly (e.g. `"AUTO-CONFIRMED (stub, no gate) item_id=..."`) so it's unmistakable in Cloud Logging that this is temporary scaffolding, not the real gate.
 
-**Unit tests** (`services/resolver-svc/tests/test_stub.py`)
-- `test_complete_item_auto_confirms`.
-- `test_incomplete_item_left_in_extracted` — `missing_fields` non-empty → no publish, no state change beyond logging.
+**Unit tests** (`services/resolver-svc/tests/test_stub.py`, DB + Pub/Sub mocked)
+- `test_complete_item_auto_confirms` — extracted fields written to `items` with `state='CONFIRMED'`, `ConfirmedItemMessage` published with `action_type="calendar"`.
+- `test_latent_confirms_with_no_action_type` — a `type="latent"` item publishes with `action_type=None`, per `agent-contracts.md` §1.
+- `test_incomplete_item_left_in_extracted` — `missing_fields` non-empty → fields still written (the "progress" update) but `state='EXTRACTED'`, no publish.
+- `test_malformed_envelope_returns_500_for_retry` / `test_db_write_failure_returns_500_for_retry` / `test_publish_failure_returns_500_for_retry` — each failure mode surfaces as a 500 so Pub/Sub retries.
 
-**Integration tests:** `test_extracted_to_confirmed_stub` (Pub/Sub emulator) — publish a complete `ExtractedItemMessage`, assert `ConfirmedItemMessage` appears.
+**Integration test** (`test_resolver_integration.py`, real Pub/Sub emulator + real dev Postgres via the Cloud SQL Auth Proxy) — `test_extracted_to_confirmed_stub`: publish a complete `ExtractedItemMessage`, assert the `items` row is `CONFIRMED` with the right title, and `ConfirmedItemMessage` is pulled back on `items.confirmed`.
 
 ---
 
