@@ -548,16 +548,38 @@ wheels = [
 name = "dispatcher-svc"
 version = "0.1.0"
 source = { editable = "services/dispatcher-svc" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "google-auth" },
+    { name = "google-cloud-secret-manager" },
+    { name = "obligation-engine-shared" },
+    { name = "requests" },
+    { name = "twilio" },
+    { name = "uvicorn", extra = ["standard"] },
+]
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx2" },
     { name = "pytest" },
 ]
 
 [package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "google-auth", specifier = ">=2.35" },
+    { name = "google-cloud-secret-manager", specifier = ">=2.20" },
+    { name = "obligation-engine-shared", editable = "shared" },
+    { name = "requests", specifier = ">=2.32" },
+    { name = "twilio", specifier = ">=9.3" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
+]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8.3" }]
+dev = [
+    { name = "httpx2" },
+    { name = "pytest", specifier = ">=8.3" },
+]
 
 [[package]]
 name = "distro"

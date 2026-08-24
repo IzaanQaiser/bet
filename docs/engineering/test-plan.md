@@ -158,21 +158,31 @@ The cleanest step to test — no I/O, and `capacity-engine.md` §6 already hands
 
 ## Step 8 — `dispatcher-svc`
 
+Deliberately NOT built here: parsing a `Y`/`N`/`Later` reply to a sent suggestion, or any latent-lifecycle transition out of `SURFACED` (state-machine.md §2.2) — that's a different concern from *sending* the suggestion, and belongs with the feedback-loop step. A sent suggestion just sits as a `suggestions` row with `outcome IS NULL` until that step exists. Two window/trigger decisions this step had to make that weren't specified anywhere — see `capacity-engine.md` §1's "Resolved gap" note (the 7-day/14-day windows are both inclusive of today) and `agent-contracts.md` §4.1's "Resolved gap" note (exactly when a reminder fires).
+
 **Acceptance criteria**
 - `/dispatch`, invoked manually, computes and persists exactly 7 `capacity_snapshots` rows (one per day) from real Calendar reads.
 - Reminders are idempotent: an obligation already reminded (`reminder_sent_at` set) is never reminded twice, even if `/dispatch` runs twice in a row.
 - Never more than one suggestion sent per run, even with multiple latents clearing the threshold.
 - Suggestion text matches `agent-contracts.md` §4.2 exactly, including all three evidence-line branches (superlative / "lighter than usual" / omitted).
+- Exactly two Calendar API reads per user per run (`infrastructure.md` §4's quota assumption) — not one per day.
 
-**Unit tests** (`services/dispatcher-svc/tests/test_dispatcher.py`)
-- `test_reminder_not_resent_if_already_sent`.
-- `test_suggestion_text_superlative_branch` / `test_suggestion_text_lighter_than_usual_branch` / `test_suggestion_text_omitted_branch` — fixed snapshot fixtures, assert exact rendered string for each.
+**Unit tests** (`services/dispatcher-svc/tests/test_templates.py` — pure template rendering, split out from the DB/SMS orchestration since it has no dependencies on either)
+- `test_render_reminder_exact_format`.
+- `test_suggestion_text_superlative_branch` / `test_suggestion_text_lighter_than_usual_branch` / `test_suggestion_text_omitted_branch` / `test_render_suggestion_full_worked_example` — fixed fixtures, assert exact rendered string for each.
 
-**Integration tests** (Pub/Sub emulator + local Postgres, Calendar + Twilio mocked)
+**Unit tests** (`services/dispatcher-svc/tests/test_dispatcher.py` — DB and Twilio mocked)
+- `test_reminder_not_resent_if_already_sent` / `test_reminder_sent_when_due_marks_reminder_sent_at`.
+- `test_compute_day_reproduces_worked_example` — real Calendar events in, exact §6 numbers out.
+- `test_eligible_latents_maps_rows_to_local_dates` — a `created_at` near a local-midnight boundary must map to the correct local calendar day, not the UTC one.
+- `test_send_suggestion_returns_false_when_no_candidate_clears_threshold` / `test_send_suggestion_sends_exactly_one_and_writes_rows`.
+
+**Integration tests** (`test_dispatcher_integration.py`, real dev Postgres via Cloud SQL Auth Proxy; Calendar + Twilio mocked — no Pub/Sub emulator needed, dispatcher-svc doesn't publish in this step's scope)
 - `test_dispatch_run_produces_7_snapshots`.
-- `test_dispatch_run_sends_at_most_one_suggestion` — fixture with multiple latents clearing threshold, assert exactly one SMS captured by the mocked Twilio client.
+- `test_dispatch_run_sends_at_most_one_suggestion` — two latents that would each independently clear threshold, assert exactly one suggestion SMS and one `suggestions` row.
+- `test_dispatch_run_sends_reminder_and_marks_idempotent` — runs `/dispatch` twice against the same due obligation, second run sends nothing.
 
-**Manual verification:** real `/dispatch` trigger against a real calendar — this is the literal PRD §13 demo segment ("manually trigger the dispatcher").
+**Manual verification:** real `/dispatch` trigger against a real calendar (`scripts/dispatch-now.sh`) — this is the literal PRD §13 demo segment ("manually trigger the dispatcher").
 
 ---
 

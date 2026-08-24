@@ -122,6 +122,19 @@ def test_load_delta_cold_start_below_3_days():
     assert load_delta(booked_today=200, trailing_booked_minutes=[100, 200]) is None
 
 
+def test_load_delta_zero_rolling_mean_empty_baseline_is_neutral():
+    """A genuinely empty trailing calendar (rolling_mean=0) would divide
+    by zero unhandled — found for real on step 8's first live /dispatch
+    run against the demo account's empty Calendar history."""
+    assert load_delta(booked_today=0, trailing_booked_minutes=[0] * 14) == 0.0
+
+
+def test_load_delta_zero_rolling_mean_any_booking_reads_as_maximally_busy():
+    delta = load_delta(booked_today=30, trailing_booked_minutes=[0] * 14)
+    assert delta == 1.0
+    assert load_fit(delta) == 0.0
+
+
 def test_booked_minutes():
     assert booked_minutes(WH_START, WH_END, free_min=330) == 210  # 540 - 330
 

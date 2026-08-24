@@ -216,6 +216,8 @@ Not specified in the PRD; added here because a conversation that just stops with
 ```
 `{relative_due_description}` is `"today"`, `"tomorrow"`, or `"in {N} days"` — computed from `obligations.due_at` and `obligations.reminder_window_hours`, not from the LLM.
 
+**Resolved gap, found in step 8: when does a reminder actually fire?** The column existing doesn't say. Decided: a reminder fires the first `/dispatch` run where `now + reminder_window_hours >= due_at` and `reminder_sent_at IS NULL` — i.e. the moment the obligation enters its reminder window, checked on whatever cadence the dispatcher runs (twice daily, `infrastructure.md` §5). `{relative_due_description}` is a separate, purely calendar-day calculation (`due_at`'s local date minus today's local date) — an obligation can be firmly "in the window" by the hour-based rule while still rendering as `"tomorrow"`, and that's correct, not a bug: the two computations answer different questions (should a reminder fire at all vs. how to describe the date in it).
+
 ### 4.2 Suggestion — exact rendering, ties to `capacity-engine.md` §6
 
 ```

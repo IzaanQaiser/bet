@@ -15,6 +15,8 @@ Owned here: how a `capacity_snapshots` row gets computed from raw Calendar data,
 
 All time arithmetic happens in the user's local timezone, converted at the Calendar API boundary. A day is always the user's local calendar day, not UTC.
 
+**Resolved gap, found in step 8: are "next 7 days" and "trailing 14 days" inclusive of today?** Neither phrase says. Decided: both windows include today — the forward window is `[today, today+6]`, the trailing window is `[today-13, today]`. Today is a legitimate scoring candidate (the dispatcher runs at both 7am, before the working day starts, and 1pm, mid-day — a live demo trigger at any hour should still be able to surface a same-day suggestion), and "ending today" in the trailing-window phrasing reads most literally as today being the last of the 14 days, not the 14 days strictly before it. One consequence, accepted rather than engineered around: when today itself is being scored as a forward candidate, its own `booked_minutes` is also one of the 14 values feeding its `load_delta` baseline — a minor self-reference, not worth a special case for a single-digit percentage effect on one metric.
+
 ---
 
 ## 2. Building free/busy intervals from Calendar events
@@ -63,6 +65,8 @@ rolling_mean = mean(booked_minutes(d) for d in trailing_14_days)
 ```
 
 **Cold start:** if fewer than 3 days of Calendar history exist (brand-new account, Calendar API returns nothing further back), `load_delta` is undefined and `load_fit` (§4) defaults to `0.5` (neutral — neither rewards nor penalizes) until 3+ days of history accumulate. 3 was chosen, not 14, because Calendar history predates the user texting the bot at all — real accounts will almost never hit this path; it exists only to keep the very first run well-defined.
+
+**Resolved gap, found in step 8's real deploy: `rolling_mean = 0`.** A distinct edge case from cold start — the trailing 14 days exist and were read, they're just genuinely empty (a brand-new demo Calendar with zero events yet), so `rolling_mean` is exactly `0` and the formula's division is undefined. Hit for real on the very first live `/dispatch` run, not a hypothetical. Decided: `load_delta = 0.0` if today is also empty (`booked_today = 0` — matches the baseline exactly, neutral, same as any other `load_delta = 0` day), otherwise `load_delta = 1.0` (any booked time against a fully-empty baseline reads as maximally busier-than-usual, which `load_fit` already clips to its `0.0` floor for any `load_delta ≥ 0.4` — so `1.0` isn't an arbitrary sentinel, it's just comfortably past that clip point).
 
 ---
 

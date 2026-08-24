@@ -158,6 +158,62 @@ case "$SERVICE" in
 
     setup_push_subscription "items-confirmed-committer-push" "items-confirmed" "items-confirmed-dlq"
     ;;
+  dispatcher-svc)
+    echo "Deploying ${SERVICE}..."
+    # No Pub/Sub push subscription — dispatcher-svc is cron/manually
+    # triggered (POST /dispatch), not a topic consumer. Twilio outbound
+    # send needs the API Key secret (infrastructure.md §4.1); Calendar
+    # read needs the same OAuth client as committer-svc.
+    gcloud run deploy "$SERVICE" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --image="$IMAGE" \
+      --service-account="$SA" \
+      --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
+      --set-env-vars="DB_USER=sa-dispatcher@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}" \
+      --set-secrets="GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest,TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
+      --min-instances=0 \
+      --no-allow-unauthenticated \
+      --account=waslyrideshare@gmail.com
+
+    SERVICE_URL=$(gcloud run services describe "$SERVICE" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
+    # Cloud Scheduler jobs need the live URL, same "needs the service to
+    # exist first" reasoning as setup_push_subscription — not Terraform,
+    # per infrastructure.md §6's "Resolved gap" note (extended here to
+    # cover Scheduler jobs, not just push subscriptions). OIDC identity is
+    # sa-dispatcher itself, same pattern as the push subscriptions: mint
+    # the token as the consuming service's own SA, not a separate one.
+    echo "Granting ${SA} run.invoker on ${SERVICE} (for Cloud Scheduler)..."
+    gcloud run services add-iam-policy-binding "$SERVICE" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --member="serviceAccount:${SA}" --role="roles/run.invoker" \
+      --account=waslyrideshare@gmail.com
+
+    for job in dispatch-daily:"0 7 * * *" dispatch-midday:"0 13 * * *"; do
+      job_name="${job%%:*}"
+      job_cron="${job#*:}"
+      echo "Creating/updating ${job_name}..."
+      if gcloud scheduler jobs describe "$job_name" \
+        --project="$PROJECT_ID" --location="$REGION" --account=waslyrideshare@gmail.com >/dev/null 2>&1; then
+        gcloud scheduler jobs update http "$job_name" \
+          --project="$PROJECT_ID" --location="$REGION" \
+          --schedule="$job_cron" --time-zone="America/Toronto" \
+          --uri="${SERVICE_URL}/dispatch" --http-method=POST \
+          --oidc-service-account-email="$SA" \
+          --account=waslyrideshare@gmail.com
+      else
+        gcloud scheduler jobs create http "$job_name" \
+          --project="$PROJECT_ID" --location="$REGION" \
+          --schedule="$job_cron" --time-zone="America/Toronto" \
+          --uri="${SERVICE_URL}/dispatch" --http-method=POST \
+          --oidc-service-account-email="$SA" \
+          --account=waslyrideshare@gmail.com
+      fi
+    done
+    ;;
   *)
     echo "No deploy config yet for ${SERVICE} — add a case in scripts/deploy.sh." >&2
     exit 1
