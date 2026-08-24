@@ -214,7 +214,7 @@ def test_y_reply_no_capacity_left_dismisses_instead(client):
     assert resp.json()["status"] == "no_capacity"
     mock_publish.assert_not_called()
     mock_sms.assert_called_once()
-    assert "filled up" in mock_sms.call_args.args[1]
+    assert "filled up" in mock_sms.call_args.args[2]
 
 
 def test_other_reply_logged_not_acted_on(client):

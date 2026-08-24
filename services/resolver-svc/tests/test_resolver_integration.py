@@ -174,7 +174,7 @@ def test_n_reply_cancels_no_publish(client, awaiting_confirmation_item):
         )
     assert resp.status_code == 200
     assert resp.json() == {"status": "cancelled", "item_id": str(item_id)}
-    mock_sms.assert_called_once_with(phone, "Cancelled.")
+    mock_sms.assert_called_once_with(user_id, phone, "Cancelled.")
 
     with get_connection() as conn:
         state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
@@ -271,7 +271,7 @@ def test_three_exchange_exhaustion_reaches_needs_review(client, received_item):
 
     assert resp.json()["status"] == "needs_review"
     assert mock_sms.call_count == 4  # 3 questions + 1 terminal message, not a 4th question
-    assert "couldn't get all the details" in mock_sms.call_args.args[1]
+    assert "couldn't get all the details" in mock_sms.call_args.args[2]
 
     with get_connection() as conn:
         state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]

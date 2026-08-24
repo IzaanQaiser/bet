@@ -58,7 +58,7 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
-from obligation_engine_shared.db import get_connection
+from obligation_engine_shared.db import get_connection, log_message
 from obligation_engine_shared.pubsub import decode_push_envelope, publish
 from obligation_engine_shared.reply_classifier import classify_reply
 from obligation_engine_shared.schemas import (
@@ -104,8 +104,16 @@ def _twilio_client() -> TwilioClient:
     return TwilioClient(TWILIO_API_KEY_SID, os.environ["TWILIO_API_KEY_SECRET"], TWILIO_ACCOUNT_SID)
 
 
-def _send_sms(to: str, body: str) -> None:
+def _send_sms(user_id, to: str, body: str) -> None:
+    """Sends, then logs to the messages table (migrations/0007) in its own
+    short transaction, decoupled from whatever transaction the caller is
+    mid-way through — the SMS really was sent regardless of what the
+    caller's transaction later does, so the log entry shouldn't be tied to
+    its commit/rollback."""
     _twilio_client().messages.create(to=to, from_=TWILIO_FROM_NUMBER, body=body)
+    with get_connection() as log_conn:
+        log_message(log_conn, user_id, "out", body)
+        log_conn.commit()
 
 
 def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
@@ -184,7 +192,7 @@ async def _handle_chat(extracted: ExtractedItemMessage) -> None:
         phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
         conn.commit()
 
-    _send_sms(phone, extracted.chat_reply or "hey")
+    _send_sms(extracted.user_id, phone, extracted.chat_reply or "hey")
     logger.info("CHATTED item_id=%s", extracted.item_id)
 
 
@@ -268,7 +276,7 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
         phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
         conn.commit()
 
-    _send_sms(phone, render_dedupe_question(dedupe.duplicate_title))
+    _send_sms(extracted.user_id, phone, render_dedupe_question(dedupe.duplicate_title))
     logger.info(
         "DUPLICATE_SUSPECTED item_id=%s matched_item_id=%s",
         extracted.item_id,
@@ -320,7 +328,7 @@ async def _start_clarification(
         conn.commit()
 
     if result.question:
-        _send_sms(phone, result.question)
+        _send_sms(extracted.user_id, phone, result.question)
         logger.info("CLARIFYING item_id=%s sent question 1/%d", extracted.item_id, MAX_EXCHANGES)
         return
 
@@ -339,7 +347,7 @@ async def _start_clarification(
             thread_attach[1] if thread_attach else None,
         )
         conn.commit()
-    _send_sms(phone, body)
+    _send_sms(extracted.user_id, phone, body)
     logger.info("AWAITING_CONFIRMATION item_id=%s (resolved on first pass)", extracted.item_id)
 
 
@@ -452,7 +460,7 @@ async def pubsub_push(request: Request):
         thread_attach_title=thread_attach[1] if thread_attach else None,
     )
     try:
-        _send_sms(phone, body)
+        _send_sms(extracted.user_id, phone, body)
     except Exception:
         logger.exception("failed to send confirmation card item_id=%s", extracted.item_id)
         raise HTTPException(status_code=500, detail="sms send failed") from None
@@ -462,7 +470,7 @@ async def pubsub_push(request: Request):
 
 
 async def _handle_clarification_reply(
-    conn, item_id, phone, tz_name, title, item_type, summary, effort_minutes, latest_reply
+    conn, user_id, item_id, phone, tz_name, title, item_type, summary, effort_minutes, latest_reply
 ) -> dict:
     convo_row = conn.execute(
         "SELECT pending_fields, resolved_fields, exchange_count FROM conversations "
@@ -499,7 +507,7 @@ async def _handle_clarification_reply(
                 (next_count, result.still_missing, Json(resolved_fields), str(item_id)),
             )
             conn.commit()
-            _send_sms(phone, result.question)
+            _send_sms(user_id, phone, result.question)
             logger.info(
                 "CLARIFYING item_id=%s sent question %d/%d", item_id, next_count, MAX_EXCHANGES
             )
@@ -515,7 +523,7 @@ async def _handle_clarification_reply(
             (Json(resolved_fields), str(item_id)),
         )
         conn.commit()
-        _send_sms(phone, render_needs_review(title))
+        _send_sms(user_id, phone, render_needs_review(title))
         logger.info("NEEDS_REVIEW item_id=%s (exhausted %d exchanges)", item_id, MAX_EXCHANGES)
         return {"status": "needs_review", "item_id": str(item_id)}
 
@@ -529,13 +537,13 @@ async def _handle_clarification_reply(
         (Json(resolved_fields), [], str(item_id)),
     )
     conn.commit()
-    _send_sms(phone, body)
+    _send_sms(user_id, phone, body)
     logger.info("AWAITING_CONFIRMATION item_id=%s (clarification resolved)", item_id)
     return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
 
 async def _handle_duplicate_reply(
-    conn, item_id, phone, tz_name, title, item_type, summary, effort_minutes, text
+    conn, user_id, item_id, phone, tz_name, title, item_type, summary, effort_minutes, text
 ) -> dict:
     convo_row = conn.execute(
         "SELECT pending_fields, resolved_fields FROM conversations WHERE item_id = %s "
@@ -552,7 +560,7 @@ async def _handle_duplicate_reply(
             (str(item_id),),
         )
         conn.commit()
-        _send_sms(phone, render_merged(match_title))
+        _send_sms(user_id, phone, render_merged(match_title))
         logger.info(
             "MERGED item_id=%s into=%s", item_id, resolved_fields.get("_dedupe_match_item_id")
         )
@@ -586,7 +594,7 @@ async def _handle_duplicate_reply(
                     (result.still_missing, Json(resolved_fields), str(item_id)),
                 )
                 conn.commit()
-                _send_sms(phone, result.question)
+                _send_sms(user_id, phone, result.question)
                 logger.info(
                     "CLARIFYING item_id=%s sent question 1/%d (post-dedupe)", item_id, MAX_EXCHANGES
                 )
@@ -602,7 +610,7 @@ async def _handle_duplicate_reply(
                 ([], Json(resolved_fields), str(item_id)),
             )
             conn.commit()
-            _send_sms(phone, body)
+            _send_sms(user_id, phone, body)
             logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
             return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
@@ -611,7 +619,7 @@ async def _handle_duplicate_reply(
             resolved_fields, thread_attach_title,
         )
         conn.commit()
-        _send_sms(phone, body)
+        _send_sms(user_id, phone, body)
         logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, no missing fields)", item_id)
         return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
@@ -634,13 +642,14 @@ async def reply(payload: RoutedReplyMessage):
 
             if state == "DUPLICATE_SUSPECTED":
                 return await _handle_duplicate_reply(
-                    conn, payload.item_id, phone, tz_name, title, item_type, summary,
-                    effort_minutes, payload.text,
+                    conn, payload.user_id, payload.item_id, phone, tz_name, title, item_type,
+                    summary, effort_minutes, payload.text,
                 )
 
             if state == "CLARIFYING":
                 return await _handle_clarification_reply(
                     conn,
+                    payload.user_id,
                     payload.item_id,
                     phone,
                     tz_name,
@@ -693,7 +702,7 @@ async def reply(payload: RoutedReplyMessage):
                     (str(payload.item_id),),
                 )
                 conn.commit()
-                _send_sms(phone, render_cancelled())
+                _send_sms(payload.user_id, phone, render_cancelled())
                 logger.info("CANCELLED item_id=%s (real N reply)", payload.item_id)
                 return {"status": "cancelled", "item_id": str(payload.item_id)}
 
@@ -712,7 +721,7 @@ async def reply(payload: RoutedReplyMessage):
                         (target_id, str(payload.item_id)),
                     )
                     conn.commit()
-                    _send_sms(phone, render_attached(target_title))
+                    _send_sms(payload.user_id, phone, render_attached(target_title))
                     logger.info(
                         "thread-attached item_id=%s to=%s", payload.item_id, target_id
                     )

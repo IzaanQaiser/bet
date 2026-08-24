@@ -35,7 +35,7 @@ from fastapi import FastAPI, HTTPException, Request
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
 from google.oauth2.id_token import fetch_id_token
-from obligation_engine_shared.db import get_connection
+from obligation_engine_shared.db import get_connection, log_message
 from obligation_engine_shared.pubsub import publish
 from obligation_engine_shared.schemas import RawItemMessage
 from twilio.request_validator import RequestValidator
@@ -168,6 +168,8 @@ async def sms_webhook(request: Request):
 
     with get_connection() as conn:
         user_id = _resolve_user_id(conn, from_number)
+        log_message(conn, user_id, "in", text or "")
+        conn.commit()
         open_item_id = _open_conversation_item_id(conn, user_id)
         open_suggestion_item_id = None if open_item_id is not None else _open_suggestion_item_id(
             conn, user_id

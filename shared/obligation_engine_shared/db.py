@@ -17,6 +17,8 @@ during step 3's first live deploy, worth being explicit about:
 """
 
 import os
+from typing import Literal
+from uuid import UUID
 
 import google.auth
 import google.auth.transport.requests
@@ -47,3 +49,17 @@ def get_connection() -> psycopg.Connection:
     host = os.environ.get("DB_HOST", "127.0.0.1")
     port = int(os.environ.get("DB_PORT", "5433"))
     return psycopg.connect(dbname=dbname, user=user, password="x", host=host, port=port)
+
+
+def log_message(conn: psycopg.Connection, user_id: UUID, direction: Literal["in", "out"], body: str) -> None:
+    """Appends one row to the messages table (migrations/0007_messages_table.sql)
+    — the durable, both-directions log Phase G's tone-mirroring reads from
+    (agent-contracts.md §3). Reused verbatim by ingest-svc (inbound),
+    resolver-svc and dispatcher-svc (outbound) — one implementation, not
+    three copies that could drift. Does not commit; caller's existing
+    transaction boundary owns that, same convention as every other write in
+    this codebase."""
+    conn.execute(
+        "INSERT INTO messages (user_id, direction, body) VALUES (%s, %s, %s)",
+        (str(user_id), direction, body),
+    )
