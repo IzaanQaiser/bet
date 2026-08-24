@@ -99,7 +99,10 @@ case "$SERVICE" in
     # (state-machine.md §4). The run.invoker grant that lets sa-ingest
     # actually call it lives in resolver-svc's own case below, matching
     # the "this resource's case fully describes its own finished IAM
-    # state" pattern setup_push_subscription already uses.
+    # state" pattern setup_push_subscription already uses. Step 11 adds
+    # TWILIO_ACCOUNT_SID (plain config, not a secret — same treatment as
+    # every other Twilio identifier, infrastructure.md §4.1) for
+    # authenticating the MMS media download from Twilio.
     RESOLVER_SVC_URL=$(gcloud run services describe resolver-svc \
       --project="$PROJECT_ID" --region="$REGION" \
       --format='value(status.url)' --account=waslyrideshare@gmail.com)
@@ -110,7 +113,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL}" \
+      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL},TWILIO_ACCOUNT_SID=AC3292d4a7944b87b2fe3db562856e32bd" \
       --set-secrets="TWILIO_AUTH_TOKEN=twilio-auth-token:latest" \
       --min-instances=0 \
       --allow-unauthenticated \

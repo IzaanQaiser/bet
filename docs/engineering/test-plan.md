@@ -244,17 +244,21 @@ Also extended (`test_resolver.py`): `test_missing_fields_starts_clarification_no
 
 ## Step 11 — Multimodal ingest
 
+Test files across `ingest-svc`/`extractor-svc` are named `test_ingest_*`/`test_extractor_*` (not the plain `test_media.py`/`test_media_integration.py` this section originally named) — pytest's module-identity check collides on identical basenames across services when the whole suite runs from the repo root in one invocation (neither service's `tests/` has an `__init__.py`, matching this project's convention), found running the full suite after adding these files.
+
 **Acceptance criteria**
 - MMS with image/PDF: media persisted to GCS at the correct `raw_media_uri`, correct MIME type, `extractor-svc` passes bytes to Gemini and produces a valid extraction.
 - An unsupported attachment type is rejected with a clear error, not silently dropped.
 - Text-only path (steps 3–4) has no regression.
 
 **Unit tests**
-- `services/ingest-svc/tests/test_media.py` — `test_mime_type_routing` (image/PDF/unsupported).
+- `services/ingest-svc/tests/test_ingest_media.py` — supported types (jpeg/png/gif/webp/pdf) processed and stored; unsupported type → 400, no DB write, no download attempt; text-only has no media, no GCS call; a download failure surfaces as 500 before any items row exists (media is fetched *before* the INSERT, not after — a failed download leaves nothing behind for Twilio's retry to duplicate).
+- `services/extractor-svc/tests/test_extractor_media.py` — a `media_uri` gets downloaded and passed as a second `Part` alongside the text `Part`; text-only sends a single `Part` with no GCS call; a non-`gs://` URI is rejected outright.
 
-**Integration tests**
-- `test_mms_end_to_end` — synthetic MMS payload with fixture image → GCS upload → `items.raw` → mocked-Gemini extraction → `items.extracted`.
-- `test_text_only_regression` — rerun step 3/4's integration tests, confirm unaffected.
+**Integration tests** (real Pub/Sub emulator + the real GCS media bucket; only the Twilio media fetch and the Gemini call are mocked — everything else is genuinely live)
+- `services/ingest-svc/tests/test_ingest_media_integration.py::test_mms_stores_media_in_real_gcs_and_publishes` — the uploaded object is read back from real GCS afterward to confirm the bytes actually match, not just that the client method was called.
+- `services/extractor-svc/tests/test_extractor_media_integration.py::test_downloads_real_gcs_object_and_extracts` — a real fixture image uploaded directly to GCS, downloaded for real by `extractor-svc`'s own code path.
+- Text-only regression: covered by rerunning the full `services/` suite, not a separate test — steps 3/4's existing tests are unmodified and still pass.
 
 **Manual verification:** one real photographed note, one real screenshot, both via actual MMS.
 
@@ -280,6 +284,8 @@ Also extended (`test_resolver.py`): `test_missing_fields_starts_clarification_no
 ---
 
 ## Step 13 — DLQ + error handling
+
+**Known real finding to address here** (found during step 11's live MMS verification, not a step 13 regression): concurrent Pub/Sub redelivery of the same `items-extracted` message during a slow cold start raced `resolver-svc`'s `_start_clarification` — the ADK `InMemorySessionService`'s deterministic `{item_id}-0` session id isn't safe against two in-flight handlers for the same item, so the losing redelivery(s) hit `AlreadyExistsError` and 500. Harmless in the observed case (the winning request had already sent the one real SMS before the duplicates arrived), but this is exactly the kind of non-idempotency this step's acceptance criteria should cover — add a case for it alongside the DLQ/replay tests below.
 
 **Acceptance criteria**
 - Every subscription has a dead-letter policy (`max_delivery_attempts=5` — Pub/Sub's actual minimum, found empirically in step 4; the API rejects anything below 5) pointing at the correct `.dlq` topic (`gcloud pubsub subscriptions describe`).
