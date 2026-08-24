@@ -15,9 +15,11 @@ That leaves exactly two LLM call sites in the whole system:
 | Extraction | `extractor-svc` | Raw input → structured item | Yes, strict schema |
 | Clarification | `resolver-svc` | Merge a reply into missing fields + write the next question | Yes, strict schema |
 
-Everything else user-facing — the dedupe question, the confirmation card, the thread-attach offer, terminal messages (`CANCELLED`/`MERGED`/`NEEDS_REVIEW`), reminders, and suggestions — is a deterministic Python template. This is worth stating explicitly in the demo: the LLM surface area is two narrow, schema-constrained calls, not "an agent writes all your texts."
+Everything else user-facing — the dedupe question, the confirmation card, the thread-attach offer, terminal messages (`CANCELLED`/`MERGED`/`NEEDS_REVIEW`), reminders, and suggestions — is a deterministic Python template.
 
 Both call sites use Google ADK with a Gemini 3.5 Flash model and a JSON response schema (ADK's structured-output mode) — no free-text parsing of a model response anywhere in this system.
+
+**Phase G note (docs/product/status.md):** the real safety property here was never "the LLM's surface area stays narrow" — it's ADR 0001 (an explicit state machine, not the LLM, decides what happens next) and ADR 0003 (only `committer-svc` holds Calendar/Gmail write creds, and it only ever consumes `items.confirmed`, published only after pipeline code — a plain `if intent == "AFFIRM":`, never a second LLM call — classifies an inbound reply as an explicit affirmative). That means the LLM's output can become more conversational (in-voice replies, a flexible intent classifier replacing strict Y/N keyword matching) without weakening either guarantee, as long as the LLM never gets a tool to trigger a write itself. Step B (below) is the first piece of this: extraction gains a triage flag and an in-voice chat reply, still inside the same call site, still with zero write access.
 
 ---
 
@@ -113,6 +115,8 @@ Output must conform exactly to the provided schema. No text outside it.
 
 If a message plausibly contains **more than one item** (e.g. a screenshot with two separate deadlines), the extractor still emits exactly one — the most salient one, by its own judgment — and folds the rest into `summary` as context. Splitting one message into multiple items is out of scope; noted here so it isn't rediscovered as a bug later, it's a boundary.
 
+The system prompt shown above predates Phase G step B (below) — the live prompt in `extractor-svc/main.py` also carries the `is_actionable`/`chat_reply` triage instructions; this doc's code block isn't kept byte-for-byte in sync with every prompt edit, `main.py` is the source of truth per this doc's own header.
+
 ### 2.1 Email action — resolved, step 15 (ADR 0008)
 
 This resolves the "Open gap, flagged rather than invented" note this doc used to carry in §3.2 (kept below, struck through in spirit — see the note there for what was deliberately *not* decided before now).
@@ -160,6 +164,26 @@ email_draft: str | None = None       # only set when action_type == "email"
 **Why `missing_fields` and not a hard rejection:** matches the existing precedent exactly — `due_at` already uses `missing_fields` + the clarification loop rather than rejecting an incomplete obligation outright. `email_recipient` is now the second field this mechanism handles (§3.2 below).
 
 **Resolved gap: does an email action need a `due_at` at all?** No — unlike a calendar obligation, where `due_at` is the entire point (it's what gets scheduled) and is effectively always present by the time an item reaches `AWAITING_CONFIRMATION`, an email action's `due_at` (if any) only describes context *inside* the draft, not a send time — `committer-svc` sends synchronously on `Y`, exactly like it writes a Calendar event synchronously on `Y`, so there's no "scheduled for later" concept to support. `due_at` stays legitimately nullable for `action_type == "email"`; the completeness check (`state-machine.md` §1.2) only ever required it because `missing_fields` said so, and the extractor now simply doesn't add `due_at` to `missing_fields` when there's genuinely no deadline to ask about.
+
+### 2.2 Chat detection — Phase G step B
+
+Before this step, every message was forced into `type="obligation"` or `type="latent"` — a plain "hello" produced a fake obligation ("Respond to greeting") and a nonsensical Y/N confirmation card. `ExtractedItemMessage` gains a leading triage flag, extended in the *same* extraction call — still §0's "exactly two call sites," no new one added:
+
+```python
+is_actionable: bool = True
+chat_reply: str | None = None   # set only when is_actionable is False
+# type/title/summary/due_at/effort_minutes/focus_depth/confidence are now
+# Optional — null when is_actionable is False, since there's nothing to
+# extract; missing_fields defaults to an empty list.
+```
+
+**System prompt addition:** decide `is_actionable` first. `false` for pure chat (banter/greeting/reaction/question, nothing to remember or schedule) — leave every extraction field null and write `chat_reply`: a short, casual, in-voice reply reacting to what the user actually said. `true` for a real obligation or idea — leave `chat_reply` null and fill every field exactly as before this step.
+
+**Verified empirically against real Vertex AI before writing any production code** (this project's established pattern — see §2's earlier "Resolved gap" notes, both found the same way): a bool field plus a mix of required/now-nullable fields plus a new string field, all in the same schema the extraction call already uses, validated correctly on the first attempt — no repeat of §3.2's `dict[str, Any]` failure, since this changes field *optionality*, not an open-key/`Any`-typed shape. Six real calls confirmed correct classification: three chat-only messages ("hello", "yo wsg bro", "you there?") each got `is_actionable=false` and a natural, distinct in-voice reply; three actionable messages (a dated obligation, an ambiguous-deadline obligation, a no-deadline latent) each got `is_actionable=true` with the full extraction unchanged from pre-step-B behavior.
+
+**Where the reply actually gets sent:** `extractor-svc` only *generates* `chat_reply` — it still has zero Twilio/DB access (ADR 0003). `resolver-svc`'s `/pubsub/push` handler short-circuits on `is_actionable=False` before the dedupe check, sends `chat_reply` via its existing `_send_sms`, and writes the item straight to a new terminal state, `CHATTED` (`items_state_check` migration `0006`) — not `CANCELLED` (implies a rejected real candidate) or `NEEDS_REVIEW` (implies an incomplete obligation), matching `state-machine.md`'s existing refusal to fold different failure/outcome semantics into one state. A `conversations` row is still written (empty `resolved_fields`) purely to satisfy the existing redelivery-idempotency guard (`data-model.md` §2.4/§2.7's "conversations row = the one true completion signal"), not because a chat item has any back-and-forth to track.
+
+**Verified for real** via a signed webhook straight to the deployed `ingest-svc`: a real "hello" produced a real `is_actionable=false` extraction, a real "hey! what's up?" SMS delivered in ~11s (down from the original ~2 minute, fake-obligation-card response), and `items.state='CHATTED'` with `type`/`title` left null. A follow-up real obligation message in the same session confirmed the actionable path is unchanged — real confirmation card, real `N` cancel.
 
 ---
 

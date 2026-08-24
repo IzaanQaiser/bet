@@ -21,19 +21,29 @@ class RawItemMessage(BaseModel):
 
 
 class ExtractedItemMessage(BaseModel):
-    """items.extracted — published by extractor-svc."""
+    """items.extracted — published by extractor-svc.
+
+    Phase G step B (agent-contracts.md §2.2): is_actionable is the leading
+    triage field. When false, the message is pure chat (banter/greeting/
+    reaction/question) with nothing to capture — type/title/summary/due_at/
+    effort_minutes/focus_depth/confidence are all null, missing_fields is
+    empty, and chat_reply carries the in-voice reply to send back. When
+    true, chat_reply is null and every other field is filled exactly as
+    before this step."""
 
     item_id: UUID
     user_id: UUID
-    type: Literal["obligation", "latent"]
-    title: str
-    summary: str
-    due_at: datetime | None
-    effort_minutes: Literal[15, 30, 60, 120, 240]
-    focus_depth: Literal["shallow", "deep"]
-    confidence: float = Field(ge=0.0, le=1.0)
-    missing_fields: list[str]
-    reasoning: str  # log-only, never shown to the user
+    is_actionable: bool = True
+    chat_reply: str | None = None
+    type: Literal["obligation", "latent"] | None = None
+    title: str | None = None
+    summary: str | None = None
+    due_at: datetime | None = None
+    effort_minutes: Literal[15, 30, 60, 120, 240] | None = None
+    focus_depth: Literal["shallow", "deep"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    missing_fields: list[str] = Field(default_factory=list)
+    reasoning: str = ""  # log-only, never shown to the user
     action_type: Literal["calendar", "email"] = "calendar"  # step 15, agent-contracts.md §2.1
     email_recipient: str | None = None  # a real address, never a guessed name
     email_draft: str | None = None  # set only when action_type == "email"
