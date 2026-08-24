@@ -226,7 +226,7 @@ def test_exchange_counting_table(client):
         assert conn.item["state"] == "NEEDS_REVIEW"
         assert conn.convo["exchange_count"] == 3  # unchanged — inbound replies never increment it
         assert mock_sms.call_count == 4  # 3 questions + 1 terminal message, not a 4th question
-        assert "couldn't get all the details" in mock_sms.call_args.args[1]
+        assert "couldn't get all the details" in mock_sms.call_args.args[2]
 
 
 def test_single_exchange_resolves_to_awaiting_confirmation(client):
@@ -257,7 +257,7 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client):
     assert conn.convo["exchange_count"] == 1  # the reply that resolved it never increments
     # 1 clarifying question + 1 confirmation card, not a 3rd clarifying question.
     assert mock_sms.call_count == 2
-    assert "Pay rent" in mock_sms.call_args.args[1]
+    assert "Pay rent" in mock_sms.call_args.args[2]
 
 
 def test_missing_email_recipient_resolves_via_clarification(client):
@@ -301,7 +301,7 @@ def test_missing_email_recipient_resolves_via_clarification(client):
 
     assert resp.json()["status"] == "awaiting_confirmation"
     assert conn.convo["resolved_fields"]["email_recipient"] == "sarah@example.com"
-    body = mock_sms.call_args.args[1]
+    body = mock_sms.call_args.args[2]
     assert body.startswith("✉️ Email to sarah@example.com:")
 
 

@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException
 from google.auth.transport.requests import AuthorizedSession
-from obligation_engine_shared.db import get_connection
+from obligation_engine_shared.db import get_connection, log_message
 from obligation_engine_shared.pubsub import publish
 from obligation_engine_shared.reply_classifier import classify_reply
 from obligation_engine_shared.schemas import ConfirmedItemMessage, RoutedReplyMessage
@@ -74,8 +74,14 @@ def _twilio_client() -> TwilioClient:
     return TwilioClient(TWILIO_API_KEY_SID, os.environ["TWILIO_API_KEY_SECRET"], TWILIO_ACCOUNT_SID)
 
 
-def _send_sms(to: str, body: str) -> None:
+def _send_sms(user_id, to: str, body: str) -> None:
+    """Sends, then logs to the messages table (migrations/0007) in its own
+    short transaction — same pattern as resolver-svc's _send_sms, this
+    project's one implementation not being duplicated with drift."""
     _twilio_client().messages.create(to=to, from_=TWILIO_FROM_NUMBER, body=body)
+    with get_connection() as log_conn:
+        log_message(log_conn, user_id, "out", body)
+        log_conn.commit()
 
 
 @dataclass
@@ -145,7 +151,7 @@ def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
     today_local = now_utc.astimezone(tz).date()
     for item_id, title, due_at in rows:
         local_due = due_at.astimezone(tz)
-        _send_sms(to=phone, body=render_reminder(title, local_due, today_local))
+        _send_sms(user_id, to=phone, body=render_reminder(title, local_due, today_local))
         conn.execute(
             "UPDATE obligations SET reminder_sent_at = now() WHERE item_id = %s", (str(item_id),)
         )
@@ -229,7 +235,7 @@ def _send_suggestion(conn, user_id, phone, tz, day_context: dict, today, latents
         item_title=title_row[0],
         days_since_capture=days_since_capture,
     )
-    _send_sms(to=phone, body=body)
+    _send_sms(user_id, to=phone, body=body)
 
     conn.execute(
         "INSERT INTO suggestions (item_id, user_id, snapshot_id) VALUES (%s, %s, %s)",
@@ -362,7 +368,9 @@ def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
             )
             conn.commit()
         _send_sms(
-            phone, f'Sorry, that day filled up — I couldn\'t find room for "{title}" anymore.'
+            payload.user_id,
+            phone,
+            f'Sorry, that day filled up — I couldn\'t find room for "{title}" anymore.',
         )
         logger.info("accept failed, no free block left item_id=%s", payload.item_id)
         return {"status": "no_capacity", "item_id": str(payload.item_id)}
@@ -389,7 +397,7 @@ def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
             (suggestion_id,),
         )
         conn.commit()
-    _send_sms(phone, render_accepted(title, due_at_local))
+    _send_sms(payload.user_id, phone, render_accepted(title, due_at_local))
     logger.info("ACCEPTED item_id=%s due_at=%s", payload.item_id, due_at_local)
     return {"status": "accepted", "item_id": str(payload.item_id)}
 
@@ -430,7 +438,7 @@ async def reply(payload: RoutedReplyMessage):
                     (new_count, str(payload.item_id)),
                 )
             conn.commit()
-        _send_sms(phone, render_dismissed())
+        _send_sms(payload.user_id, phone, render_dismissed())
         logger.info("DISMISSED item_id=%s dismissal_count=%d", payload.item_id, new_count)
         return {"status": "dismissed", "item_id": str(payload.item_id)}
 
@@ -445,7 +453,7 @@ async def reply(payload: RoutedReplyMessage):
                 (str(payload.item_id),),
             )
             conn.commit()
-        _send_sms(phone, render_snoozed())
+        _send_sms(payload.user_id, phone, render_snoozed())
         logger.info("SNOOZED item_id=%s", payload.item_id)
         return {"status": "snoozed", "item_id": str(payload.item_id)}
 

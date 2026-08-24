@@ -137,7 +137,7 @@ def test_exact_hash_match_skips_embedding_call(client, test_user):
     assert resp.json() == {"status": "duplicate_suspected", "item_id": str(new_item_id)}
     mock_embed.assert_not_called()
     mock_sms.assert_called_once()
-    assert '"Pay rent"' in mock_sms.call_args.args[1]
+    assert '"Pay rent"' in mock_sms.call_args.args[2]
 
     with get_connection() as conn:
         state = conn.execute(
@@ -173,8 +173,8 @@ def test_near_duplicate_caught(client, test_user):
 
     assert resp.json() == {"status": "duplicate_suspected", "item_id": str(new_item_id)}
     mock_sms.assert_called_once()
-    assert '"Pay rent"' in mock_sms.call_args.args[1]
-    assert "Reply Y to merge" in mock_sms.call_args.args[1]
+    assert '"Pay rent"' in mock_sms.call_args.args[2]
+    assert "Reply Y to merge" in mock_sms.call_args.args[2]
 
 
 def test_dissimilar_item_not_caught(client, test_user):

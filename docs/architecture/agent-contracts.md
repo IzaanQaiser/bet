@@ -189,6 +189,8 @@ chat_reply: str | None = None   # set only when is_actionable is False
 
 ## 3. Resolver contract
 
+**Phase G step C note:** every inbound and outbound SMS is now durably logged in `messages` (`migrations/0007_messages_table.sql`, `direction`/`body`/`created_at`, `obligation_engine_shared.log_message()`) — `ingest-svc` logs inbound, `resolver-svc`/`dispatcher-svc` log their own outbound sends. This exists for step D below: the unified conversational turn reads a user's own last N messages as a live style reference, so replies sound like that specific user, not a generic persona. Sections 3.1-3.4 below still describe the pre-step-D deterministic templates — accurate until step D lands, at which point this doc gets another pass.
+
 ### 3.1 Dedupe question — deterministic, no LLM
 
 Per `state-machine.md` §1.1. Fixed template, filled from the existing matched item's `title`:

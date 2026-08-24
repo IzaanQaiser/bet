@@ -7,7 +7,7 @@ test_clarification.py."""
 import base64
 from datetime import datetime
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -106,7 +106,7 @@ def test_complete_item_awaits_confirmation(client):
     assert len(insert_calls) == 1
 
     mock_sms.assert_called_once()
-    assert "Pay rent" in mock_sms.call_args.args[1]
+    assert "Pay rent" in mock_sms.call_args.args[2]
 
 
 def test_complete_email_item_shows_email_confirmation_card(client):
@@ -133,7 +133,7 @@ def test_complete_email_item_shows_email_confirmation_card(client):
     assert resp.status_code == 200
     assert resp.json()["status"] == "awaiting_confirmation"
     mock_sms.assert_called_once()
-    body = mock_sms.call_args.args[1]
+    body = mock_sms.call_args.args[2]
     assert body.startswith("✉️ Email to sarah@example.com:")
     assert "Confirming the delay" in body
     assert "Reply Y to send" in body
@@ -183,7 +183,7 @@ def test_missing_fields_starts_clarification_not_left_stalled(client):
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "clarifying", "item_id": str(extracted.item_id)}
-    mock_sms.assert_called_once_with("+15551234567", "When's it due?")
+    mock_sms.assert_called_once_with(extracted.user_id, "+15551234567", "When's it due?")
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert update_calls[0].args[1][-2] == "CLARIFYING"
 
@@ -293,7 +293,7 @@ def test_n_reply_cancels_no_publish(client):
     assert resp.status_code == 200
     assert resp.json() == {"status": "cancelled", "item_id": item_id}
     mock_publish.assert_not_called()
-    mock_sms.assert_called_once_with("+15551234567", "Cancelled.")
+    mock_sms.assert_called_once_with(UUID(user_id), "+15551234567", "Cancelled.")
 
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "CANCELLED" in update_calls[0].args[0]
@@ -363,8 +363,8 @@ def test_duplicate_found_routes_to_duplicate_suspected_not_clarification(client)
     assert resp.status_code == 200
     assert resp.json() == {"status": "duplicate_suspected", "item_id": str(extracted.item_id)}
     mock_sms.assert_called_once()
-    assert '"Pay rent"' in mock_sms.call_args.args[1]
-    assert "Reply Y to merge" in mock_sms.call_args.args[1]
+    assert '"Pay rent"' in mock_sms.call_args.args[2]
+    assert "Reply Y to merge" in mock_sms.call_args.args[2]
 
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert update_calls[0].args[1][-2] == "DUPLICATE_SUSPECTED"
@@ -393,7 +393,7 @@ def test_duplicate_y_reply_merges_no_publish(client):
     assert resp.json() == {"status": "merged", "item_id": item_id}
     mock_publish.assert_not_called()
     mock_sms.assert_called_once_with(
-        "+15551234567", 'Got it — that\'s the same as "Pay rent". Nothing new added.'
+        UUID(user_id), "+15551234567", 'Got it — that\'s the same as "Pay rent". Nothing new added.'
     )
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "MERGED" in update_calls[0].args[0]
@@ -417,7 +417,7 @@ def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):
     assert resp.status_code == 200
     assert resp.json() == {"status": "awaiting_confirmation", "item_id": item_id}
     mock_sms.assert_called_once()
-    assert "Pay rent" in mock_sms.call_args.args[1]
+    assert "Pay rent" in mock_sms.call_args.args[2]
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "AWAITING_CONFIRMATION" in update_calls[0].args[0]
 
@@ -442,7 +442,7 @@ def test_duplicate_n_reply_with_missing_fields_resumes_clarification(client):
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "clarifying", "item_id": item_id}
-    mock_sms.assert_called_once_with("+15551234567", "When's it due?")
+    mock_sms.assert_called_once_with(UUID(user_id), "+15551234567", "When's it due?")
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert "CLARIFYING" in update_calls[0].args[0]
 
@@ -467,7 +467,9 @@ def test_attach_reply_sets_parent_item_id(client):
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "attached", "item_id": item_id}
-    mock_sms.assert_called_once_with("+15551234567", 'Attached to "Take a ceramics class".')
+    mock_sms.assert_called_once_with(
+        UUID(user_id), "+15551234567", 'Attached to "Take a ceramics class".'
+    )
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert update_calls[0].args[0].strip().startswith("UPDATE items SET parent_item_id")
     assert update_calls[0].args[1][0] == target_id
