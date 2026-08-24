@@ -8,14 +8,14 @@ dependencies = []
 package = false
 
 [tool.uv.workspace]
-# services/* joins this list starting step 3, when the first service exists.
-members = ["shared"]
+members = ["shared", "services/*"]
 
 [dependency-groups]
-dev = ["pytest>=8.3", "ruff>=0.16", "obligation-engine-shared"]
+dev = ["pytest>=8.3", "ruff>=0.16", "obligation-engine-shared", "ingest-svc"]
 
 [tool.uv.sources]
 obligation-engine-shared = { workspace = true }
+ingest-svc = { workspace = true }
 
 [tool.ruff]
 line-length = 100

@@ -88,3 +88,20 @@ resource "google_project_iam_member" "cloudsql_client" {
   role    = "roles/cloudsql.client"
   member  = "serviceAccount:${each.value}"
 }
+
+# roles/cloudsql.instanceUser — separate from cloudsql.client: this is what
+# actually permits IAM database authentication as a specific DB user. Its
+# absence surfaced as a real deploy-time bug (build step 3): the developer's
+# own Owner-level access worked without it, masking that the four service
+# accounts had no way to authenticate at all until this was added.
+resource "google_project_iam_member" "cloudsql_instance_user" {
+  for_each = {
+    ingest     = google_service_account.ingest.email
+    resolver   = google_service_account.resolver.email
+    committer  = google_service_account.committer.email
+    dispatcher = google_service_account.dispatcher.email
+  }
+  project = var.project_id
+  role    = "roles/cloudsql.instanceUser"
+  member  = "serviceAccount:${each.value}"
+}
