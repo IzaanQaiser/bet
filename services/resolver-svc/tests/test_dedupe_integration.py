@@ -130,14 +130,20 @@ def test_exact_hash_match_skips_embedding_call(client, test_user):
     with (
         patch("resolver_svc.main._send_sms") as mock_sms,
         patch("resolver_svc.main.embed") as mock_embed,
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        from resolver_svc.conversation import ConversationTurnResult
+
+        mock_converse.return_value = ConversationTurnResult(
+            reply_text="isn't this the same pay rent thing you already had?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.status_code == 200
     assert resp.json() == {"status": "duplicate_suspected", "item_id": str(new_item_id)}
     mock_embed.assert_not_called()
     mock_sms.assert_called_once()
-    assert '"Pay rent"' in mock_sms.call_args.args[2]
+    assert mock_converse.call_args.kwargs["dedupe_candidate_title"] == "Pay rent"
 
     with get_connection() as conn:
         state = conn.execute(
@@ -168,13 +174,18 @@ def test_near_duplicate_caught(client, test_user):
     with (
         patch("resolver_svc.main._send_sms") as mock_sms,
         patch("resolver_svc.main.embed", return_value=_vector(seed=0.995)),  # cosine ~0.9999
+        patch("resolver_svc.main.converse") as mock_converse,
     ):
+        from resolver_svc.conversation import ConversationTurnResult
+
+        mock_converse.return_value = ConversationTurnResult(
+            reply_text="isn't this the same pay rent thing you already had?"
+        )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
     assert resp.json() == {"status": "duplicate_suspected", "item_id": str(new_item_id)}
     mock_sms.assert_called_once()
-    assert '"Pay rent"' in mock_sms.call_args.args[2]
-    assert "Reply Y to merge" in mock_sms.call_args.args[2]
+    assert mock_converse.call_args.kwargs["dedupe_candidate_title"] == "Pay rent"
 
 
 def test_dissimilar_item_not_caught(client, test_user):

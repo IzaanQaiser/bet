@@ -40,6 +40,20 @@ a first-contact message takes, via the new `create_raw_item` shared
 helper + `items-raw` publish. Verified empirically before wiring into
 main.py, per this project's pattern of not trusting a prompt-only change
 to a shared schema without a real Vertex AI check first.
+
+Dedupe-question note (same follow-up work, prompted directly by a user
+report against the live deployed demo): §3.1's dedupe question was
+deliberately left as a fixed "Reply Y to merge, N if it's different"
+template through step D and the continuity fix above — not what either
+was about. That rigid Y/N script is exactly what the user hit and
+objected to. `dedupe_candidate_title`/`awaiting_dedupe_reply` fold the
+dedupe question into this same call instead: the initial question and
+both its merge/different acknowledgments are now `reply_text`, in voice,
+same as every other outbound message in this flow — no fixed template
+left anywhere in the confirm-a-duplicate path. `templates.py`'s
+`render_dedupe_question`/`render_merged` are now dead and removed;
+`render_needs_review` stays — a deliberate exhaustion terminal message,
+untouched by any of this.
 """
 
 import json
@@ -63,8 +77,11 @@ with what the user's own history actually sounds like).
 You're given: the item (title/type/summary/effort/known fields), which
 fields (if any) are still missing, whether a confirmation message has
 ALREADY been sent for this item (awaiting_confirmation), a pending
-thread-attach candidate title if any, recent message history, and the
-user's latest reply (absent on the very first turn for a new item).
+thread-attach candidate title if any, a possible-duplicate candidate title
+if any (dedupe_candidate_title) and whether a reply to THAT question is
+being interpreted right now (awaiting_dedupe_reply), recent message
+history, and the user's latest reply (absent on the very first turn for a
+new item).
 
 Do, in order:
 
@@ -103,9 +120,21 @@ Do, in order:
    turn resolves; if it genuinely reads as unclear, just work with it as
    given rather than asking about it.
 
-2. Intent (ONLY set this if awaiting_confirmation is true — a confirmation
-   message was already sent and this reply is responding to it; otherwise
-   leave intent null):
+2. Intent (ONLY set this if awaiting_confirmation OR awaiting_dedupe_reply
+   is true — a question was already sent and this reply is responding to
+   it; otherwise leave intent null):
+
+   If awaiting_dedupe_reply is true, this reply is answering a DIFFERENT
+   question than usual — "is this the same as an existing item" — not
+   confirming a new one. Here AFFIRM/DENY mean:
+   - AFFIRM: yes, it's the same thing (will be merged into the existing
+     item — "yeah", "same one", "that's it", etc.)
+   - DENY: no, it's different / a separate new thing ("no", "nah, different
+     thing", "not the same", etc.)
+   CORRECTION and ATTACH don't apply to a dedupe reply — use OTHER for
+   anything that isn't a clear yes/no on "is this the same item".
+
+   Otherwise (awaiting_confirmation true, the normal case):
    - AFFIRM: a clear yes/confirmation ("yes", "yeah", "bet", "sounds good",
      "do it", etc.)
    - DENY: a clear no/cancel ("no", "nah", "don't", "cancel", etc.)
@@ -118,6 +147,20 @@ Do, in order:
    - OTHER: genuinely unclear, off-topic, or a question.
 
 3. reply_text: the actual next SMS to send. Rules:
+   - If dedupe_candidate_title is given and this is the very first turn
+     (no latest_reply, awaiting_dedupe_reply false): a short casual
+     question asking whether this is the same thing as the existing item
+     (name it naturally) — phrase it like you'd actually ask a friend,
+     e.g. "isn't this the same as X you already had on there?" — NEVER a
+     rigid "Reply Y to merge, N if it's different" style instruction, no
+     fixed format, just a normal question a yes/no answer naturally fits.
+   - If awaiting_dedupe_reply and intent is AFFIRM: a short casual line
+     acknowledging you're treating it as the same thing / merging it —
+     mention the existing item naturally.
+   - If awaiting_dedupe_reply and intent is DENY: a short casual line
+     acknowledging it's separate/different — just an acknowledgment, do
+     NOT ask a yes/no confirm question here, the next turn handles
+     whatever's still needed for the new item.
    - If still_missing is non-empty (fields remain missing, not yet at
      confirmation): a short casual question asking for what's still
      missing, in one natural sentence, never a list.
@@ -129,13 +172,14 @@ Do, in order:
      naturally if one is given.
    - If awaiting_confirmation and intent is AFFIRM: a short casual
      acknowledgment that it's done/scheduled.
-   - If DENY: a short casual "no worries, scrapped it" style line.
+   - If DENY (awaiting_confirmation, not a dedupe reply): a short casual
+     "no worries, scrapped it" style line.
    - If CORRECTION: a short casual line restating the updated detail and
      asking to confirm again — never assume yes just because a correction
      was given.
    - If ATTACH: a short casual line confirming the attach.
    - If OTHER: a short casual line asking them to clarify (yes/no/what to
-     change).
+     change, or — for a dedupe reply — whether it's the same thing or not).
    Keep it SMS-length, under 160 characters where possible.
 
 Output must conform exactly to the provided schema. No text outside it.
@@ -176,6 +220,8 @@ async def converse(
     thread_attach_title: str | None,
     history: list[str],
     latest_reply: str | None,
+    dedupe_candidate_title: str | None = None,
+    awaiting_dedupe_reply: bool = False,
 ) -> ConversationTurnResult:
     await _session_service.create_session(
         app_name="conversation", user_id="conversation", session_id=session_id
@@ -192,6 +238,8 @@ async def converse(
         f"Missing fields: {missing_fields}\n"
         f"awaiting_confirmation: {awaiting_confirmation}\n"
         f"Thread-attach candidate: {thread_attach_title}\n"
+        f"dedupe_candidate_title: {dedupe_candidate_title}\n"
+        f"awaiting_dedupe_reply: {awaiting_dedupe_reply}\n"
         f"Recent message history (oldest first):\n{hist_block}\n"
         f"User's latest reply: {reply_text}\n"
     )

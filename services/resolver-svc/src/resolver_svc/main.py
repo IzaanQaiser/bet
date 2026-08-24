@@ -23,22 +23,27 @@ else to live pre-commit (data-model.md §2.4's original resolved bug).
 
 Phase G step D (agent-contracts.md §3.2/§3.3) replaces the old due_at-only
 clarify() call, the fixed render_confirmation_card template, and strict
-Y/N/ATTACH keyword matching — for everything EXCEPT the dedupe question
-itself — with resolver_svc.conversation.converse(), one Gemini call per
-turn that merges fields, classifies intent (AFFIRM/DENY/CORRECTION/
-ATTACH/OTHER) when replying to an already-sent confirmation, and writes
-the actual outbound SMS in the user's own mirrored voice. The dedupe
-question/Y-N-merge classification (classify_reply, render_dedupe_question)
-is deliberately untouched — not what triggered the redesign, and its own
-separate concern from the confirm-before-write flow. Real correction
-handling (a reply that changes a detail rather than confirming/denying)
-is genuinely new here — never built before this step. CORRECTION never
-publishes on its own, no matter how complete the merged fields look —
-only a subsequent, separate AFFIRM turn ever triggers items.confirmed
-(ADR 0003's actual mechanism: the LLM only fills a classified field,
-pipeline code below does a plain `if result.intent == "AFFIRM":` before
-ever publishing — never a second LLM call interpreting the first one's
-output).
+Y/N/ATTACH keyword matching with resolver_svc.conversation.converse(),
+one Gemini call per turn that merges fields, classifies intent (AFFIRM/
+DENY/CORRECTION/ATTACH/OTHER) when replying to an already-sent
+confirmation, and writes the actual outbound SMS in the user's own
+mirrored voice. Real correction handling (a reply that changes a detail
+rather than confirming/denying) is genuinely new here — never built
+before this step. CORRECTION never publishes on its own, no matter how
+complete the merged fields look — only a subsequent, separate AFFIRM turn
+ever triggers items.confirmed (ADR 0003's actual mechanism: the LLM only
+fills a classified field, pipeline code below does a plain
+`if result.intent == "AFFIRM":` before ever publishing — never a second
+LLM call interpreting the first one's output).
+
+The dedupe question was step D's one deliberate exception — left as the
+fixed "Reply Y to merge, N if it's different" template/classifier, not
+what that redesign was about. A user hit exactly that rigid script live
+against the deployed demo and objected to it directly; a follow-up in
+this same session (below) folds it into converse() too, via
+dedupe_candidate_title/awaiting_dedupe_reply — no fixed template left
+anywhere in this flow. classify_reply/render_dedupe_question/render_merged
+are gone.
 
 Step 13 adds an idempotency guard at the top of /pubsub/push — a real
 bug found in step 11's live testing: a concurrent Pub/Sub redelivery of
@@ -55,10 +60,8 @@ when a reply during CLARIFYING or AWAITING_CONFIRMATION doesn't actually
 relate to the open item, `_route_as_new_item()` leaves that item
 completely untouched and gives the text its own new item via the same
 path a first-contact message takes (`create_raw_item` + `items-raw`
-publish). The DUPLICATE_SUSPECTED path's plain-Y/N `classify_reply()` got
-the same fix for its own "neither Y nor N" case — that used to silently
-drop the reply with no SMS at all (found reading this code while fixing
-the converse() side of the same bug class), now routed the same way.
+publish). The DUPLICATE_SUSPECTED path applies the same `relates_to_item`
+check now too (below), on top of its own separate dedupe-question fix.
 
 The guard checks for an existing `conversations` row, not `items.state`
 — an earlier draft checked state, and a second real bug (found
@@ -85,7 +88,6 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Request
 from obligation_engine_shared.db import create_raw_item, get_connection, log_message
 from obligation_engine_shared.pubsub import decode_push_envelope, publish
-from obligation_engine_shared.reply_classifier import classify_reply
 from obligation_engine_shared.schemas import (
     ConfirmedItemMessage,
     ExtractedItemMessage,
@@ -103,11 +105,7 @@ from resolver_svc.dedupe import (
     embed,
     vector_literal,
 )
-from resolver_svc.templates import (
-    render_dedupe_question,
-    render_merged,
-    render_needs_review,
-)
+from resolver_svc.templates import render_needs_review
 
 logger = logging.getLogger("resolver_svc")
 app = FastAPI()
@@ -298,6 +296,10 @@ def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
 
 
 async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: DedupeResult) -> None:
+    """The dedupe question itself, in voice (conversation.py's dedupe-
+    question note) — replaces the old fixed render_dedupe_question
+    template, the one Y/N script left standing through step D and the
+    continuity fix, and the direct trigger for finally retiring it."""
     _write_item(extracted, "DUPLICATE_SUSPECTED")
 
     resolved_fields = _initial_resolved_fields(extracted)
@@ -306,6 +308,29 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
     if dedupe.thread_attach_item_id:
         resolved_fields["_thread_attach_item_id"] = str(dedupe.thread_attach_item_id)
         resolved_fields["_thread_attach_title"] = dedupe.thread_attach_title
+
+    with get_connection() as conn:
+        phone, tz_name = _user_phone_and_timezone(conn, extracted.user_id)
+        history = _recent_history(conn, extracted.user_id)
+
+    now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    result = await converse(
+        session_id=f"{extracted.item_id}-{uuid4().hex[:8]}",
+        now_local=now_local,
+        tz_name=tz_name,
+        title=extracted.title,
+        item_type=extracted.type,
+        summary=extracted.summary,
+        effort_minutes=extracted.effort_minutes,
+        known_fields=resolved_fields,
+        missing_fields=extracted.missing_fields,
+        awaiting_confirmation=False,
+        thread_attach_title=None,
+        history=history,
+        latest_reply=None,
+        dedupe_candidate_title=dedupe.duplicate_title,
+        awaiting_dedupe_reply=False,
+    )
 
     with get_connection() as conn:
         conn.execute(
@@ -318,10 +343,9 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
                 Json(resolved_fields),
             ),
         )
-        phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
         conn.commit()
 
-    _send_sms(extracted.user_id, phone, render_dedupe_question(dedupe.duplicate_title))
+    _send_sms(extracted.user_id, phone, result.reply_text)
     logger.info(
         "DUPLICATE_SUSPECTED item_id=%s matched_item_id=%s",
         extracted.item_id,
@@ -570,36 +594,66 @@ async def _handle_clarification_reply(
 async def _handle_duplicate_reply(
     conn, user_id, item_id, phone, tz_name, title, item_type, summary, effort_minutes, text
 ) -> dict:
+    """The dedupe reply, in voice (conversation.py's dedupe-question note):
+    classify_reply()'s plain Y/N keyword matching is retired here too —
+    the exact same "Reply Y to merge, N if it's different" script the
+    question itself used to send, now interpreted by converse() with
+    awaiting_dedupe_reply=True instead. relates_to_item still applies:
+    genuinely unrelated text gets its own new item, same as every other
+    open-item path."""
     convo_row = conn.execute(
         "SELECT pending_fields, resolved_fields FROM conversations WHERE item_id = %s "
         "ORDER BY last_message_at DESC LIMIT 1",
         (str(item_id),),
     ).fetchone()
     pending_fields, resolved_fields = convo_row
-    classification = classify_reply(text)
+    match_title = resolved_fields.get("_dedupe_match_title") or "that item"
+    thread_attach_title = resolved_fields.get("_thread_attach_title")
+    history = _recent_history(conn, user_id)
+    now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    dedupe_result = await converse(
+        session_id=f"{item_id}-{uuid4().hex[:8]}",
+        now_local=now_local,
+        tz_name=tz_name,
+        title=title,
+        item_type=item_type,
+        summary=summary,
+        effort_minutes=effort_minutes,
+        known_fields=resolved_fields,
+        missing_fields=[],
+        awaiting_confirmation=False,
+        thread_attach_title=thread_attach_title,
+        history=history,
+        latest_reply=text,
+        dedupe_candidate_title=match_title,
+        awaiting_dedupe_reply=True,
+    )
+    if not dedupe_result.relates_to_item:
+        return _route_as_new_item(
+            conn, item_id, user_id, text, reason="dedupe reply unrelated"
+        )
 
-    if classification == "Y":
-        match_title = resolved_fields.get("_dedupe_match_title") or "that item"
+    if dedupe_result.intent == "AFFIRM":
         conn.execute(
             "UPDATE items SET state = 'MERGED', updated_at = now() WHERE id = %s",
             (str(item_id),),
         )
         conn.commit()
-        _send_sms(user_id, phone, render_merged(match_title))
+        _send_sms(user_id, phone, dedupe_result.reply_text)
         logger.info(
             "MERGED item_id=%s into=%s", item_id, resolved_fields.get("_dedupe_match_item_id")
         )
         return {"status": "merged", "item_id": str(item_id)}
 
-    if classification == "N":
-        # "N" proceeds to the completeness check as if no match existed
+    if dedupe_result.intent == "DENY":
+        # DENY proceeds to the completeness check as if no match existed
         # (state-machine.md §1.1 point 2) — pending_fields here is the
         # original missing_fields staged by _start_duplicate_suspected.
-        # Reuses the same converse()-driven conversation turn every other
-        # path uses now, rather than a separate dedicated mechanism.
-        thread_attach_title = resolved_fields.get("_thread_attach_title")
-        history = _recent_history(conn, user_id)
-        now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+        # A second, separate converse() call, exactly the multi-turn
+        # pattern every other path already uses (this reply already did
+        # its one job — classifying the dedupe question — dedupe_result's
+        # own reply_text was just the "keeping separate" acknowledgment,
+        # not a real attempt at resolving missing fields).
         result = await converse(
             session_id=f"{item_id}-{uuid4().hex[:8]}",
             now_local=now_local,
@@ -651,17 +705,15 @@ async def _handle_duplicate_reply(
         logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
         return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
-    # Not Y or N — classify_reply's own keyword set is deliberately
-    # untouched (module docstring), but the reply still has to go
-    # somewhere: swallowing it silently (the old behavior — no SMS sent
-    # at all) is exactly the "open item eats an unrelated message" bug
-    # this whole change exists to fix, just via the dedupe path's own
-    # simpler classifier instead of converse()'s relates_to_item. Same
-    # fix, same mechanism: leave the dedupe question exactly as it was,
-    # give this text its own new item.
-    return _route_as_new_item(
-        conn, item_id, user_id, text, reason=f"dedupe reply outside Y/N text={text!r}"
-    )
+    # OTHER — genuinely ambiguous about whether this is the same item
+    # (relates_to_item already routed genuinely unrelated text away above).
+    # Used to go completely silent here (the old classify_reply-based
+    # system had no OTHER case at all — anything that wasn't a literal Y/N
+    # match was dropped with no SMS sent); now, like every other OTHER
+    # case in this flow, it gets a real natural clarifying reply instead.
+    _send_sms(user_id, phone, dedupe_result.reply_text)
+    logger.info("dedupe reply ambiguous item_id=%s text=%r", item_id, text)
+    return {"status": "unhandled_reply", "item_id": str(item_id)}
 
 
 async def _handle_confirmation_reply(
