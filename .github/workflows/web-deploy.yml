@@ -35,6 +35,13 @@ jobs:
 
       - name: Build static export
         working-directory: web
+        # NEXT_PUBLIC_REGISTRATION_SVC_URL: registration-svc's Cloud Run URL
+        # (docs/design plan Phase 2) — set as a repo Actions variable once
+        # that service is deployed (scripts/deploy.sh registration-svc).
+        # Baked in at build time, same as everything else in a static
+        # export — there's no server here to read it from at request time.
+        env:
+          NEXT_PUBLIC_REGISTRATION_SVC_URL: ${{ vars.REGISTRATION_SVC_URL }}
         run: npm run build
 
       - name: Deploy to gh-pages

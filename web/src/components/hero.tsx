@@ -29,7 +29,6 @@ export function Hero() {
             It listens and quietly keeps track of everything else, including when you&apos;re actually free enough
             to do it.
           </p>
-          {/* plan Phase 2 builds /waitlist — dead link until then, expected */}
           <Link
             href="/waitlist"
             className="self-start text-[15px] font-medium text-foreground underline decoration-foreground/40 underline-offset-[6px] hover:decoration-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-foreground"
