@@ -47,6 +47,17 @@ resource "google_secret_manager_secret_iam_member" "registration_reads_signing_k
   member    = "serviceAccount:${google_service_account.registration.email}"
 }
 
+# Web division Phase 5 — dashboard-svc verifies its own login-session
+# tokens with this same key (a distinct `purpose` claim from
+# registration-svc's tokens, obligation_engine_shared.tokens, so neither
+# service's tokens can be replayed as the other's) — read-only, it never
+# mints a registration-flow token.
+resource "google_secret_manager_secret_iam_member" "dashboard_reads_signing_key" {
+  secret_id = google_secret_manager_secret.web_session_signing_key.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.dashboard.email}"
+}
+
 # Web division Phase 4 — the *second* OAuth client. Distinct from
 # google-oauth-client-secret above: that one is bootstrap_oauth_token.py's
 # Installed App client (a local CLI redirect flow), this one is a Web
@@ -89,6 +100,16 @@ resource "google_secret_manager_secret_iam_member" "registration_reads_verify_si
   member    = "serviceAccount:${google_service_account.registration.email}"
 }
 
+# Web division Phase 5 — dashboard-svc reuses the same Verify Service for
+# login OTP (a different flow's purpose, same Twilio Verify Service — one
+# Service, many independent verification checks; Twilio doesn't require
+# a separate Service per use case).
+resource "google_secret_manager_secret_iam_member" "dashboard_reads_verify_sid" {
+  secret_id = google_secret_manager_secret.twilio_verify_service_sid.secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.dashboard.email}"
+}
+
 # Twilio API Key — not in the original infrastructure.md plan, added during
 # step 3 build. Distinct from twilio-auth-token: the Auth Token is required
 # for webhook signature validation (no substitute), but outbound sends
@@ -104,14 +125,16 @@ resource "google_secret_manager_secret" "twilio_api_key_secret" {
   depends_on = [google_project_service.apis]
 }
 
-# Phase 4 adds registration to this map — same credential
-# (twilio-api-key-secret), also used for Twilio Verify API calls
-# (verify-start/verify-otp), not just plain SMS sends.
+# Phase 4 adds registration, Phase 5 adds dashboard, to this map — same
+# credential (twilio-api-key-secret), also used for Twilio Verify API
+# calls (registration's verify-start/verify-otp, dashboard's login OTP),
+# not just plain SMS sends.
 resource "google_secret_manager_secret_iam_member" "sms_senders_read_api_key" {
   for_each = {
     resolver     = google_service_account.resolver.email
     dispatcher   = google_service_account.dispatcher.email
     registration = google_service_account.registration.email
+    dashboard    = google_service_account.dashboard.email
   }
   secret_id = google_secret_manager_secret.twilio_api_key_secret.secret_id
   role      = "roles/secretmanager.secretAccessor"

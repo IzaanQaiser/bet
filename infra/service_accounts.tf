@@ -42,6 +42,15 @@ resource "google_service_account" "registration" {
   depends_on   = [google_project_service.apis]
 }
 
+# Web division Phase 5 — dashboard-svc's identity. Read-only across the
+# pipeline's data, scoped per-caller in application code (migrations/
+# 0011_dashboard_grants.sql's comment).
+resource "google_service_account" "dashboard" {
+  account_id   = "sa-dashboard"
+  display_name = "dashboard-svc"
+  depends_on   = [google_project_service.apis]
+}
+
 # Developer's own IAM identity, granted cloudsqlsuperuser for running
 # migrations. Deliberate addition beyond docs/architecture/infrastructure.md's
 # original service-account list: none of the four service-account Postgres
