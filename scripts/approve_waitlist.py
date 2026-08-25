@@ -20,7 +20,7 @@ until Phase 2.
 Usage:
   GCP_PROJECT_ID=obligation-engine-hack DB_USER=<you>@gmail.com \
   DB_HOST=127.0.0.1 DB_PORT=5433 TWILIO_API_KEY_SECRET=... \
-  uv run --with pyjwt python -u scripts/approve_waitlist.py <phone_e164>
+  uv run python -u scripts/approve_waitlist.py <phone_e164>
 
 Requires a Cloud SQL Auth Proxy already running (same as any other local
 script against the real dev DB — infrastructure.md §7). WEB_BASE_URL
@@ -31,10 +31,9 @@ plan's manual setup step 1 domain is live).
 
 import os
 import sys
-import time
 
-import jwt
 from google.cloud import secretmanager
+from obligation_engine_shared.tokens import mint_signed_token
 from twilio.rest import Client as TwilioClient
 
 # Same identifiers dispatcher-svc/resolver-svc already use (infrastructure.md
@@ -51,17 +50,6 @@ def _signing_key(project_id: str) -> str:
     client = secretmanager.SecretManagerServiceClient()
     name = f"projects/{project_id}/secrets/web-session-signing-key/versions/latest"
     return client.access_secret_version(request={"name": name}).payload.data.decode()
-
-
-def _mint_registration_token(phone_e164: str, signing_key: str) -> str:
-    now = int(time.time())
-    payload = {
-        "phone_e164": phone_e164,
-        "purpose": "registration",
-        "iat": now,
-        "exp": now + TOKEN_TTL_SECONDS,
-    }
-    return jwt.encode(payload, signing_key, algorithm="HS256")
 
 
 def main() -> None:
@@ -83,7 +71,10 @@ def main() -> None:
             print(f"Note: {phone_e164} already approved at {row[0]}; sending a fresh link anyway.")
 
     project_id = os.environ["GCP_PROJECT_ID"]
-    token = _mint_registration_token(phone_e164, _signing_key(project_id))
+    signing_key = _signing_key(project_id)
+    token = mint_signed_token(
+        {"phone_e164": phone_e164}, "registration", signing_key, TOKEN_TTL_SECONDS
+    )
 
     base_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io")
     link = f"{base_url}/register/{token}"
