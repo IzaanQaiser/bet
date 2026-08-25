@@ -17,8 +17,8 @@ export function Hero() {
 
   return (
     <div className="mx-auto flex min-h-screen max-w-[1200px] flex-col justify-center px-8 py-10">
-      <div className="grid h-[min(640px,70vh)] grid-cols-1 items-start gap-8 md:grid-cols-[1fr_1.1fr] md:gap-14 md:h-[min(640px,70vh)]">
-        <div className="flex flex-col">
+      <div className="grid h-[min(640px,70vh)] grid-cols-1 items-start gap-8 md:grid-cols-[minmax(0,1fr)_560px] md:gap-14 md:h-[min(640px,70vh)]">
+        <div className="flex min-w-0 flex-col">
           <p className="mb-[18px] font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">bet</p>
           <h1 className="mb-[18px] font-serif text-[clamp(30px,4.4vw,46px)] leading-[1.05] tracking-[-0.02em] text-balance">
             Nothing to remember.

@@ -29,7 +29,7 @@ export interface Group {
 
 const INITIAL_MEMORY: MemoryRowData[] = [
   { key: "hackathon", title: "incident-triage agent crew", status: "someday", visible: false, glow: false, retrieved: false },
-  { key: "gift", title: "buy birthday gift — sarah", status: "fri", visible: false, glow: false, retrieved: false },
+  { key: "gift", title: "buy birthday gift, sarah", status: "fri", visible: false, glow: false, retrieved: false },
 ];
 
 let uid = 0;
@@ -206,7 +206,7 @@ export function useHeroSequence() {
     // ---- beat 2: a "someday" idea, captured casually — not scheduled, just held ----
     await showDayHeader("Wednesday September 9th", "Wednesday, September 9th");
     await sleep(1000, reduced); if (cancelled()) return;
-    addBubble("out", "yo i wanna build an agent crew for the agentic ai hackathon — one that triages prod incidents, reads logs, checks recent deploys, drafts the postmortem");
+    addBubble("out", "yo i wanna build an agent crew for the hackathon that triages prod incidents and drafts the postmortem");
     await sleep(1100, reduced); if (cancelled()) return;
     t = addTyping();
     await sleep(1800, reduced); if (cancelled()) return;
@@ -218,7 +218,7 @@ export function useHeroSequence() {
     // ---- beat 3: speaks first — proactive, capacity-aware, no typing indicator ----
     await showDayHeader("Thursday September 10th", "Thursday, September 10th");
     await sleep(1200, reduced); if (cancelled()) return;
-    addBubble("in", "yo this afternoon's wide open — wanna knock out the incident-triage agent?");
+    addBubble("in", "yo this afternoon's wide open, wanna knock out the incident-triage agent?");
     await sleep(450, reduced); if (cancelled()) return;
     retrieveMemoryRow("hackathon");
     await sleep(450, reduced); if (cancelled()) return;
@@ -232,7 +232,7 @@ export function useHeroSequence() {
     // ---- beat 4: the day-of reminder, closing the loop back to beat 1 ----
     await showDayHeader("Friday September 11th", "Friday, September 11th");
     await sleep(1200, reduced); if (cancelled()) return;
-    addBubble("in", "don't forget — sarah's gift today at noon");
+    addBubble("in", "don't forget, sarah's gift today at noon");
     await sleep(450, reduced); if (cancelled()) return;
     retrieveMemoryRow("gift");
     await sleep(450, reduced); if (cancelled()) return;

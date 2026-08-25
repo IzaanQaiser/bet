@@ -13,9 +13,9 @@ export function HeroThread({ groups, viewportRef }: { groups: Group[]; viewportR
       role="log"
       aria-label="Example conversation"
       aria-live="off"
-      className="h-[min(640px,70vh)] overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className="h-[min(640px,70vh)] w-full min-w-0 overflow-x-hidden overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
     >
-      <div className="flex flex-col px-0.5 pb-2 pt-1">
+      <div className="flex min-w-0 flex-col px-0.5 pb-2 pt-1">
         {groups.map((group) => (
           <motion.div
             key={group.id}
@@ -25,7 +25,7 @@ export function HeroThread({ groups, viewportRef }: { groups: Group[]; viewportR
                 ? { y: -48, opacity: 0, transition: { duration: 0.42, ease: [0.4, 0, 1, 1] } }
                 : { y: 0, opacity: 1 }
             }
-            className="flex flex-col"
+            className="flex min-w-0 flex-col"
           >
             <div className="sticky top-0 z-[2] mb-1 flex justify-center bg-background px-0 pb-3.5 pt-2.5">
               <span className="rounded-full border border-border bg-muted px-3.5 py-1.5 font-mono text-[0.6875rem] tracking-[0.08em] text-muted-foreground">
@@ -34,7 +34,7 @@ export function HeroThread({ groups, viewportRef }: { groups: Group[]; viewportR
               </span>
             </div>
 
-            <div className="flex flex-col">
+            <div className="flex min-w-0 flex-col">
               {group.items.map((item, i) => {
                 // "last speaker" has to skip over calendar cards, not just look at
                 // the immediately-preceding item — a card never changes who's
@@ -81,13 +81,13 @@ export function HeroThread({ groups, viewportRef }: { groups: Group[]; viewportR
 
 function Bubble({ item, spacing }: { item: Extract<ThreadItem, { kind: "bubble" }>; spacing: string }) {
   return (
-    <div className={`flex flex-col ${item.dir === "out" ? "items-end" : "items-start"} ${spacing}`}>
+    <div className={`flex min-w-0 flex-col ${item.dir === "out" ? "items-end" : "items-start"} ${spacing}`}>
       <motion.div
         initial={{ opacity: 0, scale: 0.62, y: 14 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         transition={{ opacity: { duration: 0.12 }, default: { type: "spring", stiffness: 500, damping: 32, mass: 0.9 } }}
         style={{ transformOrigin: item.dir === "out" ? "bottom right" : "bottom left" }}
-        className={`max-w-[82%] rounded-[18px] px-[13px] py-[9px] text-sm leading-snug ${
+        className={`max-w-[82%] min-w-0 break-words rounded-[18px] px-[13px] py-[9px] text-sm leading-snug ${
           item.dir === "out" ? "rounded-br-[4px] bg-primary text-primary-foreground" : "rounded-bl-[4px] bg-muted text-foreground"
         }`}
       >
