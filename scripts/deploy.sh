@@ -379,6 +379,24 @@ case "$SERVICE" in
       --allow-unauthenticated \
       --account=waslyrideshare@gmail.com
     ;;
+  dashboard-svc)
+    echo "Deploying ${SERVICE}..."
+    # Second of the web division's two public services (web division
+    # Phase 5) — same shape as registration-svc: --allow-unauthenticated,
+    # auth enforced at the app layer (session JWT), not IAM.
+    # min-instances=0, same cost reasoning as registration-svc.
+    gcloud run deploy "$SERVICE" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --image="$IMAGE" \
+      --service-account="$SA" \
+      --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
+      --set-env-vars="DB_USER=sa-dashboard@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID}" \
+      --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest,TWILIO_VERIFY_SERVICE_SID=twilio-verify-service-sid:latest,WEB_SESSION_SIGNING_KEY=web-session-signing-key:latest" \
+      --min-instances=0 \
+      --allow-unauthenticated \
+      --account=waslyrideshare@gmail.com
+    ;;
   *)
     echo "No deploy config yet for ${SERVICE} — add a case in scripts/deploy.sh." >&2
     exit 1
