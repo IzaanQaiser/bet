@@ -25,6 +25,11 @@ export function WaitlistForm() {
       setError("Enter your number in E.164 format, e.g. +15551234567");
       return;
     }
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("Enter your name");
+      return;
+    }
 
     const baseUrl = process.env.NEXT_PUBLIC_REGISTRATION_SVC_URL;
     if (!baseUrl) {
@@ -37,7 +42,7 @@ export function WaitlistForm() {
       const res = await fetch(`${baseUrl}/waitlist/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone_e164: trimmed, name: name.trim() || null }),
+        body: JSON.stringify({ phone_e164: trimmed, name: trimmedName }),
       });
       if (!res.ok) throw new Error(`request failed: ${res.status}`);
       setStatus("joined");
@@ -90,7 +95,7 @@ export function WaitlistForm() {
 
         <div className="flex flex-col gap-1.5">
           <label htmlFor="name" className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
-            Name <span className="normal-case text-muted-foreground/70">(optional)</span>
+            Name
           </label>
           <input
             id="name"
@@ -99,6 +104,7 @@ export function WaitlistForm() {
             placeholder="Sarah"
             value={name}
             onChange={(e) => setName(e.target.value)}
+            required
             className="h-10 rounded-[10px] border border-border bg-background px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           />
         </div>
