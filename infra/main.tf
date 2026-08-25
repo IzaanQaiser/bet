@@ -18,6 +18,16 @@ provider "google" {
   region  = var.region
 }
 
+# Secret Manager's actual resource names are project-number-based
+# (projects/<number>/secrets/<id>), not project-id-based, confirmed via
+# `gcloud secrets describe ... --format="value(name)"` — needed for the
+# IAM condition in secret_manager.tf's registration_creates_user_secrets
+# (a project-id string there would silently never match, making the
+# grant a no-op).
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
 # Required project APIs. infrastructure.md §1 — Vertex AI, Calendar, Gmail are
 # APIs enabled here, not provisioned resources.
 resource "google_project_service" "apis" {

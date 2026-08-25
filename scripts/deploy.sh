@@ -21,11 +21,21 @@ SA="sa-${SERVICE%-svc}@${PROJECT_ID}.iam.gserviceaccount.com"
 # client *secret* goes through Secret Manager (google-oauth-client-secret).
 # Created via the manual bootstrap in infrastructure.md §4.
 GOOGLE_OAUTH_CLIENT_ID="665100673712-md4toevjbouvfemojkne9ito237av8hk.apps.googleusercontent.com"
-# Web division (docs/design plan) — the GitHub Pages default origin, until
-# the custom domain from the plan's manual setup step 1 is live. Update
-# this (and re-run `./scripts/deploy.sh registration-svc`) once that
-# domain is pointed and web/CNAME exists.
+# Web division (docs/design plan) — GitHub Pages, until the custom domain
+# from the plan's manual setup step 1 is live. Two distinct values, not
+# one: WEB_ORIGIN is a bare origin (scheme+host, no path) for CORS —
+# browsers never send a path in an Origin header, so a path-suffixed
+# value here would make every real cross-origin request from the site
+# silently fail CORS. WEB_BASE_URL is the actual navigable site root,
+# which *does* need /bet: this repo isn't named izaanqaiser.github.io, so
+# a project-page GitHub Pages site always serves from
+# izaanqaiser.github.io/<repo>/, confirmed via web/next.config.ts's
+# matching `basePath` (found live, Phase 4's registration link 404'd
+# without it). Update both (and re-run
+# `./scripts/deploy.sh registration-svc`) once the custom domain is
+# pointed and web/CNAME exists.
 WEB_ORIGIN="https://izaanqaiser.github.io"
+WEB_BASE_URL="https://izaanqaiser.github.io/bet"
 
 echo "Building and pushing ${IMAGE}..."
 # --platform linux/amd64 explicitly: Cloud Run requires amd64, but a local
@@ -335,13 +345,27 @@ case "$SERVICE" in
     # limit are what stand between this and the open internet, not IAM.
     # min-instances=0: unlike ingest-svc, a cold start here just makes one
     # waitlist submission slightly slower, not a missed webhook.
+    #
+    # Phase 4 adds the registration-completion env vars/secrets below.
+    # GOOGLE_OAUTH_CLIENT_ID_WEB is the Web Application client from the
+    # plan's manual setup step 2 (Console-only — Google doesn't expose
+    # OAuth-client creation as an API) — fill in once created.
+    # OAUTH_REDIRECT_URI is Cloud Run's own default URL format
+    # (https://<service>-<project-number>.<region>.run.app), which is
+    # deterministic ahead of a first deploy, not a random per-revision
+    # hash — safe to register in the Google Console before this service
+    # exists. Update it once the plan's custom-domain step 1 is live.
+    GOOGLE_OAUTH_CLIENT_ID_WEB="${GOOGLE_OAUTH_CLIENT_ID_WEB:-}"
+    OAUTH_REDIRECT_URI="https://registration-svc-665100673712.us-central1.run.app/register/oauth-callback"
+
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-registration@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN}" \
+      --set-env-vars="DB_USER=sa-registration@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},WEB_BASE_URL=${WEB_BASE_URL},GOOGLE_OAUTH_CLIENT_ID_WEB=${GOOGLE_OAUTH_CLIENT_ID_WEB},OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI}" \
+      --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest,TWILIO_VERIFY_SERVICE_SID=twilio-verify-service-sid:latest,WEB_SESSION_SIGNING_KEY=web-session-signing-key:latest,GOOGLE_OAUTH_CLIENT_SECRET_WEB=google-oauth-client-secret-web:latest" \
       --min-instances=0 \
       --allow-unauthenticated \
       --account=waslyrideshare@gmail.com

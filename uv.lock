@@ -1381,6 +1381,7 @@ dependencies = [
     { name = "google-cloud-pubsub" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
+    { name = "pyjwt" },
 ]
 
 [package.metadata]
@@ -1389,6 +1390,7 @@ requires-dist = [
     { name = "google-cloud-pubsub", specifier = ">=2.27" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.9" },
+    { name = "pyjwt", specifier = ">=2.9" },
 ]
 
 [[package]]
@@ -1878,7 +1880,10 @@ version = "0.1.0"
 source = { editable = "services/registration-svc" }
 dependencies = [
     { name = "fastapi" },
+    { name = "google-cloud-secret-manager" },
     { name = "obligation-engine-shared" },
+    { name = "requests" },
+    { name = "twilio" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1891,7 +1896,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "google-cloud-secret-manager", specifier = ">=2.20" },
     { name = "obligation-engine-shared", editable = "shared" },
+    { name = "requests", specifier = ">=2.32" },
+    { name = "twilio", specifier = ">=9.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
