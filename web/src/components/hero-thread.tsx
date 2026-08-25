@@ -79,7 +79,7 @@ export function HeroThread({ groups, viewportRef }: { groups: Group[]; viewportR
   );
 }
 
-function Bubble({ item, spacing }: { item: Extract<ThreadItem, { kind: "bubble" }>; spacing: string }) {
+export function Bubble({ item, spacing }: { item: Extract<ThreadItem, { kind: "bubble" }>; spacing: string }) {
   return (
     <div className={`flex min-w-0 flex-col ${item.dir === "out" ? "items-end" : "items-start"} ${spacing}`}>
       <motion.div
@@ -106,7 +106,7 @@ function Bubble({ item, spacing }: { item: Extract<ThreadItem, { kind: "bubble" 
   );
 }
 
-function TypingIndicator({ fading, spacing }: { fading: boolean; spacing: string }) {
+export function TypingIndicator({ fading, spacing }: { fading: boolean; spacing: string }) {
   return (
     <div className={`flex flex-col items-start ${spacing}`}>
       <motion.div
