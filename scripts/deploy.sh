@@ -21,6 +21,11 @@ SA="sa-${SERVICE%-svc}@${PROJECT_ID}.iam.gserviceaccount.com"
 # client *secret* goes through Secret Manager (google-oauth-client-secret).
 # Created via the manual bootstrap in infrastructure.md §4.
 GOOGLE_OAUTH_CLIENT_ID="665100673712-md4toevjbouvfemojkne9ito237av8hk.apps.googleusercontent.com"
+# Web division (docs/design plan) — the GitHub Pages default origin, until
+# the custom domain from the plan's manual setup step 1 is live. Update
+# this (and re-run `./scripts/deploy.sh registration-svc`) once that
+# domain is pointed and web/CNAME exists.
+WEB_ORIGIN="https://izaanqaiser.github.io"
 
 echo "Building and pushing ${IMAGE}..."
 # --platform linux/amd64 explicitly: Cloud Run requires amd64, but a local
@@ -320,6 +325,26 @@ case "$SERVICE" in
           --account=waslyrideshare@gmail.com
       fi
     done
+    ;;
+  registration-svc)
+    echo "Deploying ${SERVICE}..."
+    # First of the web division's two public services (docs/design plan
+    # Phase 2). --allow-unauthenticated same as ingest-svc — the only other
+    # public-facing service — but the request itself carries no external
+    # signature to validate (unlike Twilio's), so CORS + the in-app rate
+    # limit are what stand between this and the open internet, not IAM.
+    # min-instances=0: unlike ingest-svc, a cold start here just makes one
+    # waitlist submission slightly slower, not a missed webhook.
+    gcloud run deploy "$SERVICE" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --image="$IMAGE" \
+      --service-account="$SA" \
+      --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
+      --set-env-vars="DB_USER=sa-registration@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN}" \
+      --min-instances=0 \
+      --allow-unauthenticated \
+      --account=waslyrideshare@gmail.com
     ;;
   *)
     echo "No deploy config yet for ${SERVICE} — add a case in scripts/deploy.sh." >&2
