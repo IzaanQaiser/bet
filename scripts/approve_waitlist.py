@@ -8,14 +8,15 @@ access via the developer's own IAM Cloud SQL user
 needed), not a service endpoint.
 
 Sets approved_at/approved_by, mints a short-lived signed registration
-token (web-session-signing-key, first use here — Phase 5's dashboard-svc
-will read the same secret to verify its own, separately-scoped session
-tokens), and texts the number a /register/<token> link — a plain Twilio
-REST send via twilio-api-key-secret, same mechanism resolver-svc/
-dispatcher-svc already use, not the Verify product (that's Phase 4, for
-actually proving phone ownership before OAuth). /register isn't built
-yet (Phase 4) — the link is a dead one until then, same as /waitlist was
-until Phase 2.
+token (web-session-signing-key, used by registration-svc's Phase 4
+endpoints, and by Phase 5's dashboard-svc for its own, separately-scoped
+session tokens), and texts the number a /register?token=<token> link — a
+plain Twilio REST send via twilio-api-key-secret, same mechanism
+resolver-svc/dispatcher-svc already use, not the Verify product (that
+happens once the link is clicked, registration-svc's own
+POST /register/verify-start). Query param, not a path segment
+(/register/<token>) — the frontend is a static export (web/next.config.ts),
+which can't pre-render an arbitrary runtime token as a dynamic route.
 
 Usage:
   GCP_PROJECT_ID=obligation-engine-hack DB_USER=<you>@gmail.com \
@@ -77,7 +78,7 @@ def main() -> None:
     )
 
     base_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io")
-    link = f"{base_url}/register/{token}"
+    link = f"{base_url}/register?token={token}"
     body = f"you're in, tap here to connect your calendar and finish setup: {link}"
 
     api_key_secret = os.environ["TWILIO_API_KEY_SECRET"]
