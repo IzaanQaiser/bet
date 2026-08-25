@@ -42,6 +42,7 @@ jobs:
         # export — there's no server here to read it from at request time.
         env:
           NEXT_PUBLIC_REGISTRATION_SVC_URL: ${{ vars.REGISTRATION_SVC_URL }}
+          NEXT_PUBLIC_DASHBOARD_SVC_URL: ${{ vars.DASHBOARD_SVC_URL }}
         run: npm run build
 
       - name: Deploy to gh-pages
