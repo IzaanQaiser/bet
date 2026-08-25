@@ -1,0 +1,1 @@
+can we amke some sort of web dashabord to visualise whats going on like we can see what tasks have been saved what things are in memory what things are in progress etc? i know its a whole  other porject but i think its something useful to have? we also need a website where mans can go to register and give their number to get started so why not? can you plan this all out for me
