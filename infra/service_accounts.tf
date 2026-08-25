@@ -32,6 +32,16 @@ resource "google_service_account" "dispatcher" {
   depends_on   = [google_project_service.apis]
 }
 
+# Web division Phase 2 — first of two new public-facing services (see
+# docs/architecture/infrastructure.md's web-division addendum). Only
+# waitlist.join today; Phase 4 adds the OAuth/Twilio-Verify registration
+# flow to this same service and same identity.
+resource "google_service_account" "registration" {
+  account_id   = "sa-registration"
+  display_name = "registration-svc"
+  depends_on   = [google_project_service.apis]
+}
+
 # Developer's own IAM identity, granted cloudsqlsuperuser for running
 # migrations. Deliberate addition beyond docs/architecture/infrastructure.md's
 # original service-account list: none of the four service-account Postgres

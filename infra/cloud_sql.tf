@@ -76,13 +76,22 @@ resource "google_sql_user" "dispatcher" {
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }
 
+# Web division Phase 2 — registration-svc gets its own IAM database user,
+# same pattern as the five pipeline services above.
+resource "google_sql_user" "registration" {
+  name     = trimsuffix(google_service_account.registration.email, ".gserviceaccount.com")
+  instance = google_sql_database_instance.main.name
+  type     = "CLOUD_IAM_SERVICE_ACCOUNT"
+}
+
 # roles/cloudsql.client — needed to open a connection via the Auth Proxy at all.
 resource "google_project_iam_member" "cloudsql_client" {
   for_each = {
-    ingest     = google_service_account.ingest.email
-    resolver   = google_service_account.resolver.email
-    committer  = google_service_account.committer.email
-    dispatcher = google_service_account.dispatcher.email
+    ingest       = google_service_account.ingest.email
+    resolver     = google_service_account.resolver.email
+    committer    = google_service_account.committer.email
+    dispatcher   = google_service_account.dispatcher.email
+    registration = google_service_account.registration.email
   }
   project = var.project_id
   role    = "roles/cloudsql.client"
@@ -96,10 +105,11 @@ resource "google_project_iam_member" "cloudsql_client" {
 # accounts had no way to authenticate at all until this was added.
 resource "google_project_iam_member" "cloudsql_instance_user" {
   for_each = {
-    ingest     = google_service_account.ingest.email
-    resolver   = google_service_account.resolver.email
-    committer  = google_service_account.committer.email
-    dispatcher = google_service_account.dispatcher.email
+    ingest       = google_service_account.ingest.email
+    resolver     = google_service_account.resolver.email
+    committer    = google_service_account.committer.email
+    dispatcher   = google_service_account.dispatcher.email
+    registration = google_service_account.registration.email
   }
   project = var.project_id
   role    = "roles/cloudsql.instanceUser"
