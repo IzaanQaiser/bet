@@ -222,7 +222,7 @@ def test_oauth_callback_creates_user_and_secret(client):
         )
 
     assert resp.status_code == 302
-    assert resp.headers["location"].endswith("/dashboard")
+    assert resp.headers["location"].endswith("/register?done=1")
     mock_post.assert_called_once()
     mock_secret_client.create_secret.assert_called_once()
     mock_secret_client.add_secret_version.assert_called_once()
@@ -247,7 +247,8 @@ def test_oauth_callback_rejects_already_registered_number(client):
             params={"code": "auth-code-123", "state": _oauth_callback_state()},
             follow_redirects=False,
         )
-    assert resp.status_code == 409
+    assert resp.status_code == 302
+    assert resp.headers["location"].endswith("/register?already=1")
     mock_post.assert_not_called()
 
 
@@ -258,7 +259,8 @@ def test_oauth_callback_rejects_expired_state(client):
             params={"code": "auth-code-123", "state": _oauth_callback_state(ttl=-1)},
             follow_redirects=False,
         )
-    assert resp.status_code == 400
+    assert resp.status_code == 302
+    assert resp.headers["location"].endswith("/register?error=session_expired")
     mock_get_conn.assert_not_called()
 
 
@@ -279,4 +281,5 @@ def test_oauth_callback_errors_when_google_omits_refresh_token(client):
             params={"code": "auth-code-123", "state": _oauth_callback_state()},
             follow_redirects=False,
         )
-    assert resp.status_code == 400
+    assert resp.status_code == 302
+    assert resp.headers["location"].endswith("/register?error=no_refresh_token")

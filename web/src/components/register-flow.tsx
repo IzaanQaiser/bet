@@ -34,6 +34,51 @@ export function RegisterFlow() {
 
   const baseUrl = process.env.NEXT_PUBLIC_REGISTRATION_SVC_URL;
 
+  // These land here via registration-svc's own 302 after the Google
+  // round trip (oauth-callback) — a real top-level navigation, never a
+  // fetch, so every outcome there (success or failure) has to resolve to
+  // a page, not a JSON body. Checked ahead of the token/phone check
+  // below: none of these carry a `token` param at all.
+  if (searchParams.get("done") === "1") {
+    return (
+      <>
+        <h1 className="mb-3 font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
+          You&apos;re all set.
+        </h1>
+        <p className="max-w-[42ch] text-base leading-relaxed text-muted-foreground">
+          Your calendar is connected. Text bet whenever something comes up.
+        </p>
+      </>
+    );
+  }
+  if (searchParams.get("already") === "1") {
+    return (
+      <>
+        <h1 className="mb-3 font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
+          You&apos;re already set up.
+        </h1>
+        <p className="max-w-[42ch] text-base leading-relaxed text-muted-foreground">
+          This number already finished registration. Just text bet directly.
+        </p>
+      </>
+    );
+  }
+  const callbackError = searchParams.get("error");
+  if (callbackError) {
+    const message =
+      callbackError === "no_refresh_token"
+        ? "Google didn't grant calendar access. Revoke access at myaccount.google.com/permissions and try the link again."
+        : "That took too long and the link expired. Reopen the original text and try again.";
+    return (
+      <>
+        <h1 className="mb-3 font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
+          Something went wrong.
+        </h1>
+        <p className="max-w-[42ch] text-base leading-relaxed text-muted-foreground">{message}</p>
+      </>
+    );
+  }
+
   if (!token || !phone) {
     return (
       <>
