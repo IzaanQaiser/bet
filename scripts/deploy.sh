@@ -21,6 +21,15 @@ SA="sa-${SERVICE%-svc}@${PROJECT_ID}.iam.gserviceaccount.com"
 # client *secret* goes through Secret Manager (google-oauth-client-secret).
 # Created via the manual bootstrap in infrastructure.md §4.
 GOOGLE_OAUTH_CLIENT_ID="665100673712-md4toevjbouvfemojkne9ito237av8hk.apps.googleusercontent.com"
+# Not secrets either, by the same Twilio credential-model reasoning — but
+# kept out of every committed file regardless (this script included, not
+# just service source), so nothing ever needs a source-scanner-aware
+# reader to know that distinction. Required from your shell env instead,
+# same pattern scripts/migrate.sh already uses for DATABASE_URL — find
+# both in the Twilio Console (Account SID on the dashboard; the API Key
+# SID wherever the paired twilio-api-key-secret was originally created).
+: "${TWILIO_ACCOUNT_SID:?Set TWILIO_ACCOUNT_SID first — see the comment above this line}"
+: "${TWILIO_API_KEY_SID:?Set TWILIO_API_KEY_SID first — see the comment above this line}"
 # Web division (docs/design plan) — GitHub Pages, until the custom domain
 # from the plan's manual setup step 1 is live. Two distinct values, not
 # one: WEB_ORIGIN is a bare origin (scheme+host, no path) for CORS —
@@ -190,7 +199,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL},DISPATCHER_SVC_URL=${DISPATCHER_SVC_URL},TWILIO_ACCOUNT_SID=AC3292d4a7944b87b2fe3db562856e32bd" \
+      --set-env-vars="DB_USER=sa-ingest@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},RESOLVER_SVC_URL=${RESOLVER_SVC_URL},DISPATCHER_SVC_URL=${DISPATCHER_SVC_URL},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}" \
       --set-secrets="TWILIO_AUTH_TOKEN=twilio-auth-token:latest" \
       --min-instances=1 \
       --allow-unauthenticated \
@@ -233,7 +242,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-resolver@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,VERTEX_LOCATION=global,GEMINI_MODEL=gemini-3.5-flash" \
+      --set-env-vars="DB_USER=sa-resolver@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,VERTEX_LOCATION=global,GEMINI_MODEL=gemini-3.5-flash,TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID}" \
       --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
       --min-instances=1 \
       --no-allow-unauthenticated \
@@ -283,7 +292,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-dispatcher@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}" \
+      --set-env-vars="DB_USER=sa-dispatcher@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID}" \
       --set-secrets="GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest,TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
       --min-instances=0 \
       --no-allow-unauthenticated \
@@ -364,7 +373,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-registration@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},WEB_BASE_URL=${WEB_BASE_URL},GOOGLE_OAUTH_CLIENT_ID_WEB=${GOOGLE_OAUTH_CLIENT_ID_WEB},OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI}" \
+      --set-env-vars="DB_USER=sa-registration@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},WEB_BASE_URL=${WEB_BASE_URL},GOOGLE_OAUTH_CLIENT_ID_WEB=${GOOGLE_OAUTH_CLIENT_ID_WEB},OAUTH_REDIRECT_URI=${OAUTH_REDIRECT_URI},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID}" \
       --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest,TWILIO_VERIFY_SERVICE_SID=twilio-verify-service-sid:latest,WEB_SESSION_SIGNING_KEY=web-session-signing-key:latest,GOOGLE_OAUTH_CLIENT_SECRET_WEB=google-oauth-client-secret-web:latest" \
       --min-instances=0 \
       --allow-unauthenticated \

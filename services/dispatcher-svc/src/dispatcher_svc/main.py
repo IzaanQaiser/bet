@@ -59,11 +59,11 @@ app = FastAPI()
 
 EFFORT_BUCKETS = (15, 30, 60, 120, 240)  # ConfirmedItemMessage's Literal, schemas.py
 
-# Plain config, not secrets — same treatment as every other Twilio/OAuth
-# identifier in this project (infrastructure.md §4.1, §4's "not a secret"
-# notes). Only TWILIO_API_KEY_SECRET is an actual secret, via env.
-TWILIO_ACCOUNT_SID = "AC3292d4a7944b87b2fe3db562856e32bd"
-TWILIO_API_KEY_SID = "SK7a7912d15fea946956ab8bbae8214bce"
+# Not secrets by Twilio's own credential model — a SID can't authenticate
+# anything without its paired secret (infrastructure.md §4.1, §4's "not a
+# secret" notes). Read from env anyway, not hardcoded: keeps them out of
+# source scans entirely rather than relying on a reviewer knowing that
+# distinction.
 TWILIO_FROM_NUMBER = "+14152365420"
 
 TRAILING_DAYS = 14
@@ -71,7 +71,11 @@ FORWARD_DAYS = 7
 
 
 def _twilio_client() -> TwilioClient:
-    return TwilioClient(TWILIO_API_KEY_SID, os.environ["TWILIO_API_KEY_SECRET"], TWILIO_ACCOUNT_SID)
+    return TwilioClient(
+        os.environ["TWILIO_API_KEY_SID"],
+        os.environ["TWILIO_API_KEY_SECRET"],
+        os.environ["TWILIO_ACCOUNT_SID"],
+    )
 
 
 def _send_sms(user_id, to: str, body: str) -> None:

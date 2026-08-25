@@ -16,6 +16,8 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("TWILIO_API_KEY_SECRET", "test-not-a-real-secret")
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACtest0000000000000000000000000")
+    monkeypatch.setenv("TWILIO_API_KEY_SID", "SKtest0000000000000000000000000")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-client-id")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "test-client-secret")
     from dispatcher_svc.main import app

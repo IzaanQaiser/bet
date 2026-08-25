@@ -115,16 +115,19 @@ app = FastAPI()
 CONFIDENCE_THRESHOLD = 0.75  # state-machine.md §1.2
 MAX_EXCHANGES = 3  # state-machine.md §1.2
 
-# Plain config, not secrets — same treatment as every other Twilio
-# identifier in this project (infrastructure.md §4.1). Only the API key
-# secret goes through Secret Manager, via env.
-TWILIO_ACCOUNT_SID = "AC3292d4a7944b87b2fe3db562856e32bd"
-TWILIO_API_KEY_SID = "SK7a7912d15fea946956ab8bbae8214bce"
+# Not secrets by Twilio's own credential model — a SID can't authenticate
+# anything without its paired secret (infrastructure.md §4.1). Read from
+# env anyway, not hardcoded: keeps them out of source scans entirely
+# rather than relying on a reviewer knowing that distinction.
 TWILIO_FROM_NUMBER = "+14152365420"
 
 
 def _twilio_client() -> TwilioClient:
-    return TwilioClient(TWILIO_API_KEY_SID, os.environ["TWILIO_API_KEY_SECRET"], TWILIO_ACCOUNT_SID)
+    return TwilioClient(
+        os.environ["TWILIO_API_KEY_SID"],
+        os.environ["TWILIO_API_KEY_SECRET"],
+        os.environ["TWILIO_ACCOUNT_SID"],
+    )
 
 
 def _send_sms(user_id, to: str, body: str) -> None:

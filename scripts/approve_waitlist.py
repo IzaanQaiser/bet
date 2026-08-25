@@ -20,7 +20,8 @@ which can't pre-render an arbitrary runtime token as a dynamic route.
 
 Usage:
   GCP_PROJECT_ID=obligation-engine-hack DB_USER=<you>@gmail.com \
-  DB_HOST=127.0.0.1 DB_PORT=5433 TWILIO_API_KEY_SECRET=... \
+  DB_HOST=127.0.0.1 DB_PORT=5433 \
+  TWILIO_ACCOUNT_SID=... TWILIO_API_KEY_SID=... TWILIO_API_KEY_SECRET=... \
   uv run python -u scripts/approve_waitlist.py <phone_e164>
 
 Requires a Cloud SQL Auth Proxy already running (same as any other local
@@ -37,10 +38,11 @@ from google.cloud import secretmanager
 from obligation_engine_shared.tokens import mint_signed_token
 from twilio.rest import Client as TwilioClient
 
-# Same identifiers dispatcher-svc/resolver-svc already use (infrastructure.md
-# §4.1) — only TWILIO_API_KEY_SECRET is an actual secret, via env.
-TWILIO_ACCOUNT_SID = "AC3292d4a7944b87b2fe3db562856e32bd"
-TWILIO_API_KEY_SID = "SK7a7912d15fea946956ab8bbae8214bce"
+# Not a secret by Twilio's own credential model — a phone number, not a
+# credential at all. TWILIO_ACCOUNT_SID/TWILIO_API_KEY_SID (also not
+# secrets — a SID can't authenticate without its paired secret) come from
+# env at the call site instead, same as every other service in this
+# project, keeping them out of source scans entirely.
 TWILIO_FROM_NUMBER = "+14152365420"
 
 TOKEN_TTL_SECONDS = 24 * 60 * 60
@@ -81,8 +83,11 @@ def main() -> None:
     link = f"{base_url}/register?token={token}"
     body = f"you're in, tap here to connect your calendar and finish setup: {link}"
 
-    api_key_secret = os.environ["TWILIO_API_KEY_SECRET"]
-    twilio_client = TwilioClient(TWILIO_API_KEY_SID, api_key_secret, TWILIO_ACCOUNT_SID)
+    twilio_client = TwilioClient(
+        os.environ["TWILIO_API_KEY_SID"],
+        os.environ["TWILIO_API_KEY_SECRET"],
+        os.environ["TWILIO_ACCOUNT_SID"],
+    )
     twilio_client.messages.create(to=phone_e164, from_=TWILIO_FROM_NUMBER, body=body)
     print(f"Sent registration link to {phone_e164}.")
 

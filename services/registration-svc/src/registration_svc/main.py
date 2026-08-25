@@ -36,11 +36,6 @@ from twilio.rest import Client as TwilioClient
 
 app = FastAPI()
 
-# Same identifiers dispatcher-svc/resolver-svc already use (infrastructure.md
-# §4.1) — only TWILIO_API_KEY_SECRET (env, --set-secrets) is an actual secret.
-TWILIO_ACCOUNT_SID = "AC3292d4a7944b87b2fe3db562856e32bd"
-TWILIO_API_KEY_SID = "SK7a7912d15fea946956ab8bbae8214bce"
-
 GOOGLE_OAUTH_SCOPES = (
     "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/gmail.send"
 )
@@ -129,8 +124,16 @@ async def waitlist_join(payload: WaitlistJoinRequest, request: Request):
 
 
 def _twilio_verify_service():
-    api_key_secret = os.environ["TWILIO_API_KEY_SECRET"]
-    client = TwilioClient(TWILIO_API_KEY_SID, api_key_secret, TWILIO_ACCOUNT_SID)
+    # Not secrets by Twilio's own credential model — a SID can't
+    # authenticate anything without its paired secret (infrastructure.md
+    # §4.1). Read from env anyway, not hardcoded: keeps them out of source
+    # scans entirely rather than relying on a reviewer knowing that
+    # distinction.
+    client = TwilioClient(
+        os.environ["TWILIO_API_KEY_SID"],
+        os.environ["TWILIO_API_KEY_SECRET"],
+        os.environ["TWILIO_ACCOUNT_SID"],
+    )
     return client.verify.v2.services(os.environ["TWILIO_VERIFY_SERVICE_SID"])
 
 
@@ -215,22 +218,30 @@ async def register_oauth_start(token: str, timezone: str):
     return RedirectResponse(auth_url, status_code=302)
 
 
+def _register_redirect(query: str) -> RedirectResponse:
+    # oauth-callback is only ever reached via a real top-level browser
+    # navigation (Google's own redirect), never a fetch/XHR — a raw JSON
+    # error response here is dead-end UX no matter which branch fires, so
+    # every outcome (success or failure) lands back on /register with a
+    # query param instead of a bare HTTPException.
+    web_base_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io/bet")
+    return RedirectResponse(f"{web_base_url}/register?{query}", status_code=302)
+
+
 @app.get("/register/oauth-callback")
 async def register_oauth_callback(code: str, state: str):
     signing_key = os.environ["WEB_SESSION_SIGNING_KEY"]
     try:
         claims = verify_signed_token(state, "oauth-callback", signing_key)
     except InvalidToken:
-        raise HTTPException(
-            status_code=400, detail="invalid or expired session, restart registration"
-        )
+        return _register_redirect("error=session_expired")
     phone = claims["phone_e164"]
     tz = claims["timezone"]
 
     with get_connection() as conn:
         existing = conn.execute("SELECT id FROM users WHERE phone_e164 = %s", (phone,)).fetchone()
     if existing is not None:
-        raise HTTPException(status_code=409, detail="this number is already registered")
+        return _register_redirect("already=1")
 
     token_response = requests.post(
         "https://oauth2.googleapis.com/token",
@@ -246,11 +257,7 @@ async def register_oauth_callback(code: str, state: str):
     token_response.raise_for_status()
     refresh_token = token_response.json().get("refresh_token")
     if not refresh_token:
-        raise HTTPException(
-            status_code=400,
-            detail="Google didn't return a refresh token — revoke access at "
-            "https://myaccount.google.com/permissions and try again",
-        )
+        return _register_redirect("error=no_refresh_token")
 
     # Same create_secret/add_secret_version pattern bootstrap_oauth_token.py
     # uses for the CLI flow, same secret naming — just with a freshly
@@ -281,9 +288,7 @@ async def register_oauth_callback(code: str, state: str):
         )
         conn.commit()
 
-    web_base_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io/bet")
-    dashboard_url = f"{web_base_url}/dashboard"
-    return RedirectResponse(dashboard_url, status_code=302)
+    return _register_redirect("done=1")
 
 
 @app.get("/health")

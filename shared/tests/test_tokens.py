@@ -37,9 +37,18 @@ def test_wrong_signing_key_rejected():
 
 
 def test_tampered_token_rejected():
+    # Flips a character in the middle of the token (solidly inside the
+    # payload segment), not the last character of the whole string —
+    # base64url's trailing padding bits mean a flipped *last* character
+    # can occasionally decode to the exact same underlying bytes,
+    # making that version of this test flaky (found via a real
+    # intermittent failure, not by inspection).
     token = mint_signed_token({"phone_e164": "+15551234567"}, "registration", KEY, ttl_seconds=60)
+    mid = len(token) // 2
+    tampered_char = "A" if token[mid] != "A" else "B"
+    tampered = token[:mid] + tampered_char + token[mid + 1 :]
     with pytest.raises(InvalidToken):
-        verify_signed_token(token[:-1] + ("A" if token[-1] != "A" else "B"), "registration", KEY)
+        verify_signed_token(tampered, "registration", KEY)
 
 
 def test_missing_purpose_claim_rejected():
