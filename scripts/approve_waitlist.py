@@ -77,7 +77,7 @@ def main() -> None:
         {"phone_e164": phone_e164}, "registration", signing_key, TOKEN_TTL_SECONDS
     )
 
-    base_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io")
+    base_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io/bet")
     link = f"{base_url}/register?token={token}"
     body = f"you're in, tap here to connect your calendar and finish setup: {link}"
 

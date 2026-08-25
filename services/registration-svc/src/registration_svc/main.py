@@ -281,7 +281,8 @@ async def register_oauth_callback(code: str, state: str):
         )
         conn.commit()
 
-    dashboard_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io") + "/dashboard"
+    web_base_url = os.environ.get("WEB_BASE_URL", "https://izaanqaiser.github.io/bet")
+    dashboard_url = f"{web_base_url}/dashboard"
     return RedirectResponse(dashboard_url, status_code=302)
 
 
