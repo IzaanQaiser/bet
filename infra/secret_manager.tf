@@ -25,6 +25,22 @@ resource "google_secret_manager_secret" "google_oauth_client_secret" {
   depends_on = [google_project_service.apis]
 }
 
+# Web division Phase 3 — signs/verifies the short-lived registration token
+# scripts/approve_waitlist.py mints. No value set here (same reasoning as
+# the two secrets above): populate with
+#   openssl rand -base64 32 | gcloud secrets versions add web-session-signing-key --data-file=-
+# Phase 5's dashboard-svc will read this same secret to verify its own,
+# separately-scoped session tokens — no per-service grant added yet
+# (Phase 4 adds registration-svc's read access, once it has an endpoint
+# that actually needs to verify a token this script minted).
+resource "google_secret_manager_secret" "web_session_signing_key" {
+  secret_id = "web-session-signing-key"
+  replication {
+    auto {}
+  }
+  depends_on = [google_project_service.apis]
+}
+
 # Twilio API Key — not in the original infrastructure.md plan, added during
 # step 3 build. Distinct from twilio-auth-token: the Auth Token is required
 # for webhook signature validation (no substitute), but outbound sends
