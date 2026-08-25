@@ -179,3 +179,13 @@ Restates and makes concrete what `docs/engineering/conventions.md` already named
 ## 9. Doc set complete
 
 This closes every "→ `infrastructure.md`" pointer from `overview.md`, `data-model.md`, `capacity-engine.md`, and `agent-contracts.md`. The six-doc architecture set (`overview`, `state-machine`, `data-model`, `capacity-engine`, `agent-contracts`, `infrastructure`) is now internally consistent — each resolved gap was traced back and the doc that raised it was updated to point here rather than left stale. Remaining work moves from documentation to implementation: `docs/engineering/conventions.md` governs how that code gets written.
+
+---
+
+## 10. Web division addendum (started Phase 2)
+
+A second, later initiative — the public landing/waitlist/registration/dashboard site (own plan doc, not one of the six above) — adds new Cloud Run services on top of everything §1–9 describes, without changing any of it. Tracked here as an addendum rather than folded into the tables above, since the two systems have different owners' worth of scope and this section will keep growing across the plan's remaining phases (registration completion, dashboard) while §1–9 stay closed.
+
+- **`sa-registration`** (`infra/service_accounts.tf`) — `registration-svc`'s identity. `roles/cloudsql.client` + `roles/cloudsql.instanceUser` (`infra/cloud_sql.tf`), same pattern as the five pipeline services. No Pub/Sub role, no Secret Manager grant yet (Phase 4 adds both — OAuth/Twilio Verify secrets, and the per-user refresh-token create-rights) — Phase 2's only surface is `POST /waitlist/join`.
+- **Postgres role** — `SELECT, INSERT` on `waitlist` only (`migrations/0009_waitlist.sql`). No `UPDATE`: approval (Phase 3) runs as the developer's own IAM identity via a local script, the same `google_sql_user.developer_admin` bootstrap §2.2 already describes for migrations — `registration-svc` itself never touches the columns approval sets.
+- **`registration-svc` deploy** (`scripts/deploy.sh`) — `--allow-unauthenticated` like `ingest-svc` (the only other public service), but unlike Twilio's signed webhook, there's no request signature to validate here; CORS (`ALLOWED_ORIGINS` env var, restricted to the GitHub Pages origin) and the in-process rate limit are what stand in for that. `min-instances=0`, not `1` — a cold start here delays one waitlist submission, not a missed inbound SMS.
