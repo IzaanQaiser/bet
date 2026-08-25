@@ -63,7 +63,7 @@ def _rate_limited(ip: str) -> bool:
 
 class WaitlistJoinRequest(BaseModel):
     phone_e164: str
-    name: str | None = None
+    name: str
 
     @field_validator("phone_e164")
     @classmethod
@@ -74,9 +74,10 @@ class WaitlistJoinRequest(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def _blank_name_to_none(cls, v: str | None) -> str | None:
-        if v is not None and not v.strip():
-            return None
+    def _require_nonblank_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("name is required")
         return v
 
 

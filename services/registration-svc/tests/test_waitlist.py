@@ -2,7 +2,8 @@
 house style (unittest.mock.patch, resolver-svc/tests/test_resolver.py is
 the reference). Covers docs/design plan Phase 2's stated acceptance cases:
 valid join, duplicate join is a no-op not an error, malformed phone
-rejected — plus the rate limiter added alongside them.
+rejected, missing/blank name rejected — plus the rate limiter added
+alongside them.
 """
 
 from unittest.mock import MagicMock, patch
@@ -47,13 +48,11 @@ def test_valid_join_inserts_row(client):
     mock_conn.commit.assert_called_once()
 
 
-def test_join_without_name_is_optional(client):
-    mock_conn = _mock_connection()
-    with patch("registration_svc.main.get_connection", return_value=mock_conn):
+def test_missing_name_rejected(client):
+    with patch("registration_svc.main.get_connection") as mock_get_conn:
         resp = client.post("/waitlist/join", json={"phone_e164": "+15551234567"})
-    assert resp.status_code == 200
-    params = mock_conn.execute.call_args[0][1]
-    assert params == ("+15551234567", None)
+    assert resp.status_code == 422
+    mock_get_conn.assert_not_called()
 
 
 def test_duplicate_join_is_a_no_op_not_an_error(client):
@@ -62,8 +61,8 @@ def test_duplicate_join_is_a_no_op_not_an_error(client):
     design (idempotent, and doesn't leak whether a number already joined)."""
     mock_conn = _mock_connection()
     with patch("registration_svc.main.get_connection", return_value=mock_conn):
-        first = client.post("/waitlist/join", json={"phone_e164": "+15551234567"})
-        second = client.post("/waitlist/join", json={"phone_e164": "+15551234567"})
+        first = client.post("/waitlist/join", json={"phone_e164": "+15551234567", "name": "Sarah"})
+        second = client.post("/waitlist/join", json={"phone_e164": "+15551234567", "name": "Sarah"})
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json() == second.json() == {"status": "ok"}
@@ -75,27 +74,38 @@ def test_duplicate_join_is_a_no_op_not_an_error(client):
 )
 def test_malformed_phone_rejected(client, bad_phone):
     with patch("registration_svc.main.get_connection") as mock_get_conn:
-        resp = client.post("/waitlist/join", json={"phone_e164": bad_phone})
+        resp = client.post("/waitlist/join", json={"phone_e164": bad_phone, "name": "Sarah"})
     assert resp.status_code == 422
     mock_get_conn.assert_not_called()
 
 
-def test_blank_name_normalized_to_none(client):
-    mock_conn = _mock_connection()
-    with patch("registration_svc.main.get_connection", return_value=mock_conn):
+def test_blank_name_rejected(client):
+    with patch("registration_svc.main.get_connection") as mock_get_conn:
         resp = client.post("/waitlist/join", json={"phone_e164": "+15551234567", "name": "   "})
+    assert resp.status_code == 422
+    mock_get_conn.assert_not_called()
+
+
+def test_name_is_trimmed(client):
+    mock_conn = _mock_connection()
+    payload = {"phone_e164": "+15551234567", "name": "  Sarah  "}
+    with patch("registration_svc.main.get_connection", return_value=mock_conn):
+        resp = client.post("/waitlist/join", json=payload)
     assert resp.status_code == 200
     params = mock_conn.execute.call_args[0][1]
-    assert params == ("+15551234567", None)
+    assert params == ("+15551234567", "Sarah")
 
 
 def test_rate_limit_blocks_after_threshold(client):
     mock_conn = _mock_connection()
     with patch("registration_svc.main.get_connection", return_value=mock_conn):
         for i in range(5):
-            resp = client.post("/waitlist/join", json={"phone_e164": f"+1555000{i:04d}"})
+            payload = {"phone_e164": f"+1555000{i:04d}", "name": "Sarah"}
+            resp = client.post("/waitlist/join", json=payload)
             assert resp.status_code == 200
-        blocked = client.post("/waitlist/join", json={"phone_e164": "+15550009999"})
+        blocked = client.post(
+            "/waitlist/join", json={"phone_e164": "+15550009999", "name": "Sarah"}
+        )
     assert blocked.status_code == 429
 
 
@@ -105,12 +115,12 @@ def test_rate_limit_is_per_ip(client):
         for i in range(5):
             client.post(
                 "/waitlist/join",
-                json={"phone_e164": f"+1555000{i:04d}"},
+                json={"phone_e164": f"+1555000{i:04d}", "name": "Sarah"},
                 headers={"X-Forwarded-For": "1.1.1.1"},
             )
         other_ip = client.post(
             "/waitlist/join",
-            json={"phone_e164": "+15550009999"},
+            json={"phone_e164": "+15550009999", "name": "Sarah"},
             headers={"X-Forwarded-For": "2.2.2.2"},
         )
     assert other_ip.status_code == 200
