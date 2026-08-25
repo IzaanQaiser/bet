@@ -31,6 +31,8 @@ def _mock_connection():
 def _env(monkeypatch):
     monkeypatch.setenv("WEB_SESSION_SIGNING_KEY", SIGNING_KEY)
     monkeypatch.setenv("TWILIO_API_KEY_SECRET", "test_api_key_secret")
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACtest0000000000000000000000000")
+    monkeypatch.setenv("TWILIO_API_KEY_SID", "SKtest0000000000000000000000000")
     monkeypatch.setenv("TWILIO_VERIFY_SERVICE_SID", "VAtest0000000000000000000000000")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID_WEB", "test-client-id.apps.googleusercontent.com")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET_WEB", "test-client-secret")

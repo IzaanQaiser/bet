@@ -31,6 +31,8 @@ pytestmark = pytest.mark.skipif(
 def client(monkeypatch):
     monkeypatch.setenv("DB_USER", os.environ["DB_USER"])
     monkeypatch.setenv("TWILIO_API_KEY_SECRET", "test-not-a-real-secret")
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACtest0000000000000000000000000")
+    monkeypatch.setenv("TWILIO_API_KEY_SID", "SKtest0000000000000000000000000")
     from resolver_svc.main import app
 
     return TestClient(app)

@@ -36,11 +36,6 @@ from twilio.rest import Client as TwilioClient
 
 app = FastAPI()
 
-# Same identifiers dispatcher-svc/resolver-svc already use (infrastructure.md
-# §4.1) — only TWILIO_API_KEY_SECRET (env, --set-secrets) is an actual secret.
-TWILIO_ACCOUNT_SID = "AC3292d4a7944b87b2fe3db562856e32bd"
-TWILIO_API_KEY_SID = "SK7a7912d15fea946956ab8bbae8214bce"
-
 GOOGLE_OAUTH_SCOPES = (
     "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/gmail.send"
 )
@@ -129,8 +124,16 @@ async def waitlist_join(payload: WaitlistJoinRequest, request: Request):
 
 
 def _twilio_verify_service():
-    api_key_secret = os.environ["TWILIO_API_KEY_SECRET"]
-    client = TwilioClient(TWILIO_API_KEY_SID, api_key_secret, TWILIO_ACCOUNT_SID)
+    # Not secrets by Twilio's own credential model — a SID can't
+    # authenticate anything without its paired secret (infrastructure.md
+    # §4.1). Read from env anyway, not hardcoded: keeps them out of source
+    # scans entirely rather than relying on a reviewer knowing that
+    # distinction.
+    client = TwilioClient(
+        os.environ["TWILIO_API_KEY_SID"],
+        os.environ["TWILIO_API_KEY_SECRET"],
+        os.environ["TWILIO_ACCOUNT_SID"],
+    )
     return client.verify.v2.services(os.environ["TWILIO_VERIFY_SERVICE_SID"])
 
 
