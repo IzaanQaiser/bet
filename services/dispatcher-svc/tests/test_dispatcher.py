@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from dispatcher_svc.capacity_engine import CapacitySnapshot, Event, Interval, LatentCandidate
 from dispatcher_svc.main import (
     DayComputation,
+    _buffered_wh_start,
     _compute_day,
     _eligible_latents,
     _send_reminders,
@@ -139,6 +140,44 @@ def test_compute_day_reproduces_worked_example():
     assert computation.booked == 210
     assert round(computation.snapshot.load_delta, 2) == -0.30
     assert computation.largest_interval == Interval(start=time(12, 0), end=time(15, 0))
+
+
+# --- SUGGESTION_LEAD buffer (v1, user-directed) ---------------------------
+# Never suggest starting an idea in the past or with less than 30 minutes'
+# notice — applied by clipping today's effective working-hours start up
+# to (now + 30min), which naturally no-ops for every day after today.
+
+
+def test_buffered_wh_start_noop_when_plenty_of_runway():
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)  # 8am, wh_start is 9am
+    assert _buffered_wh_start(WH_START, WH_END, now_local) == WH_START
+
+
+def test_buffered_wh_start_pushes_start_forward_mid_day():
+    now_local = datetime(2026, 8, 27, 9, 15, tzinfo=TZ)  # 9:15am + 30min = 9:45am
+    assert _buffered_wh_start(WH_START, WH_END, now_local) == time(9, 45)
+
+
+def test_buffered_wh_start_clamps_to_wh_end_late_in_the_day():
+    # 5:45pm + 30min = 6:15pm, past wh_end (6pm) — clamped, not left invalid.
+    now_local = datetime(2026, 8, 27, 17, 45, tzinfo=TZ)
+    assert _buffered_wh_start(WH_START, WH_END, now_local) == WH_END
+
+
+def test_compute_day_with_buffered_start_shrinks_todays_block():
+    """Same worked-example calendar as test_compute_day_reproduces_worked_example,
+    but scored from 9:30am — the 30-minute buffer pushes the effective
+    start to 10am, so the free block starting at 9am is unreachable and
+    the 12:00-15:00 block is now the only (and still the largest) one."""
+    events = [
+        Event(start=time(9, 0), end=time(9, 15)),
+        Event(start=time(15, 0), end=time(15, 30)),
+    ]
+    now_local = datetime(2026, 8, 27, 9, 30, tzinfo=TZ)
+    buffered_start = _buffered_wh_start(WH_START, WH_END, now_local)
+    assert buffered_start == time(10, 0)
+    computation = _compute_day(events, A_DAY, buffered_start, WH_END, [300] * 14)
+    assert computation.largest_interval == Interval(start=time(10, 0), end=time(15, 0))
 
 
 def test_eligible_latents_maps_rows_to_local_dates():

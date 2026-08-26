@@ -75,9 +75,9 @@ def test_free_intervals_excludes_declined_and_transparent():
     assert intervals == [Interval(start=WH_START, end=WH_END)]  # neither event blocks anything
 
 
-def test_block_fit_deep_requires_125_percent_margin():
-    assert block_fit(largest_block=150, effort_minutes=120, focus_depth="deep") == 1
-    assert block_fit(largest_block=149, effort_minutes=120, focus_depth="deep") == 0
+def test_block_fit_deep_requires_150_percent_margin():
+    assert block_fit(largest_block=180, effort_minutes=120, focus_depth="deep") == 1
+    assert block_fit(largest_block=179, effort_minutes=120, focus_depth="deep") == 0
 
 
 def test_block_fit_shallow_no_margin_required():

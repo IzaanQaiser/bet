@@ -153,8 +153,13 @@ def load_delta(booked_today: int, trailing_booked_minutes: list[int]) -> float |
 
 
 def block_fit(largest_block: int, effort_minutes: int, focus_depth: str) -> int:
+    # User-directed margin (v1, capacity-engine.md §4.1): deep work wants a
+    # block 50% bigger than the estimate, not 25% — a 3-hour deep idea
+    # shouldn't get suggested into a block that only just covers it with
+    # no room to actually settle in. Shallow work stays sized to fit
+    # exactly, no headroom needed.
     if focus_depth == "deep":
-        return 1 if largest_block >= effort_minutes * 1.25 else 0
+        return 1 if largest_block >= effort_minutes * 1.5 else 0
     return 1 if largest_block >= effort_minutes else 0
 
 

@@ -45,6 +45,8 @@ def free_intervals(day: date, events: list[Event], wh_start: time, wh_end: time)
 
 No buffer/transition time is subtracted around meetings (e.g. a 10-minute pad before/after). Deliberately not built — a real UX nicety, but not load-bearing for the demo or the scoring model; noted in §7 as a cut item, not silently missing.
 
+**Added, v1, user-directed: today's effective `working_hours_start` carries a 30-minute suggestion lead.** A different concern from the meeting-padding buffer above (that one's about spacing around events; this one's about not suggesting a start time that's already gone, or too soon to react to). For the candidate day equal to *today* only, `working_hours_start` is replaced with `min(max(working_hours_start, now + 30min), working_hours_end)` before free/busy computation runs — every day after today is already entirely in the future, so this can never bind for them, and no separate code path is needed. If the buffered start would land past `working_hours_end` (e.g. it's 5:45pm and the working day ends at 6pm), the clamp collapses the day to zero free minutes rather than producing an invalid `start > end` pair — correctly, since there's no real remaining window to suggest into. Applied both to the original per-run scoring pass (`/dispatch`) and to the accept-path's real-current-availability re-check (§5's own note on why that re-check exists) — a reply arriving late enough that the originally-suggested slot has already passed must not schedule into the past either.
+
 ---
 
 ## 3. Snapshot metrics
@@ -83,12 +85,12 @@ fit_score = block_fit × depth_fit × load_fit
 ```python
 def block_fit(largest_contiguous_block: int, effort_minutes: int, focus_depth: str) -> int:
     if focus_depth == "deep":
-        return 1 if largest_contiguous_block >= effort_minutes * 1.25 else 0
+        return 1 if largest_contiguous_block >= effort_minutes * 1.5 else 0
     else:  # shallow
         return 1 if largest_contiguous_block >= effort_minutes else 0
 ```
 
-Deep work keeps the 25% headroom margin from the PRD (a 2-hour deep task wants a block noticeably bigger than 2 hours, so it doesn't feel wedged in). Shallow work needs no headroom — it's sized to fit exactly.
+**Revised, v1, user-directed (was 25% headroom from the PRD):** deep work now needs a block 50% bigger than the estimate, not 25% — a 3-hour deep idea shouldn't get suggested into a block that only just covers it with no room to actually settle in. Shallow work still needs no headroom — it's sized to fit exactly.
 
 ### 4.2 `depth_fit` — reward/penalty curve over `fragmentation_index`
 
@@ -175,7 +177,7 @@ Reproduces the exact suggestion text from PRD §5.3, with real numbers, so this 
 **Candidate latent:** "Rewrite the ingest pipeline in Rust" — captured 18 days ago, `effort_minutes = 120`, `focus_depth = deep`, `dismissal_count = 0`.
 
 **Fit:**
-- `block_fit`: deep needs `120 × 1.25 = 150` ≤ `180` → `1`
+- `block_fit`: deep needs `120 × 1.5 = 180` ≤ `180` → `1` (exact — no headroom to spare on this particular day)
 - `depth_fit`: `fragmentation_index = 0.0 ≤ 0.5` → `1.0`
 - `load_fit`: `0.5 - (-0.30 × 1.25) = 0.5 + 0.375 = 0.875`
 - `fit_score = 1 × 1.0 × 0.875 = 0.875`
