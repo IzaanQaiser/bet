@@ -516,6 +516,36 @@ def test_reply_unexpected_state_does_not_crash(client):
 # --- /pubsub/push, dedupe path (step 12) ---------------------------------
 
 
+def test_check_duplicate_excludes_dead_states_from_both_queries():
+    """Regression guard for a real bug, found live: a user-deleted
+    (CANCELLED) item stayed a permanently eligible dedupe match forever,
+    since neither the exact dedupe_hash query nor the vector-similarity
+    query filtered on state at all — confirming a "duplicate" against a
+    dead item resurrected it via the merge path instead of leaving it
+    deleted."""
+    from resolver_svc.main import _check_duplicate
+
+    extracted = _extracted_message()
+    conn = MagicMock()
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    conn.execute.return_value.fetchone.return_value = None
+
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.embed", return_value=[0.1, 0.2, 0.3]),
+    ):
+        _check_duplicate(extracted)
+
+    hash_call, vector_call = conn.execute.call_args_list[0], conn.execute.call_args_list[1]
+    hash_sql, hash_params = hash_call.args
+    vector_sql, vector_params = vector_call.args
+    assert "state != ALL" in hash_sql
+    assert "CANCELLED" in hash_params[-1] and "MERGED" in hash_params[-1]
+    assert "state != ALL" in vector_sql
+    assert "CANCELLED" in vector_params[-2] and "MERGED" in vector_params[-2]
+
+
 def test_duplicate_found_routes_to_duplicate_suspected_not_clarification(client):
     """A duplicate match short-circuits before the completeness check ever
     runs (state-machine.md §1.1) — even an item with missing_fields set
@@ -558,12 +588,16 @@ def test_duplicate_found_routes_to_duplicate_suspected_not_clarification(client)
 
 
 def test_duplicate_y_reply_merges_no_publish(client):
+    # Regression guard for a real bug, found live: this update used to
+    # write state='MERGED' without ever setting parent_item_id, silently
+    # dropping the link its own log line already claimed to record.
     item_id, user_id = str(uuid4()), str(uuid4())
+    match_item_id = str(uuid4())
     conn = _mock_connection(
         item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
         conversation_row=(
             None,
-            {"_dedupe_match_item_id": str(uuid4()), "_dedupe_match_title": "Pay rent"},
+            {"_dedupe_match_item_id": match_item_id, "_dedupe_match_title": "Pay rent"},
         ),
     )
     with (
@@ -588,7 +622,10 @@ def test_duplicate_y_reply_merges_no_publish(client):
         UUID(user_id), "+15551234567", "sounds good, merging it with pay rent."
     )
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
-    assert "MERGED" in update_calls[0].args[0]
+    sql, params = update_calls[0].args
+    assert "MERGED" in sql
+    assert "parent_item_id" in sql
+    assert params == (match_item_id, item_id)
 
 
 def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):

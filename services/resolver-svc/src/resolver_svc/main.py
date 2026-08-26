@@ -273,28 +273,44 @@ async def _handle_chat(extracted: ExtractedItemMessage) -> None:
     logger.info("CHATTED item_id=%s", extracted.item_id)
 
 
+_DEDUPE_INELIGIBLE_STATES = ("CANCELLED", "MERGED", "FAILED")
+
+
 def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
     dedupe_hash = compute_dedupe_hash(extracted.title, extracted.summary)
 
     with get_connection() as conn:
         exact = conn.execute(
             "SELECT id, title FROM items "
-            "WHERE user_id = %s AND dedupe_hash = %s AND id != %s LIMIT 1",
-            (str(extracted.user_id), dedupe_hash, str(extracted.item_id)),
+            "WHERE user_id = %s AND dedupe_hash = %s AND id != %s AND state != ALL(%s) LIMIT 1",
+            (
+                str(extracted.user_id),
+                dedupe_hash,
+                str(extracted.item_id),
+                list(_DEDUPE_INELIGIBLE_STATES),
+            ),
         ).fetchone()
         if exact is not None:
             return DedupeResult(duplicate_item_id=exact[0], duplicate_title=exact[1])
 
         vector = vector_literal(embed(extracted.title, extracted.summary))
+        # A cancelled/merged/failed item is dead — the user deleted it, or
+        # it already got absorbed into something else, or it never
+        # completed. None of those are "the same live thing" a fresh
+        # message could be a duplicate of, so they're excluded from ever
+        # being offered as a dedupe match — real finding: without this, a
+        # deleted item stayed a permanently eligible "duplicate" forever,
+        # and confirming the match resurrected it via the merge path
+        # below instead of actually clearing it.
         match = conn.execute(
             """
             SELECT i.id, i.title, i.type, 1 - (e.embedding <=> %s::vector) AS similarity
             FROM item_embeddings e JOIN items i ON i.id = e.item_id
-            WHERE i.user_id = %s
+            WHERE i.user_id = %s AND i.state != ALL(%s)
             ORDER BY e.embedding <=> %s::vector
             LIMIT 1
             """,
-            (vector, str(extracted.user_id), vector),
+            (vector, str(extracted.user_id), list(_DEDUPE_INELIGIBLE_STATES), vector),
         ).fetchone()
         conn.execute(
             "INSERT INTO item_embeddings (item_id, embedding) VALUES (%s, %s::vector)",
@@ -647,9 +663,14 @@ async def _handle_duplicate_reply(
         )
 
     if dedupe_result.intent == "AFFIRM":
+        # Real bug, found live: this used to write state='MERGED' without
+        # ever setting parent_item_id, despite the log line below already
+        # claiming "into=<match>" — the link it named was never actually
+        # written anywhere.
         conn.execute(
-            "UPDATE items SET state = 'MERGED', updated_at = now() WHERE id = %s",
-            (str(item_id),),
+            "UPDATE items SET state = 'MERGED', parent_item_id = %s, updated_at = now() "
+            "WHERE id = %s",
+            (resolved_fields.get("_dedupe_match_item_id"), str(item_id)),
         )
         conn.commit()
         _send_sms(user_id, phone, dedupe_result.reply_text)
