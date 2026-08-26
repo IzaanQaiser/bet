@@ -22,7 +22,7 @@ reconsideration.
 import logging
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -73,6 +73,25 @@ TWILIO_FROM_NUMBER = "+14152365420"
 
 TRAILING_DAYS = 14
 FORWARD_DAYS = 7
+
+# User-directed (v1): never suggest starting an idea in the past or with
+# less than 30 minutes' notice — a free block found by the algorithm has
+# to leave the user time to actually see the text and get to it. Applied
+# by clipping today's effective working-hours start up to (now + this),
+# which naturally reduces to a no-op for every day after today (already
+# entirely in the future, so the clip can never bind).
+SUGGESTION_LEAD = timedelta(minutes=30)
+
+
+def _buffered_wh_start(wh_start: time, wh_end: time, now_local: datetime) -> time:
+    """Today's real remaining working-hours start, not the nominal one —
+    see SUGGESTION_LEAD above. Clamped to wh_end, not left to exceed it:
+    a buffer that pushes past the end of the working day correctly
+    collapses free_intervals() to zero free minutes for today (verified
+    in capacity_engine.py's own _complement — an empty window when
+    start >= end), rather than passing an invalid start > end pair in."""
+    buffered = (now_local + SUGGESTION_LEAD).time()
+    return min(max(wh_start, buffered), wh_end)
 
 
 def _twilio_client() -> TwilioClient:
@@ -331,10 +350,19 @@ async def dispatch():
 
         forward_end = today + timedelta(days=FORWARD_DAYS - 1)
         forward_events = fetch_events_for_range(session, today, forward_end, tz_name)
+        now_local = now_utc.astimezone(tz)
         day_context = {}
         with get_connection() as conn:
             for d in sorted(forward_events):
-                computation = _compute_day(forward_events[d], d, wh_start, wh_end, trailing_booked)
+                # Only today's start ever moves — every later day is
+                # already entirely in the future, so the buffer can never
+                # bind for it (SUGGESTION_LEAD's own note).
+                day_wh_start = (
+                    _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+                )
+                computation = _compute_day(
+                    forward_events[d], d, day_wh_start, wh_end, trailing_booked
+                )
                 computation.snapshot_id = _persist_snapshot(conn, user_id, computation)
                 day_context[d] = computation
             conn.commit()
@@ -518,10 +546,24 @@ def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
 
     # Real current availability, not the (possibly stale) snapshot from
     # when the suggestion was sent — a reply can arrive hours or a day
-    # later, and the day's Calendar state can have changed since.
+    # later, and the day's Calendar state can have changed since. Same
+    # SUGGESTION_LEAD buffer as the original scoring pass, for the same
+    # reason: if the suggested day is today and the reply itself arrives
+    # late (the originally-suggested slot already started), don't let
+    # due_at land in the past or with no real notice — re-derive today's
+    # effective start from right now, not from whatever it was when this
+    # suggestion first went out.
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(UTC).astimezone(tz)
+    is_today = snapshot_date == now_local.date()
+    effective_wh_start = (
+        _buffered_wh_start(wh_start, wh_end, now_local) if is_today else wh_start
+    )
     session = AuthorizedSession(user_credentials(refresh_ref))
     events_by_day = fetch_events_for_range(session, snapshot_date, snapshot_date, tz_name)
-    intervals = free_intervals(snapshot_date, events_by_day[snapshot_date], wh_start, wh_end)
+    intervals = free_intervals(
+        snapshot_date, events_by_day[snapshot_date], effective_wh_start, wh_end
+    )
     largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
 
     if largest is None:
