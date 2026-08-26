@@ -298,19 +298,30 @@ def _persist_effort_minutes_fill(conn, item_id, result) -> None:
         )
 
 
+_EVENT_REMINDER_LEAD = timedelta(minutes=30)
+
+
 def _compute_reminder_times(
     due_at_iso: str | None, effort_minutes: int | None, is_scheduled_event: bool = False
 ) -> tuple[datetime, datetime] | None:
     """A task with a deadline (default) gets both reminders strictly
     BEFORE due_at — due_at - 2x effort (early heads-up), due_at - effort
     (start-by, last call) — never at the deadline itself, since there'd be
-    no time left. A scheduled event you attend (is_scheduled_event=True)
-    gets a heads-up before start (due_at - effort, effort doubling as a
-    reasonable "how much notice" proxy since it already means how long the
-    event lasts) AND a reminder AT the actual start time — the one thing
-    the task-shaped formula deliberately never produces, and exactly what
-    a meeting reminder needs. Real bug, found live: a meeting used the
-    task formula and never got reminded at its own start time.
+    no time left.
+
+    A scheduled event you attend (is_scheduled_event=True) gets a fixed
+    30-minute heads-up before start (due_at - 30min, deliberately NOT
+    effort-scaled — effort means the event's own duration here, used for
+    the Calendar block's end time, not "how much advance notice to give";
+    reusing it for lead time was the original design, corrected on
+    user direction to a flat window instead) AND a reminder AT the actual
+    start time. User-specified exact behavior: confirm an event 30+
+    minutes out and you get both; confirm one within 30 minutes of its
+    own start and you get ONLY the at-start reminder, nothing more — that
+    second half is committer-svc's job (_enqueue_reminder_task skips any
+    slot already in the past at commit time), not this function's; this
+    function still always returns both computed instants, before-the-fact.
+
     Both naive local, same "naive means local" convention due_at itself
     already carries through this whole pipeline (committer-svc attaches
     the real timezone at commit time). None whenever either input isn't
@@ -318,9 +329,9 @@ def _compute_reminder_times(
     if not due_at_iso or effort_minutes is None:
         return None
     due_at = datetime.fromisoformat(due_at_iso)
-    delta = timedelta(minutes=effort_minutes)
     if is_scheduled_event:
-        return due_at - delta, due_at
+        return due_at - _EVENT_REMINDER_LEAD, due_at
+    delta = timedelta(minutes=effort_minutes)
     return due_at - 2 * delta, due_at - delta
 
 

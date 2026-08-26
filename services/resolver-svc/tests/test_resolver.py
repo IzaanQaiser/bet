@@ -897,13 +897,28 @@ def test_compute_reminder_times_none_when_either_input_missing():
 
 def test_compute_reminder_times_event_reminds_at_start_not_before():
     """Real bug, found live: a meeting used the task-shaped formula and
-    never got reminded at its own start time. An event gets a heads-up
-    before start AND a reminder AT the actual start — the second value
-    equals due_at itself, on purpose."""
+    never got reminded at its own start time. An event gets a fixed
+    30-minute heads-up before start AND a reminder AT the actual start —
+    the second value equals due_at itself, on purpose."""
     from resolver_svc.main import _compute_reminder_times
 
     times = _compute_reminder_times("2026-08-25T20:39:00", 30, is_scheduled_event=True)
     assert times == (datetime(2026, 8, 25, 20, 9), datetime(2026, 8, 25, 20, 39))
+
+
+def test_compute_reminder_times_event_lead_is_flat_30min_not_effort_scaled():
+    """User-directed correction: the event heads-up used to scale with
+    effort_minutes (the event's own duration) — wrong, since a longer
+    meeting doesn't deserve proportionally more notice, and it made the
+    lead time unpredictable. Always exactly 30 minutes before start,
+    regardless of effort."""
+    from resolver_svc.main import _compute_reminder_times
+
+    times_60 = _compute_reminder_times("2026-08-25T20:39:00", 60, is_scheduled_event=True)
+    times_240 = _compute_reminder_times("2026-08-25T20:39:00", 240, is_scheduled_event=True)
+    assert times_60[0] == datetime(2026, 8, 25, 20, 9)
+    assert times_240[0] == datetime(2026, 8, 25, 20, 9)
+    assert times_60[1] == times_240[1] == datetime(2026, 8, 25, 20, 39)
 
 
 def test_compute_reminder_times_task_never_reminds_at_due_at():
