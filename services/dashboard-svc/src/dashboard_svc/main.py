@@ -168,19 +168,18 @@ async def me_items(user_id: UUID = Depends(current_user_id)):
         # legitimately have a null due_at too, so that heuristic isn't
         # reliable) so the frontend can group ideas separately from real
         # committed obligations.
-        # focus_depth/next_fit_start are only ever meaningful for an idea
-        # (an obligation's "deep work eligible" isn't a concept the user
-        # asked to see, and it has no next_fit_start row at all) — NULL on
-        # the obligation branch, real values from latents on the other.
+        # next_fit_start is only ever meaningful for an idea (a real
+        # obligation has no next_fit_start row at all) — NULL on the
+        # obligation branch, real values from latents on the other.
         committed_rows = conn.execute(
             """
             SELECT i.id, i.title, i.summary, o.due_at, o.calendar_event_id, i.effort_minutes,
-                   i.type, NULL::text, NULL::timestamptz
+                   i.type, NULL::timestamptz
             FROM items i JOIN obligations o ON o.item_id = i.id
             WHERE i.user_id = %s AND i.state = 'COMMITTED'
             UNION ALL
             SELECT i.id, i.title, i.summary, NULL::timestamptz, NULL::text, i.effort_minutes,
-                   i.type, i.focus_depth, l.next_fit_start
+                   i.type, l.next_fit_start
             FROM items i JOIN latents l ON l.item_id = i.id
             WHERE i.user_id = %s AND i.state = 'COMMITTED'
             ORDER BY 4 DESC NULLS LAST
@@ -225,8 +224,7 @@ async def me_items(user_id: UUID = Depends(current_user_id)):
                 "calendar_event_id": r[4],
                 "effort_minutes": r[5],
                 "type": r[6],
-                "focus_depth": r[7],
-                "next_fit_start": r[8].isoformat() if r[8] else None,
+                "next_fit_start": r[7].isoformat() if r[7] else None,
             }
             for r in committed_rows
         ],

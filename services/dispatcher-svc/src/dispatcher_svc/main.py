@@ -255,7 +255,7 @@ def _eligible_latents(conn, user_id, tz) -> list[LatentCandidate]:
     allow texting about."""
     rows = conn.execute(
         """
-        SELECT i.id, i.created_at, i.effort_minutes, i.focus_depth,
+        SELECT i.id, i.created_at, i.effort_minutes,
                l.dismissal_count, l.dormant_until, l.last_surfaced_at,
                EXISTS (
                    SELECT 1 FROM suggestions s WHERE s.item_id = i.id AND s.outcome IS NULL
@@ -270,19 +270,16 @@ def _eligible_latents(conn, user_id, tz) -> list[LatentCandidate]:
             item_id=str(r[0]),
             created_at=r[1].astimezone(tz).date(),
             effort_minutes=r[2],
-            focus_depth=r[3],
-            dismissal_count=r[4],
-            dormant_until=r[5].astimezone(tz).date() if r[5] else None,
-            last_surfaced_at=r[6].astimezone(tz).date() if r[6] else None,
-            has_open_suggestion=r[7],
+            dismissal_count=r[3],
+            dormant_until=r[4].astimezone(tz).date() if r[4] else None,
+            last_surfaced_at=r[5].astimezone(tz).date() if r[5] else None,
+            has_open_suggestion=r[6],
         )
         for r in rows
     ]
 
 
-def _next_fitting_slot(
-    day_context: dict, tz, effort_minutes: int, focus_depth: str
-) -> datetime | None:
+def _next_fitting_slot(day_context: dict, tz, effort_minutes: int) -> datetime | None:
     """User-directed: the dashboard shows, per idea, when it could
     actually happen — not the revival_score-weighted "best" day
     select_suggestion picks (which can prefer a later but better-scored
@@ -296,14 +293,14 @@ def _next_fitting_slot(
         ctx = day_context[d]
         if ctx.largest_interval is None:
             continue
-        if block_fit(ctx.snapshot.largest_contiguous_block, effort_minutes, focus_depth):
+        if block_fit(ctx.snapshot.largest_contiguous_block, effort_minutes):
             return datetime.combine(d, ctx.largest_interval.start, tzinfo=tz)
     return None
 
 
 def _update_next_fit_slots(conn, latents: list[LatentCandidate], day_context: dict, tz) -> None:
     for item in latents:
-        next_fit = _next_fitting_slot(day_context, tz, item.effort_minutes, item.focus_depth)
+        next_fit = _next_fitting_slot(day_context, tz, item.effort_minutes)
         conn.execute(
             "UPDATE latents SET next_fit_start = %s WHERE item_id = %s",
             (next_fit, item.item_id),

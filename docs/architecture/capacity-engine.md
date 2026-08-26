@@ -75,38 +75,21 @@ rolling_mean = mean(booked_minutes(d) for d in trailing_14_days)
 ## 4. Fit score
 
 ```
-fit_score = block_fit × depth_fit × load_fit
+fit_score = block_fit × load_fit
 ```
+
+**Removed, v1, user-directed: `focus_depth` and everything derived from it** — the deep/shallow distinction (separate margins, `depth_fit`'s reward/penalty curve over `fragmentation_index`) was judged too verbose for v1 and stripped from every layer: extraction no longer classifies it, `items` no longer has the column, and the fit formula no longer includes a `depth_fit` term. `fragmentation_index` itself is unaffected — still computed and persisted (§3), just no longer consumed by `fit_score`.
 
 ### 4.1 `block_fit` — hard gate, 0 or 1
 
-**Resolved inconsistency with the PRD:** PRD §6.2 states the shallow gate as `free_minutes ≥ effort_minutes` (summed across all gaps). That's wrong given `state-machine.md` §2.3, which places an accepted item at the *start of a single contiguous block* — three 10-minute gaps summing to 30 free minutes cannot host one 30-minute event. Both branches below gate on a single contiguous block; only the required margin differs.
+**Resolved inconsistency with the PRD:** PRD §6.2 states the gate as `free_minutes ≥ effort_minutes` (summed across all gaps). That's wrong given `state-machine.md` §2.3, which places an accepted item at the *start of a single contiguous block* — three 10-minute gaps summing to 30 free minutes cannot host one 30-minute event. The gate below is on a single contiguous block, with no margin — one universal rule for every item, v1:
 
 ```python
-def block_fit(largest_contiguous_block: int, effort_minutes: int, focus_depth: str) -> int:
-    if focus_depth == "deep":
-        return 1 if largest_contiguous_block >= effort_minutes * 1.5 else 0
-    else:  # shallow
-        return 1 if largest_contiguous_block >= effort_minutes else 0
+def block_fit(largest_contiguous_block: int, effort_minutes: int) -> int:
+    return 1 if largest_contiguous_block >= effort_minutes else 0
 ```
 
-**Revised, v1, user-directed (was 25% headroom from the PRD):** deep work now needs a block 50% bigger than the estimate, not 25% — a 3-hour deep idea shouldn't get suggested into a block that only just covers it with no room to actually settle in. Shallow work still needs no headroom — it's sized to fit exactly.
-
-### 4.2 `depth_fit` — reward/penalty curve over `fragmentation_index`
-
-```python
-def depth_fit(fragmentation_index: float, focus_depth: str) -> float:
-    if focus_depth == "deep":
-        if fragmentation_index <= 0.5:
-            return 1.0
-        return max(0.3, 1.0 - (fragmentation_index - 0.5) / 0.5 * 0.7)
-    else:  # shallow
-        return min(1.2, 1.0 + fragmentation_index * 0.2)
-```
-
-Deep work is flat at `1.0` up to moderate fragmentation, then falls linearly to a floor of `0.3` at maximum fragmentation (never `0` — `block_fit` already gated out days where the block is physically too small; a day that clears the gate but is choppy elsewhere is still usable, just less ideal). Shallow work gets a mild reward, up to `1.2`, for landing on a more fragmented day — it's better use of a day that's bad for anything else.
-
-### 4.3 `load_fit` — distance below the personal baseline
+### 4.2 `load_fit` — distance below the personal baseline
 
 PRD §6.2 gives two anchor points in prose: a day at the mean scores `~0.5`, a day 40% below scores `~1.0`. Solved exactly for a line through both points:
 
@@ -145,7 +128,7 @@ REVIVAL_THRESHOLD = 0.4   # tunable — see rationale below
 best = None
 for item in eligible_latents:
     for snapshot in next_7_days_snapshots:
-        fit = fit_score(snapshot, item.effort_minutes, item.focus_depth)
+        fit = fit_score(snapshot, item.effort_minutes)
         score = revival_score(item, snapshot, fit)
         if best is None or score > best.score:
             best = Candidate(item, snapshot, score)
@@ -174,13 +157,12 @@ Reproduces the exact suggestion text from PRD §5.3, with real numbers, so this 
 - `booked_minutes = 540 - 330 = 210`
 - `load_delta = (210 - 300) / 300 = -0.30`
 
-**Candidate latent:** "Rewrite the ingest pipeline in Rust" — captured 18 days ago, `effort_minutes = 120`, `focus_depth = deep`, `dismissal_count = 0`.
+**Candidate latent:** "Rewrite the ingest pipeline in Rust" — captured 18 days ago, `effort_minutes = 120`, `dismissal_count = 0`.
 
 **Fit:**
-- `block_fit`: deep needs `120 × 1.5 = 180` ≤ `180` → `1` (exact — no headroom to spare on this particular day)
-- `depth_fit`: `fragmentation_index = 0.0 ≤ 0.5` → `1.0`
+- `block_fit`: needs `120` ≤ `180` → `1`
 - `load_fit`: `0.5 - (-0.30 × 1.25) = 0.5 + 0.375 = 0.875`
-- `fit_score = 1 × 1.0 × 0.875 = 0.875`
+- `fit_score = 1 × 0.875 = 0.875`
 
 **Revival:**
 - `recency_decay = 1 - exp(-18/14) = 1 - 0.2765 = 0.7235`
@@ -191,7 +173,7 @@ Reproduces the exact suggestion text from PRD §5.3, with real numbers, so this 
 
 **Evidence line generation** ("lightest day you've had in two weeks"): a separate check from `load_fit` itself — is this day's `booked_minutes` (210) the minimum among the trailing 14 daily values? If yes, use that superlative; otherwise fall back to a plainer phrasing ("Thursday looks lighter than usual"). Two different uses of the same 14-day window: `load_fit` wants a smooth distance-from-mean, the suggestion copy wants a discrete "is this the best one" fact. `agent-contracts.md` owns the exact phrasing rules.
 
-**Contrast — a candidate that doesn't clear the gate:** same day, a latent "Read the Rust book" captured 4 days ago, `effort_minutes = 240`, `deep`. `block_fit`: needs `300`, block is `180` → `0`. `fit_score = 0` regardless of the other factors — excluded from consideration for this day entirely, correctly, since there's nowhere to put 4 hours of deep work today.
+**Contrast — a candidate that doesn't clear the gate:** same day, a latent "Read the Rust book" captured 4 days ago, `effort_minutes = 240`. `block_fit`: needs `240`, block is `180` → `0`. `fit_score = 0` regardless of `load_fit` — excluded from consideration for this day entirely, correctly, since there's nowhere to put 4 hours today.
 
 ---
 

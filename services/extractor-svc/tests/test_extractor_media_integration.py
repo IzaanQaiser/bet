@@ -85,7 +85,6 @@ def test_downloads_real_gcs_object_and_extracts(
         summary="Pay rent by Friday, from a photographed note.",
         due_at=None,
         effort_minutes=15,
-        focus_depth="shallow",
         confidence=0.9,
         missing_fields=["due_at"],
         reasoning="Deadline implied but ambiguous, from image text.",

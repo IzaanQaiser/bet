@@ -50,7 +50,6 @@ class LatentCandidate:
     item_id: str
     created_at: date  # "days_since_capture" is measured from here, §5
     effort_minutes: int
-    focus_depth: str
     dismissal_count: int
     dormant_until: date | None
     last_surfaced_at: date | None
@@ -152,23 +151,13 @@ def load_delta(booked_today: int, trailing_booked_minutes: list[int]) -> float |
     return (booked_today - rolling_mean) / rolling_mean
 
 
-def block_fit(largest_block: int, effort_minutes: int, focus_depth: str) -> int:
-    # User-directed margin (v1, capacity-engine.md §4.1): deep work wants a
-    # block 50% bigger than the estimate, not 25% — a 3-hour deep idea
-    # shouldn't get suggested into a block that only just covers it with
-    # no room to actually settle in. Shallow work stays sized to fit
-    # exactly, no headroom needed.
-    if focus_depth == "deep":
-        return 1 if largest_block >= effort_minutes * 1.5 else 0
+def block_fit(largest_block: int, effort_minutes: int) -> int:
+    # User-directed, v1: one universal rule for every idea, no deep/
+    # shallow distinction — a block is a fit if it's at least as long as
+    # the estimate, full stop. depth_fit and the deep-work margin
+    # (capacity-engine.md §4.1/§4.2) are removed entirely as unnecessary
+    # complexity, along with focus_depth itself.
     return 1 if largest_block >= effort_minutes else 0
-
-
-def depth_fit(frag_index: float, focus_depth: str) -> float:
-    if focus_depth == "deep":
-        if frag_index <= 0.5:
-            return 1.0
-        return max(0.3, 1.0 - (frag_index - 0.5) / 0.5 * 0.7)
-    return min(1.2, 1.0 + frag_index * 0.2)
 
 
 def load_fit(delta: float | None) -> float:
@@ -177,11 +166,9 @@ def load_fit(delta: float | None) -> float:
     return min(1.0, max(0.0, 0.5 - delta * 1.25))
 
 
-def fit_score(snapshot: CapacitySnapshot, effort_minutes: int, focus_depth: str) -> float:
-    return (
-        block_fit(snapshot.largest_contiguous_block, effort_minutes, focus_depth)
-        * depth_fit(snapshot.fragmentation_index, focus_depth)
-        * load_fit(snapshot.load_delta)
+def fit_score(snapshot: CapacitySnapshot, effort_minutes: int) -> float:
+    return block_fit(snapshot.largest_contiguous_block, effort_minutes) * load_fit(
+        snapshot.load_delta
     )
 
 
@@ -220,7 +207,7 @@ def select_suggestion(
             continue
         item_best: Candidate | None = None
         for snapshot in snapshots:
-            fit = fit_score(snapshot, item.effort_minutes, item.focus_depth)
+            fit = fit_score(snapshot, item.effort_minutes)
             score = revival_score(item, today, fit)
             if item_best is None or score > item_best.score:
                 item_best = Candidate(item=item, snapshot=snapshot, score=score)

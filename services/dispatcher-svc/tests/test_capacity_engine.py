@@ -13,7 +13,6 @@ from dispatcher_svc.capacity_engine import (
     LatentCandidate,
     block_fit,
     booked_minutes,
-    depth_fit,
     fit_score,
     fragmentation_index,
     free_intervals,
@@ -34,7 +33,6 @@ A_DAY = date(2026, 8, 27)  # Thursday, matches capacity-engine.md §6
 def _latent(
     created_at,
     effort_minutes=120,
-    focus_depth="deep",
     dismissal_count=0,
     dormant_until=None,
     last_surfaced_at=None,
@@ -44,7 +42,6 @@ def _latent(
         item_id="x",
         created_at=created_at,
         effort_minutes=effort_minutes,
-        focus_depth=focus_depth,
         dismissal_count=dismissal_count,
         dormant_until=dormant_until,
         last_surfaced_at=last_surfaced_at,
@@ -75,30 +72,11 @@ def test_free_intervals_excludes_declined_and_transparent():
     assert intervals == [Interval(start=WH_START, end=WH_END)]  # neither event blocks anything
 
 
-def test_block_fit_deep_requires_150_percent_margin():
-    assert block_fit(largest_block=180, effort_minutes=120, focus_depth="deep") == 1
-    assert block_fit(largest_block=179, effort_minutes=120, focus_depth="deep") == 0
-
-
-def test_block_fit_shallow_no_margin_required():
-    assert block_fit(largest_block=120, effort_minutes=120, focus_depth="shallow") == 1
-    assert block_fit(largest_block=119, effort_minutes=120, focus_depth="shallow") == 0
-
-
-def test_depth_fit_deep_flat_below_threshold():
-    assert depth_fit(frag_index=0.0, focus_depth="deep") == 1.0
-    assert depth_fit(frag_index=0.5, focus_depth="deep") == 1.0
-
-
-def test_depth_fit_deep_falls_off_above_threshold():
-    assert depth_fit(frag_index=1.0, focus_depth="deep") == pytest.approx(0.3)
-    # halfway between 0.5 and 1.0 → halfway between 1.0 and the 0.3 floor
-    assert depth_fit(frag_index=0.75, focus_depth="deep") == pytest.approx(0.65)
-
-
-def test_depth_fit_shallow_rewards_fragmentation():
-    assert depth_fit(frag_index=0.0, focus_depth="shallow") == 1.0
-    assert depth_fit(frag_index=1.0, focus_depth="shallow") == pytest.approx(1.2)
+def test_block_fit_one_universal_rule_no_margin():
+    # User-directed, v1: "deep work" (focus_depth, depth_fit, the deep
+    # margin) removed entirely — one rule for every idea, no distinction.
+    assert block_fit(largest_block=120, effort_minutes=120) == 1
+    assert block_fit(largest_block=119, effort_minutes=120) == 0
 
 
 def test_load_fit_at_mean_is_half():
@@ -164,7 +142,7 @@ def test_fit_score_worked_example_reproduces_0_875():
         fragmentation_index=0.0,
         load_delta=-0.30,
     )
-    fit = fit_score(snapshot, effort_minutes=120, focus_depth="deep")
+    fit = fit_score(snapshot, effort_minutes=120)
     assert round(fit, 3) == 0.875
 
 
@@ -177,14 +155,14 @@ def test_revival_score_worked_example():
         fragmentation_index=0.0,
         load_delta=-0.30,
     )
-    fit = fit_score(snapshot, item.effort_minutes, item.focus_depth)
+    fit = fit_score(snapshot, item.effort_minutes)
     score = revival_score(item, today=A_DAY, fit=fit)
     assert round(score, 3) == 0.633
 
 
 def test_contrast_example_insufficient_block_scores_zero():
-    """capacity-engine.md §6's contrast: 240min deep task can't fit an
-    180min block even before considering depth_fit/load_fit."""
+    """capacity-engine.md §6's contrast: a 240min idea can't fit a 180min
+    block, regardless of load_fit."""
     snapshot = CapacitySnapshot(
         date=A_DAY,
         free_minutes=330,
@@ -192,7 +170,7 @@ def test_contrast_example_insufficient_block_scores_zero():
         fragmentation_index=0.0,
         load_delta=-0.30,
     )
-    fit = fit_score(snapshot, effort_minutes=240, focus_depth="deep")
+    fit = fit_score(snapshot, effort_minutes=240)
     assert fit == 0.0
 
 
@@ -232,7 +210,7 @@ def test_selection_picks_best_day_per_latent_then_argmax_across_latents():
         load_delta=0.5,
     )
     strong_candidate = _latent(created_at=date(2026, 8, 9))  # 18 days old, matches worked example
-    weak_candidate = _latent(created_at=date(2026, 8, 20), effort_minutes=15, focus_depth="shallow")
+    weak_candidate = _latent(created_at=date(2026, 8, 20), effort_minutes=15)
 
     result = select_suggestion(
         [strong_candidate, weak_candidate], [strong_snapshot, weak_snapshot], today=A_DAY

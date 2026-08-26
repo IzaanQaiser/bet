@@ -163,7 +163,7 @@ def test_me_items_groups_by_state(client):
     mock_conn = _mock_connection()
 
     committed_row = (
-        item_b, "Committed thing", "summary", now, "cal-evt-1", 60, "obligation", None, None
+        item_b, "Committed thing", "summary", now, "cal-evt-1", 60, "obligation", None
     )
     cancelled_row = (item_c, "Cancelled thing", "CANCELLED", now)
     in_progress_row = (item_a, "In progress thing", "summary", "CLARIFYING", now)
@@ -211,14 +211,13 @@ def test_me_items_committed_includes_ideas_alongside_obligations(client):
     mock_conn = _mock_connection()
 
     # Simulates the real UNION ALL: obligations contribute a real due_at/
-    # calendar_event_id and NULL focus_depth/next_fit_start, latents
-    # contribute NULL due_at/calendar_event_id and real focus_depth/
-    # next_fit_start.
+    # calendar_event_id and NULL next_fit_start, latents contribute NULL
+    # due_at/calendar_event_id and a real next_fit_start.
     committed_rows = [
-        (item_obligation, "Pay rent", "summary", now, "cal-evt-1", 15, "obligation", None, None),
+        (item_obligation, "Pay rent", "summary", now, "cal-evt-1", 15, "obligation", None),
         (
             item_idea, "Make an AI nerf gun turret", "someday idea", None, None, 240, "latent",
-            "deep", next_fit,
+            next_fit,
         ),
     ]
 
@@ -242,11 +241,9 @@ def test_me_items_committed_includes_ideas_alongside_obligations(client):
     assert idea_row["calendar_event_id"] is None
     assert idea_row["effort_minutes"] == 240
     assert idea_row["type"] == "latent"
-    assert idea_row["focus_depth"] == "deep"
     assert idea_row["next_fit_start"] == next_fit.isoformat()
     obligation_row = next(r for r in body["committed"] if r["title"] == "Pay rent")
     assert obligation_row["type"] == "obligation"
-    assert obligation_row["focus_depth"] is None
     assert obligation_row["next_fit_start"] is None
 
 

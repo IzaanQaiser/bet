@@ -102,9 +102,9 @@ def _insert_committed_latent(user_id, created_at):
         row = conn.execute(
             """
             INSERT INTO items (user_id, raw_channel, ingested_at, created_at, state, type, title,
-                                summary, effort_minutes, focus_depth)
+                                summary, effort_minutes)
             VALUES (%s, 'sms', now(), %s, 'COMMITTED', 'latent',
-                    'Rewrite the ingest pipeline in Rust', 'Someday, no rush.', 120, 'deep')
+                    'Rewrite the ingest pipeline in Rust', 'Someday, no rush.', 120)
             RETURNING id
             """,
             (str(user_id), created_at),
@@ -128,8 +128,8 @@ def _insert_committed_obligation(user_id, due_at, effort_minutes=15, is_schedule
         row = conn.execute(
             """
             INSERT INTO items (user_id, raw_channel, ingested_at, state, type, title,
-                                effort_minutes, focus_depth, is_scheduled_event)
-            VALUES (%s, 'sms', now(), 'COMMITTED', 'obligation', 'Pay rent', %s, 'shallow', %s)
+                                effort_minutes, is_scheduled_event)
+            VALUES (%s, 'sms', now(), 'COMMITTED', 'obligation', 'Pay rent', %s, %s)
             RETURNING id
             """,
             (str(user_id), effort_minutes, is_scheduled_event),

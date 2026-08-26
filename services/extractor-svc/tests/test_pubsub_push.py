@@ -46,7 +46,6 @@ def _extraction_result(**overrides):
         summary="Pay rent by Friday.",
         due_at=None,
         effort_minutes=15,
-        focus_depth="shallow",
         confidence=0.95,
         missing_fields=["due_at"],
         reasoning="Has an implied but ambiguous deadline.",
