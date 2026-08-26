@@ -245,9 +245,24 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
                 (confirmed.type, str(confirmed.item_id)),
             )
             conn.commit()
-        if reminder_1_at:
+        # Real finding, live: confirming something close to its own due
+        # time (a meeting 2 minutes out) meant reminder_1_at (due - effort,
+        # meant as advance notice) was already in the past by commit time.
+        # Cloud Tasks doesn't hold a past schedule_time for later — it
+        # dispatches immediately, so the "heads up, starting soon" text
+        # fired at the same instant as confirmation, right next to the
+        # real on-time "starting now" reminder a minute later. That's not
+        # a missed reminder being rescued (the old "better late than
+        # never" reasoning, still correct for the /dispatch/reminders
+        # safety net's own genuine catch-up case) — there was never a gap
+        # to catch up from here, just a heads-up whose moment had already
+        # passed before it was ever scheduled. Skip enqueueing a slot
+        # that's already overdue at commit time instead of firing it
+        # immediately as stale noise.
+        now = datetime.now(UTC)
+        if reminder_1_at and reminder_1_at > now:
             _enqueue_reminder_task(confirmed.item_id, 1, reminder_1_at)
-        if reminder_2_at:
+        if reminder_2_at and reminder_2_at > now:
             _enqueue_reminder_task(confirmed.item_id, 2, reminder_2_at)
         return
 

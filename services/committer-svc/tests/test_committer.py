@@ -200,6 +200,41 @@ def test_calendar_branch_enqueues_a_reminder_task_per_slot(client):
     mock_enqueue.assert_any_call(confirmed.item_id, 2, datetime(2026, 8, 28, 12, 0, tzinfo=tz))
 
 
+def test_calendar_branch_skips_a_reminder_slot_already_overdue_at_commit(client):
+    """Real bug, found live: confirming a meeting 2 minutes before it
+    started meant reminder_1_at (due - effort, meant as advance notice)
+    was already ~29 minutes in the past by commit time. Cloud Tasks
+    doesn't hold a past schedule_time — it fires immediately, so the
+    "heads up" text landed at the same instant as confirmation, right next
+    to the real on-time "starting now" reminder a minute later. Only the
+    still-future slot should ever get enqueued."""
+    from datetime import UTC, timedelta
+
+    now = datetime.now(UTC)
+    confirmed = _confirmed_message(
+        reminder_1_at=now - timedelta(minutes=29),  # already overdue
+        reminder_2_at=now + timedelta(minutes=1),  # still ahead
+    )
+    conn = _mock_connection(
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
+    )
+    calendar_response = MagicMock()
+    calendar_response.json.return_value = {"id": "gcal-event-123"}
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+        patch("committer_svc.main._enqueue_reminder_task") as mock_enqueue,
+    ):
+        mock_session_cls.return_value.post.return_value = calendar_response
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    mock_enqueue.assert_called_once()
+    assert mock_enqueue.call_args.args[1] == 2  # only the still-future slot 2 enqueued
+
+
 def test_calendar_branch_no_reminder_task_when_times_absent(client):
     """A latent-turned-obligation or any commit with no reminder times
     (both null) enqueues nothing — nothing to schedule."""
