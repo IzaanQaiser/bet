@@ -205,6 +205,50 @@ def test_low_confidence_complete_item_still_auto_confirms(client):
     mock_sms.assert_called_once()
 
 
+# --- /pubsub/push, chat path (is_actionable=False) ------------------------
+
+
+def test_chat_message_uses_converse_reply_with_history_context(client):
+    """Real bug, found live: a plain "betski" sent right after a task had
+    just auto-committed got a context-blind "hey! what's up?" back —
+    extractor-svc's own chat_reply had zero conversation history to work
+    with (ADR 0003's untrusted-input boundary). The reply now comes from
+    converse()'s is_chat mode, which has _recent_history like every other
+    reply in this service."""
+    extracted = _extracted_message(
+        is_actionable=False,
+        type=None,
+        title=None,
+        summary=None,
+        due_at=None,
+        effort_minutes=None,
+        focus_depth=None,
+        confidence=None,
+        missing_fields=[],
+        raw_text="Betski",
+    )
+    conn = _mock_connection()
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
+    ):
+        mock_converse.return_value = ConversationTurnResult(reply_text="bet 👍")
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "chatted", "item_id": str(extracted.item_id)}
+
+    mock_converse.assert_called_once()
+    call_kwargs = mock_converse.call_args.kwargs
+    assert call_kwargs["is_chat"] is True
+    assert call_kwargs["latest_reply"] == "Betski"
+
+    mock_sms.assert_called_once_with(extracted.user_id, "+15551234567", "bet 👍")
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert "CHATTED" in update_calls[0].args[0]
+
+
 def test_missing_fields_starts_clarification_not_left_stalled(client):
     """Step 10 replaces step 9's "left in EXTRACTED, do nothing" — an
     incomplete item now gets a real clarifying question."""

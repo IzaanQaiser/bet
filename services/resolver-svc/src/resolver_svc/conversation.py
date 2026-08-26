@@ -88,7 +88,9 @@ below if there is any; otherwise use a generic casual voice (things like
 "bet", "no worries" are fine defaults, but don't force slang that clashes
 with what the user's own history actually sounds like).
 
-You're given: the item (title/type/summary/effort/known fields), whether
+You're given: whether this turn is plain chat with no associated item at
+all (is_chat — see its own rule below, which overrides everything else
+when true), the item (title/type/summary/effort/known fields), whether
 it's a scheduled event you attend at a specific time rather than a task
 with a completion deadline (is_scheduled_event), which fields (if any)
 are still missing, a pending thread-attach candidate title if any, a
@@ -101,7 +103,23 @@ first turn for a new item). There is no separate confirmation step for a
 fresh item — the moment nothing is missing, it's locked in immediately, no
 yes/no required.
 
-Do, in order:
+If is_chat is true: this message has nothing to do with any item — it's
+banter, a greeting, a reaction, an aside, a casual acknowledgment ("bet",
+"betski", "lol", "cool thanks") sent after something else already
+happened. Every item-related field given (title/summary/effort/known
+fields/missing fields/is_scheduled_event/thread-attach/dedupe fields) is a
+meaningless placeholder in this mode — ignore all of it entirely, and
+skip every rule below. Just write a short, casual, in-voice reply_text
+reacting to the user's latest message specifically, using recent history
+for tone and for whatever just happened right before it (a reply like
+"betski" right after you just locked something in is a casual close-out
+of THAT, not an open-ended greeting — react accordingly, don't ask a
+generic "what's up?" that ignores the context staring right at you in the
+history). Leave every other field at its default (empty still_missing,
+null intent, every *_filled flag false, relates_to_item true) and stop —
+none of the numbered steps below apply.
+
+Otherwise (is_chat false, the normal case), do, in order:
 
 0. Relatedness (only meaningful when a latest reply is given — on the very
    first turn for a new item there is no reply yet, so this is trivially
@@ -327,21 +345,22 @@ async def converse(
     session_id: str,
     now_local: datetime,
     tz_name: str,
-    title: str | None,
-    item_type: str,
-    summary: str,
-    effort_minutes: int | None,
-    known_fields: dict,
-    missing_fields: list[str],
-    thread_attach_title: str | None,
     history: list[str],
     latest_reply: str | None,
+    title: str | None = None,
+    item_type: str | None = None,
+    summary: str | None = None,
+    effort_minutes: int | None = None,
+    known_fields: dict | None = None,
+    missing_fields: list[str] | None = None,
+    thread_attach_title: str | None = None,
     dedupe_candidate_title: str | None = None,
     awaiting_dedupe_reply: bool = False,
     reminder_1_at: str | None = None,
     reminder_2_at: str | None = None,
     other_items: list[str] | None = None,
     is_scheduled_event: bool = False,
+    is_chat: bool = False,
 ) -> ConversationTurnResult:
     _t0 = time.monotonic()
     await _session_service.create_session(
@@ -349,29 +368,48 @@ async def converse(
     )
     _t1 = time.monotonic()
     runner = Runner(app_name="conversation", agent=_agent, session_service=_session_service)
+    missing_fields = missing_fields or []
     reply_text = f"'{latest_reply}'" if latest_reply else "(none, first turn)"
     hist_block = "\n".join(history) if history else "(none yet)"
-    other_items_block = "\n".join(other_items) if other_items else "(none)"
-    effort_line = f"{effort_minutes} min" if effort_minutes is not None else "unknown"
-    title_display = title if title else "(untitled — not yet known, ask what it's for)"
-    message_text = (
-        f"Current date/time: {now_local.isoformat()}, timezone: {tz_name}\n"
-        f"Item: {title_display} (type={item_type})\n"
-        f"Summary: {summary}\n"
-        f"is_scheduled_event: {is_scheduled_event}\n"
-        f"Effort: {effort_line}\n"
-        f"Known fields: {known_fields}\n"
-        f"Missing fields: {missing_fields}\n"
-        f"Thread-attach candidate: {thread_attach_title}\n"
-        f"dedupe_candidate_title: {dedupe_candidate_title}\n"
-        f"awaiting_dedupe_reply: {awaiting_dedupe_reply}\n"
-        f"reminder_1_at: {reminder_1_at}\n"
-        f"reminder_2_at: {reminder_2_at}\n"
-        f"User's other real committed obligations (other_items, separate from this item):\n"
-        f"{other_items_block}\n"
-        f"Recent message history (oldest first):\n{hist_block}\n"
-        f"User's latest reply: {reply_text}\n"
-    )
+
+    if is_chat:
+        # Deliberately leaner than the item-context block below — nothing
+        # here is a real item, and handing the model fake/null item fields
+        # invites it to reference them anyway. Real bug, found live: a
+        # plain "betski" sent right after a task just auto-committed got
+        # a generic "hey! what's up?" reply, because chat_reply used to be
+        # generated by extractor-svc with zero conversation history at
+        # all — this call site (which already has _recent_history) exists
+        # to fix exactly that.
+        message_text = (
+            f"Current date/time: {now_local.isoformat()}, timezone: {tz_name}\n"
+            f"is_chat: true — plain conversational message, no item involved.\n"
+            f"Recent message history (oldest first):\n{hist_block}\n"
+            f"User's latest message: {reply_text}\n"
+        )
+    else:
+        other_items_block = "\n".join(other_items) if other_items else "(none)"
+        effort_line = f"{effort_minutes} min" if effort_minutes is not None else "unknown"
+        title_display = title if title else "(untitled — not yet known, ask what it's for)"
+        message_text = (
+            f"Current date/time: {now_local.isoformat()}, timezone: {tz_name}\n"
+            f"is_chat: false\n"
+            f"Item: {title_display} (type={item_type})\n"
+            f"Summary: {summary}\n"
+            f"is_scheduled_event: {is_scheduled_event}\n"
+            f"Effort: {effort_line}\n"
+            f"Known fields: {known_fields}\n"
+            f"Missing fields: {missing_fields}\n"
+            f"Thread-attach candidate: {thread_attach_title}\n"
+            f"dedupe_candidate_title: {dedupe_candidate_title}\n"
+            f"awaiting_dedupe_reply: {awaiting_dedupe_reply}\n"
+            f"reminder_1_at: {reminder_1_at}\n"
+            f"reminder_2_at: {reminder_2_at}\n"
+            f"User's other real committed obligations (other_items, separate from this item):\n"
+            f"{other_items_block}\n"
+            f"Recent message history (oldest first):\n{hist_block}\n"
+            f"User's latest reply: {reply_text}\n"
+        )
     message = types.Content(role="user", parts=[types.Part(text=message_text)])
 
     _t2 = time.monotonic()

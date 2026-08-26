@@ -450,12 +450,34 @@ def _ensure_reminder_mention(
 
 async def _handle_chat(extracted: ExtractedItemMessage) -> None:
     """Phase G step B: a pure-chat message never reaches dedupe/clarification/
-    confirmation — extractor-svc already generated the reply, this just sends
-    it and closes the item out at CHATTED (state-machine.md's own reasoning
-    for not reusing CANCELLED/NEEDS_REVIEW here — different failure/outcome
-    semantics). A conversations row is still written (empty resolved_fields)
-    purely as the existing idempotency guard's completion signal — reusing
-    that mechanism rather than inventing a second one for this one path."""
+    confirmation — closes the item out at CHATTED (state-machine.md's own
+    reasoning for not reusing CANCELLED/NEEDS_REVIEW here — different
+    failure/outcome semantics). A conversations row is still written (empty
+    resolved_fields) purely as the existing idempotency guard's completion
+    signal — reusing that mechanism rather than inventing a second one for
+    this one path.
+
+    The reply itself comes from converse()'s is_chat mode, not
+    extractor-svc — real bug, found live: extractor-svc has zero
+    conversation history (ADR 0003, this is the untrusted-input boundary),
+    so a plain "betski" sent right after a task had just auto-committed
+    got a context-blind "hey! what's up?" back. converse() already has
+    _recent_history for every other reply in this service; chat gets the
+    same treatment now instead of being the one path that doesn't."""
+    with get_connection() as conn:
+        phone, tz_name = _user_phone_and_timezone(conn, extracted.user_id)
+        history = _recent_history(conn, extracted.user_id)
+
+    now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    result = await converse(
+        session_id=f"{extracted.item_id}-{uuid4().hex[:8]}",
+        now_local=now_local,
+        tz_name=tz_name,
+        history=history,
+        latest_reply=extracted.raw_text,
+        is_chat=True,
+    )
+
     with get_connection() as conn:
         conn.execute(
             "UPDATE items SET state = 'CHATTED', updated_at = now() WHERE id = %s",
@@ -465,10 +487,9 @@ async def _handle_chat(extracted: ExtractedItemMessage) -> None:
             "INSERT INTO conversations (user_id, item_id, resolved_fields) VALUES (%s, %s, %s)",
             (str(extracted.user_id), str(extracted.item_id), Json({})),
         )
-        phone, _tz = _user_phone_and_timezone(conn, extracted.user_id)
         conn.commit()
 
-    _send_sms(extracted.user_id, phone, extracted.chat_reply or "hey")
+    _send_sms(extracted.user_id, phone, result.reply_text or "hey")
     logger.info("CHATTED item_id=%s", extracted.item_id)
 
 
