@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
-import { HeroMemory, type MemoryRowData } from "@/components/hero-memory";
 import { Button } from "@/components/ui/button";
+import { MemoryList } from "@/components/memory-list";
 import { digitsOnly, formatPhoneDisplay, toE164 } from "@/lib/phone";
 
 const SESSION_KEY = "bet_dashboard_session";
@@ -38,22 +38,6 @@ async function authedFetch(path: string, token: string, init?: RequestInit) {
     ...init,
     headers: { ...init?.headers, Authorization: `Bearer ${token}` },
   });
-}
-
-function humanizeState(state: string | undefined): string {
-  if (!state) return "";
-  return state.toLowerCase().replace(/_/g, " ");
-}
-
-// due_at is inherently anchored to the user's own registered timezone
-// (that's what committer-svc wrote the real Calendar event in) — every
-// display here has to use that same zone explicitly, never the ambient
-// timezone of whatever device happens to be looking at the dashboard,
-// or the same obligation reads as a different time depending on who's
-// viewing it and where they are.
-function shortDate(iso: string | null | undefined, timeZone: string): string {
-  if (!iso) return "committed";
-  return new Date(iso).toLocaleDateString("en-US", { timeZone, weekday: "short" });
 }
 
 function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
@@ -290,33 +274,6 @@ export function DashboardApp() {
 
   const timeZone = profile?.timezone ?? "UTC";
 
-  const memoryRows: MemoryRowData[] = items
-    ? [
-        ...items.in_progress.map((row) => ({
-          key: row.id,
-          title: row.title,
-          status: humanizeState(row.state),
-          visible: true,
-          glow: false,
-          retrieved: false,
-        })),
-        ...items.committed.map((row) => ({
-          key: row.id,
-          title: row.title,
-          status: shortDate(row.due_at, timeZone),
-          visible: true,
-          glow: false,
-          // Deliberately never struck through here: "past due" depends on
-          // comparing against due_at, and a real committer-svc bug (naive
-          // local times landing in the DB uninterpreted, silently off by
-          // the user's UTC offset) means stored due_at can't be trusted
-          // for this comparison yet. Off until that's actually fixed and
-          // deployed, rather than showing a confidently wrong strikethrough.
-          retrieved: false,
-        })),
-      ]
-    : [];
-
   return (
     <>
       <div className="mb-8 flex items-baseline justify-between gap-6">
@@ -335,17 +292,13 @@ export function DashboardApp() {
 
       {!items || !profile ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : memoryRows.length === 0 ? (
-        <div className="mb-10 rounded-[10px] border-[1.5px] border-dashed border-border px-[18px] py-4">
-          <p className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
-            agent memory
-          </p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Nothing yet — text bet something and it&apos;ll show up here.
-          </p>
-        </div>
       ) : (
-        <HeroMemory rows={memoryRows} onDelete={deleteItem} />
+        <MemoryList
+          inProgress={items.in_progress}
+          committed={items.committed}
+          timeZone={timeZone}
+          onDelete={deleteItem}
+        />
       )}
     </>
   );
