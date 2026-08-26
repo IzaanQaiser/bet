@@ -304,6 +304,31 @@ def _round_to_bucket(minutes: int) -> int:
     return min(_EFFORT_BUCKETS, key=lambda b: (abs(b - minutes), -b))
 
 
+def _reconcile_still_missing(missing_fields: list[str], result) -> list[str]:
+    """Real production bug, not theoretical: a live call was given
+    missing_fields=["due_at", "effort_minutes", "title"] on a fresh
+    item's first turn (no latest_reply — nothing could have resolved
+    anything yet) and came back with still_missing=["effort_minutes",
+    "title"], due_at_filled=False, due_at=null — silently dropping
+    "due_at" from still_missing despite never actually resolving it. The
+    item then auto-committed with due_at=None and crashed committer-svc
+    downstream (a null due_at has nowhere left to be caught once there's
+    no confirmation step to fall back on). A field the caller listed as
+    missing must never vanish from still_missing unless its own *_filled
+    flag says this turn actually resolved it."""
+    filled_this_turn = {
+        "due_at": result.due_at_filled,
+        "email_recipient": result.email_recipient_filled,
+        "title": result.title_filled,
+        "effort_minutes": result.effort_minutes_filled,
+    }
+    still_missing = list(result.still_missing)
+    for field in missing_fields:
+        if field in filled_this_turn and not filled_this_turn[field] and field not in still_missing:
+            still_missing.append(field)
+    return still_missing
+
+
 async def converse(
     session_id: str,
     now_local: datetime,
@@ -386,6 +411,12 @@ async def converse(
         f for f in result.still_missing
         if f in ("due_at", "email_recipient", "title", "effort_minutes")
     ]
+
+    # Defensive, real production bug (not theoretical, see
+    # _reconcile_still_missing's own docstring) — re-added here, the one
+    # choke point every caller goes through, rather than trusting the
+    # model's still_missing list to be complete on its own.
+    result.still_missing = _reconcile_still_missing(missing_fields, result)
 
     # Defensive re-bucketing, same reasoning as still_missing above: don't
     # trust the model's raw number to already be exactly one of the five
