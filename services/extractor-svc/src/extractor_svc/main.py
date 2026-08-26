@@ -90,8 +90,16 @@ Rules:
   "soon"), leave due_at null and add "due_at" to missing_fields — do not
   guess a specific date.
 - effort_minutes must be exactly one of "15", "30", "60", "120", "240"
-  (as a string) — pick the closest realistic bucket. Never output any other
-  value.
+  (as a string) — pick the closest realistic bucket, rounding up on a tie
+  (underestimating available work time is the worse failure mode). Never
+  output any other value. Same "never guess, ask" rule as due_at: only pick
+  a bucket when the message gives some real signal about how much work is
+  involved (an explicit duration, or a task type/scope you can reasonably
+  judge from — "write a report", "quick call", "clean the garage" all
+  imply enough to bucket). If the message gives truly no signal at all —
+  a bare title with nothing to judge scope from — leave effort_minutes
+  null and add "effort_minutes" to missing_fields instead of guessing.
+  This should be rare; most messages imply at least a rough scope.
 - focus_depth is "deep" if the task needs one uninterrupted stretch of
   concentration (writing, coding, focused analysis); "shallow" if it can be
   done in short pieces or is administrative/low-cognitive-load (a phone

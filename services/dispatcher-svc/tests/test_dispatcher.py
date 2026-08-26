@@ -30,21 +30,41 @@ def _mock_connection(fetchall_result=None, fetchone_result=None):
     return conn
 
 
+def _mock_reminder_connection(early_rows=None, final_rows=None):
+    """Two independent SELECTs now, not one (reminder_1_at/reminder_2_at
+    replaced the old single reminder_window_hours/reminder_sent_at) — a
+    uniform fetchall_result can't distinguish them, so this keys off which
+    reminder slot each query's SQL text mentions, same SQL-aware side_effect
+    pattern resolver-svc's own tests already use for a multi-query function."""
+
+    def execute_side_effect(sql, params=None):
+        result = MagicMock()
+        if "SELECT" in sql and "reminder_1" in sql:
+            result.fetchall.return_value = early_rows or []
+        elif "SELECT" in sql and "reminder_2" in sql:
+            result.fetchall.return_value = final_rows or []
+        return result
+
+    conn = MagicMock()
+    conn.execute.side_effect = execute_side_effect
+    return conn
+
+
 def test_reminder_not_resent_if_already_sent():
-    """The SQL's own `reminder_sent_at IS NULL` clause is what enforces
+    """The SQL's own `reminder_N_sent_at IS NULL` clause is what enforces
     this for real (verified against live Postgres in the integration
     test) — here, an empty result set (what that clause produces once a
-    reminder has been sent) must send nothing."""
-    conn = _mock_connection(fetchall_result=[])
+    reminder slot has already fired) must send nothing for that slot."""
+    conn = _mock_reminder_connection(early_rows=[], final_rows=[])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 0
     mock_sms.assert_not_called()
 
 
-def test_reminder_sent_when_due_marks_reminder_sent_at():
+def test_early_reminder_sent_marks_reminder_1_sent_at():
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_connection(fetchall_result=[("item-1", "Pay rent", due_at)])
+    conn = _mock_reminder_connection(early_rows=[("item-1", "Pay rent", due_at, 120)])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 1
@@ -52,10 +72,43 @@ def test_reminder_sent_when_due_marks_reminder_sent_at():
     call_kwargs = mock_sms.call_args.kwargs
     assert call_kwargs["to"] == "+15551234567"
     assert "Pay rent" in call_kwargs["body"]
+    assert "heads up" in call_kwargs["body"]
 
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE obligations" in c.args[0]]
     assert len(update_calls) == 1
+    assert "reminder_1_sent_at" in update_calls[0].args[0]
     assert update_calls[0].args[1] == ("item-1",)
+
+
+def test_final_reminder_sent_marks_reminder_2_sent_at():
+    due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
+    conn = _mock_reminder_connection(final_rows=[("item-1", "Pay rent", due_at, 120)])
+    with patch("dispatcher_svc.main._send_sms") as mock_sms:
+        sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
+    assert sent == 1
+    mock_sms.assert_called_once()
+    call_kwargs = mock_sms.call_args.kwargs
+    assert "last call" in call_kwargs["body"]
+
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE obligations" in c.args[0]]
+    assert len(update_calls) == 1
+    assert "reminder_2_sent_at" in update_calls[0].args[0]
+    assert update_calls[0].args[1] == ("item-1",)
+
+
+def test_both_reminders_can_fire_in_the_same_run():
+    """An obligation due soon enough can have both thresholds already
+    passed by the time a /dispatch run finds it — same forgiving "better
+    late than never" semantics the old single reminder always had."""
+    due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
+    conn = _mock_reminder_connection(
+        early_rows=[("item-1", "Pay rent", due_at, 120)],
+        final_rows=[("item-1", "Pay rent", due_at, 120)],
+    )
+    with patch("dispatcher_svc.main._send_sms") as mock_sms:
+        sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
+    assert sent == 2
+    assert mock_sms.call_count == 2
 
 
 def test_compute_day_reproduces_worked_example():

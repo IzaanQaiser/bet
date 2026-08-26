@@ -115,20 +115,26 @@ def _insert_committed_latent(user_id, created_at):
     return item_id
 
 
-def _insert_committed_obligation(user_id, due_at):
+def _insert_committed_obligation(user_id, due_at, effort_minutes=15):
+    """reminder_1_at/reminder_2_at mirror resolver-svc's own
+    _compute_reminder_times (due_at - 2*effort, due_at - effort) — real
+    production behavior, not a test-only shortcut."""
+    delta = timedelta(minutes=effort_minutes)
     with get_connection() as conn:
         row = conn.execute(
             """
             INSERT INTO items (user_id, raw_channel, ingested_at, state, type, title,
                                 effort_minutes, focus_depth)
-            VALUES (%s, 'sms', now(), 'COMMITTED', 'obligation', 'Pay rent', 15, 'shallow')
+            VALUES (%s, 'sms', now(), 'COMMITTED', 'obligation', 'Pay rent', %s, 'shallow')
             RETURNING id
             """,
-            (str(user_id),),
+            (str(user_id), effort_minutes),
         ).fetchone()
         item_id = row[0]
         conn.execute(
-            "INSERT INTO obligations (item_id, due_at) VALUES (%s, %s)", (str(item_id), due_at)
+            "INSERT INTO obligations (item_id, due_at, reminder_1_at, reminder_2_at) "
+            "VALUES (%s, %s, %s, %s)",
+            (str(item_id), due_at, due_at - 2 * delta, due_at - delta),
         )
         conn.commit()
     return item_id
@@ -191,9 +197,13 @@ def test_dispatch_run_sends_at_most_one_suggestion(client, test_user):
 
 
 def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
+    """effort_minutes=120, due in 1h: reminder_1_at (due-4h) and
+    reminder_2_at (due-2h) have both already passed, so a single run
+    fires both — real DB-backed idempotency for each slot independently,
+    not just one shared reminder_sent_at."""
     user_id, phone = test_user
-    due_at = datetime.now(UTC) + timedelta(hours=2)
-    item_id = _insert_committed_obligation(user_id, due_at)
+    due_at = datetime.now(UTC) + timedelta(hours=1)
+    item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=120)
 
     def mock_events_range(session, start, end, tz_name):
         return _mock_events_by_range(start, end, tz_name, forward_events=7)
@@ -202,21 +212,23 @@ def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
     with p1, p2, p3, patch("dispatcher_svc.main._send_sms") as mock_sms:
         client.post("/dispatch")
 
-    reminder_calls = [c for c in mock_sms.call_args_list if "is due" in c.kwargs["body"]]
-    assert len(reminder_calls) == 1
+    reminder_calls = [c for c in mock_sms.call_args_list if "⏰" in c.kwargs["body"]]
+    assert len(reminder_calls) == 2
 
     with get_connection() as conn:
-        reminder_sent_at = conn.execute(
-            "SELECT reminder_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
-        ).fetchone()[0]
-    assert reminder_sent_at is not None
+        reminder_1_sent_at, reminder_2_sent_at = conn.execute(
+            "SELECT reminder_1_sent_at, reminder_2_sent_at FROM obligations WHERE item_id = %s",
+            (str(item_id),),
+        ).fetchone()
+    assert reminder_1_sent_at is not None
+    assert reminder_2_sent_at is not None
 
-    # Second run: already reminded, must not send again.
+    # Second run: already reminded (both slots), must not send again.
     p1, p2, p3 = _patched_calendar(mock_events_range)
     with p1, p2, p3, patch("dispatcher_svc.main._send_sms") as mock_sms_second_run:
         client.post("/dispatch")
     reminder_calls_second = [
-        c for c in mock_sms_second_run.call_args_list if "is due" in c.kwargs["body"]
+        c for c in mock_sms_second_run.call_args_list if "⏰" in c.kwargs["body"]
     ]
     assert len(reminder_calls_second) == 0
 

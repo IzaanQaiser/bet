@@ -6,7 +6,28 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _strip_due_at_tzinfo(v: datetime | None) -> datetime | None:
+    """Gemini is explicitly instructed (agent-contracts.md's due_at rule,
+    conversation.py's clarification prompt) to emit due_at as a naive
+    local wall-clock string — no UTC offset, ever — since committer-svc
+    treats a naive due_at as already being in the user's own timezone
+    and attaches that zone itself (agent-contracts.md §1's "Resolved
+    gap" note). Real-world finding, not theoretical: a live conversation
+    still got back a due_at with a fabricated "-07:00" offset despite
+    the explicit instruction, which committer-svc's `if due_at.tzinfo is
+    None` check then silently skipped — the offset rode straight into
+    the real Calendar event's dateTime, contradicting the correct
+    America/Toronto timeZone label sent alongside it in the same call.
+    Stripping any tzinfo here keeps the wall-clock numbers exactly as
+    given and enforces "always local, always naive" by construction,
+    rather than trusting every model response to honor the prompt.
+    """
+    if v is not None and v.tzinfo is not None:
+        return v.replace(tzinfo=None)
+    return v
 
 
 class RawItemMessage(BaseModel):
@@ -48,6 +69,8 @@ class ExtractedItemMessage(BaseModel):
     email_recipient: str | None = None  # a real address, never a guessed name
     email_draft: str | None = None  # set only when action_type == "email"
 
+    _strip_due_at_tz = field_validator("due_at")(_strip_due_at_tzinfo)
+
 
 class ConfirmedItemMessage(BaseModel):
     """items.confirmed — published by resolver-svc (normal path) or
@@ -70,6 +93,18 @@ class ConfirmedItemMessage(BaseModel):
     action_type: Literal["calendar", "email"] | None = None
     email_recipient: str | None = None  # step 15 — carries a resolved recipient to committer-svc
     email_draft: str | None = None
+    # Two-stage reminder scheduling: resolver-svc computes these from
+    # due_at/effort_minutes (due_at - 2*effort, due_at - effort) once both
+    # are known — plain arithmetic on an already-validated due_at, so no
+    # tzinfo-stripping validator needed here the way due_at itself needs
+    # one (that one guards untrusted LLM output, this is our own subtraction).
+    # Null whenever due_at or effort_minutes isn't applicable (a latent, an
+    # email action with no due date). committer-svc persists them as-is;
+    # dispatcher-svc fires each independently.
+    reminder_1_at: datetime | None = None
+    reminder_2_at: datetime | None = None
+
+    _strip_due_at_tz = field_validator("due_at")(_strip_due_at_tzinfo)
 
 
 class RoutedReplyMessage(BaseModel):
