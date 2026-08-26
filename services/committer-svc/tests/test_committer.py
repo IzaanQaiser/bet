@@ -169,6 +169,60 @@ def test_calendar_branch_persists_reminder_times(client):
     assert insert_params[5] == datetime(2026, 8, 28, 12, 0, tzinfo=tz)
 
 
+def test_calendar_branch_enqueues_a_reminder_task_per_slot(client):
+    """Real gap, found live: dispatcher-svc's own /dispatch only runs
+    twice a day, too coarse for a same-day reminder. committer-svc must
+    schedule a precise Cloud Task per reminder slot, at the exact
+    (already-localized) reminder instant, instead of relying on polling."""
+    confirmed = _confirmed_message(
+        reminder_1_at=datetime(2026, 8, 28, 10, 0),
+        reminder_2_at=datetime(2026, 8, 28, 12, 0),
+    )
+    conn = _mock_connection(
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
+    )
+    calendar_response = MagicMock()
+    calendar_response.json.return_value = {"id": "gcal-event-123"}
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+        patch("committer_svc.main._enqueue_reminder_task") as mock_enqueue,
+    ):
+        mock_session_cls.return_value.post.return_value = calendar_response
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    assert mock_enqueue.call_count == 2
+    tz = ZoneInfo("America/Los_Angeles")
+    mock_enqueue.assert_any_call(confirmed.item_id, 1, datetime(2026, 8, 28, 10, 0, tzinfo=tz))
+    mock_enqueue.assert_any_call(confirmed.item_id, 2, datetime(2026, 8, 28, 12, 0, tzinfo=tz))
+
+
+def test_calendar_branch_no_reminder_task_when_times_absent(client):
+    """A latent-turned-obligation or any commit with no reminder times
+    (both null) enqueues nothing — nothing to schedule."""
+    confirmed = _confirmed_message()  # reminder_1_at/reminder_2_at default None
+    conn = _mock_connection(
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
+    )
+    calendar_response = MagicMock()
+    calendar_response.json.return_value = {"id": "gcal-event-123"}
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+        patch("committer_svc.main._enqueue_reminder_task") as mock_enqueue,
+    ):
+        mock_session_cls.return_value.post.return_value = calendar_response
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    mock_enqueue.assert_not_called()
+
+
 def test_latent_branch_does_not_call_calendar(client):
     confirmed = _confirmed_message(
         type="latent", due_at=None, action_type=None, title="Learn pottery", summary="Someday."

@@ -23,6 +23,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException
@@ -31,6 +32,7 @@ from obligation_engine_shared.db import get_connection, log_message
 from obligation_engine_shared.pubsub import publish
 from obligation_engine_shared.reply_classifier import classify_reply
 from obligation_engine_shared.schemas import ConfirmedItemMessage, RoutedReplyMessage
+from pydantic import BaseModel
 from twilio.rest import Client as TwilioClient
 
 from dispatcher_svc.calendar_client import fetch_events_for_range, user_credentials
@@ -355,6 +357,126 @@ async def dispatch():
 
     logger.info("dispatch complete: %s", results)
     return {"status": "ok", "results": results}
+
+
+@app.post("/dispatch/reminders")
+async def dispatch_reminders():
+    """SAFETY-NET FALLBACK, not the primary reminder mechanism — see
+    /dispatch/reminders/fire below for that. Real gap, found live:
+    /dispatch only runs twice a day (7am/1pm America/Toronto,
+    scripts/deploy.sh) because each run does 2 real Calendar API reads per
+    user (infrastructure.md §4's quota assumption) for the capacity-
+    snapshot/suggestion pipeline — appropriate cadence for that,
+    completely wrong for reminder delivery. A first fix here was to poll
+    this endpoint every few minutes — then correctly pushed back on
+    (polling that often is wasteful, and still imprecise) in favor of
+    committer-svc scheduling a real Cloud Task for the exact reminder
+    instant. This endpoint stays wired up on a much cheaper, infrequent
+    cadence (scripts/deploy.sh) purely as a fallback for whatever the
+    precise path might miss (a Cloud Tasks outage, a lost task) — no
+    Calendar reads, pure Postgres + Twilio either way. Calling
+    _send_reminders from both this and /dispatch/reminders/fire is safe,
+    not a double-send risk: it's already idempotent
+    (reminder_N_sent_at IS NULL)."""
+    with get_connection() as conn:
+        users = conn.execute("SELECT id, timezone, phone_e164 FROM users").fetchall()
+
+    now_utc = datetime.now(UTC)
+    results = []
+    for user_id, tz_name, phone in users:
+        tz = ZoneInfo(tz_name)
+        with get_connection() as conn:
+            reminders_sent = _send_reminders(conn, user_id, phone, now_utc, tz)
+        if reminders_sent:
+            results.append({"user_id": str(user_id), "reminders_sent": reminders_sent})
+
+    logger.info("dispatch_reminders complete: %s", results)
+    return {"status": "ok", "results": results}
+
+
+class ReminderFirePayload(BaseModel):
+    item_id: UUID
+    slot: int
+
+
+@app.post("/dispatch/reminders/fire")
+async def dispatch_reminders_fire(payload: ReminderFirePayload):
+    """The actual, precise reminder mechanism: committer-svc enqueues one
+    Cloud Task per reminder slot at the exact reminder instant
+    (committer_svc/main.py's _enqueue_reminder_task), and Cloud Tasks
+    invokes this directly at that time — no polling, no 5-40 minute
+    slop, the reminder fires when it's actually supposed to.
+
+    Still checked against real DB state, not blindly fired: a task
+    enqueued hours or days ago could find the item since deleted or
+    cancelled, or already sent by the /dispatch/reminders fallback in the
+    meantime (Cloud Tasks delivers at-least-once) — same
+    reminder_N_sent_at IS NULL idempotency guard every other reminder
+    path already relies on."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT i.title, o.due_at, i.effort_minutes, i.is_scheduled_event, i.user_id,
+                   o.reminder_1_sent_at, o.reminder_2_sent_at, u.timezone, u.phone_e164
+            FROM obligations o
+            JOIN items i ON i.id = o.item_id
+            JOIN users u ON u.id = i.user_id
+            WHERE o.item_id = %s AND i.state = 'COMMITTED'
+            """,
+            (str(payload.item_id),),
+        ).fetchone()
+        if row is None:
+            logger.info(
+                "reminder fire skipped item_id=%s slot=%s (no longer committed)",
+                payload.item_id,
+                payload.slot,
+            )
+            return {"status": "skipped", "item_id": str(payload.item_id)}
+
+        (
+            title,
+            due_at,
+            effort_minutes,
+            is_scheduled_event,
+            user_id,
+            reminder_1_sent_at,
+            reminder_2_sent_at,
+            tz_name,
+            phone,
+        ) = row
+        already_sent = reminder_1_sent_at if payload.slot == 1 else reminder_2_sent_at
+        if already_sent is not None:
+            return {"status": "already_sent", "item_id": str(payload.item_id)}
+
+        tz = ZoneInfo(tz_name)
+        local_due = due_at.astimezone(tz)
+        today_local = datetime.now(UTC).astimezone(tz).date()
+        if payload.slot == 1:
+            body = (
+                render_event_reminder_early(title, local_due, today_local)
+                if is_scheduled_event
+                else render_reminder_early(title, local_due, effort_minutes, today_local)
+            )
+            _send_sms(user_id, to=phone, body=body)
+            conn.execute(
+                "UPDATE obligations SET reminder_1_sent_at = now() WHERE item_id = %s",
+                (str(payload.item_id),),
+            )
+        else:
+            body = (
+                render_event_reminder_start(title, local_due, today_local)
+                if is_scheduled_event
+                else render_reminder_final(title, local_due, effort_minutes, today_local)
+            )
+            _send_sms(user_id, to=phone, body=body)
+            conn.execute(
+                "UPDATE obligations SET reminder_2_sent_at = now() WHERE item_id = %s",
+                (str(payload.item_id),),
+            )
+        conn.commit()
+
+    logger.info("reminder fired item_id=%s slot=%s", payload.item_id, payload.slot)
+    return {"status": "sent", "item_id": str(payload.item_id)}
 
 
 def _capped_effort_minutes(original: int, block_minutes: int) -> int:

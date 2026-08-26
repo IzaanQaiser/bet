@@ -55,16 +55,18 @@ email-specific mechanism.
 """
 
 import base64
+import json
 import logging
 import os
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
 from google.auth.transport.requests import AuthorizedSession
-from google.cloud import secretmanager
+from google.cloud import secretmanager, tasks_v2
 from google.oauth2.credentials import Credentials
+from google.protobuf import timestamp_pb2
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.pubsub import decode_dead_letter_envelope, decode_push_envelope
 from obligation_engine_shared.schemas import ConfirmedItemMessage
@@ -78,9 +80,55 @@ CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
+# Real gap, found live: dispatcher-svc's own /dispatch only runs twice a
+# day (real Calendar-read quota reasons), so a same-day reminder never
+# got checked until hours after the fact. Cloud Tasks replaces polling
+# for the common case — a task scheduled for the exact reminder instant,
+# firing dispatcher-svc's /dispatch/reminders/fire directly — with
+# dispatcher-svc's own infrequent /dispatch/reminders poll kept only as a
+# safety net (queue outage, a task lost) not the primary mechanism.
+TASKS_LOCATION = "us-central1"
+TASKS_QUEUE = "reminders"
+
 
 def _secret_client() -> secretmanager.SecretManagerServiceClient:
     return secretmanager.SecretManagerServiceClient()
+
+
+def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
+    """Best-effort, not fatal to the commit: the obligations row and the
+    real Calendar event are the parts that matter — a failed enqueue just
+    means this one reminder relies on the infrequent poll fallback instead
+    of firing precisely on time, not that the item silently loses its
+    reminder entirely."""
+    try:
+        project_id = os.environ["GCP_PROJECT_ID"]
+        dispatcher_url = os.environ["DISPATCHER_SVC_URL"]
+        url = f"{dispatcher_url}/dispatch/reminders/fire"
+        dispatcher_sa = f"sa-dispatcher@{project_id}.iam.gserviceaccount.com"
+        client = tasks_v2.CloudTasksClient()
+        parent = client.queue_path(project_id, TASKS_LOCATION, TASKS_QUEUE)
+        schedule_time = timestamp_pb2.Timestamp()
+        schedule_time.FromDatetime(fire_at.astimezone(UTC))
+        client.create_task(
+            parent=parent,
+            task={
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": url,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"item_id": str(item_id), "slot": slot}).encode(),
+                    "oidc_token": {"service_account_email": dispatcher_sa, "audience": url},
+                },
+                "schedule_time": schedule_time,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "failed to enqueue reminder task item_id=%s slot=%s (falling back to poll)",
+            item_id,
+            slot,
+        )
 
 
 def _user_credentials(user_id, scope: str) -> tuple[Credentials, str]:
@@ -197,6 +245,10 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
                 (confirmed.type, str(confirmed.item_id)),
             )
             conn.commit()
+        if reminder_1_at:
+            _enqueue_reminder_task(confirmed.item_id, 1, reminder_1_at)
+        if reminder_2_at:
+            _enqueue_reminder_task(confirmed.item_id, 2, reminder_2_at)
         return
 
     if confirmed.action_type == "email":

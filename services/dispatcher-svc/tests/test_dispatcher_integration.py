@@ -115,26 +115,31 @@ def _insert_committed_latent(user_id, created_at):
     return item_id
 
 
-def _insert_committed_obligation(user_id, due_at, effort_minutes=15):
+def _insert_committed_obligation(user_id, due_at, effort_minutes=15, is_scheduled_event=False):
     """reminder_1_at/reminder_2_at mirror resolver-svc's own
-    _compute_reminder_times (due_at - 2*effort, due_at - effort) — real
-    production behavior, not a test-only shortcut."""
+    _compute_reminder_times — real production formula, not a test-only
+    shortcut: a task (default) gets both reminders strictly before due_at
+    (due_at - 2*effort, due_at - effort); a scheduled event gets a
+    heads-up before start AND a reminder AT the actual start time
+    (due_at - effort, due_at)."""
     delta = timedelta(minutes=effort_minutes)
+    reminder_1_at = due_at - delta if is_scheduled_event else due_at - 2 * delta
+    reminder_2_at = due_at if is_scheduled_event else due_at - delta
     with get_connection() as conn:
         row = conn.execute(
             """
             INSERT INTO items (user_id, raw_channel, ingested_at, state, type, title,
-                                effort_minutes, focus_depth)
-            VALUES (%s, 'sms', now(), 'COMMITTED', 'obligation', 'Pay rent', %s, 'shallow')
+                                effort_minutes, focus_depth, is_scheduled_event)
+            VALUES (%s, 'sms', now(), 'COMMITTED', 'obligation', 'Pay rent', %s, 'shallow', %s)
             RETURNING id
             """,
-            (str(user_id), effort_minutes),
+            (str(user_id), effort_minutes, is_scheduled_event),
         ).fetchone()
         item_id = row[0]
         conn.execute(
             "INSERT INTO obligations (item_id, due_at, reminder_1_at, reminder_2_at) "
             "VALUES (%s, %s, %s, %s)",
-            (str(item_id), due_at, due_at - 2 * delta, due_at - delta),
+            (str(item_id), due_at, reminder_1_at, reminder_2_at),
         )
         conn.commit()
     return item_id
@@ -231,6 +236,101 @@ def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
         c for c in mock_sms_second_run.call_args_list if "⏰" in c.kwargs["body"]
     ]
     assert len(reminder_calls_second) == 0
+
+
+def test_dispatch_reminders_fires_a_same_day_event_start_with_no_calendar_calls(client, test_user):
+    """Real bug, reported live: a same-day 9pm meeting never got a
+    reminder text at all — /dispatch only runs twice a day (7am/1pm), so
+    the only run that could have caught a 9pm reminder was the *next*
+    day's 7am one, hours after the meeting. /dispatch/reminders is the
+    infrequent safety-net fallback (the precise path is committer-svc's
+    Cloud Task -> /dispatch/reminders/fire, tested separately below); this
+    hits the real endpoint with NO Calendar mocking at all — if it touched
+    the Calendar API like /dispatch does, this test would fail on a real
+    network/credential error, which is itself proof it doesn't."""
+    user_id, phone = test_user
+    due_at = datetime.now(UTC) + timedelta(minutes=2)
+    item_id = _insert_committed_obligation(
+        user_id, due_at, effort_minutes=30, is_scheduled_event=True
+    )
+
+    with patch("dispatcher_svc.main._send_sms") as mock_sms:
+        resp = client.post("/dispatch/reminders")
+
+    assert resp.status_code == 200
+    reminder_calls = [c for c in mock_sms.call_args_list if "⏰" in c.kwargs["body"]]
+    assert len(reminder_calls) == 1
+    assert "starts" in reminder_calls[0].kwargs["body"]
+
+    with get_connection() as conn:
+        reminder_1_sent_at = conn.execute(
+            "SELECT reminder_1_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
+        ).fetchone()[0]
+    assert reminder_1_sent_at is not None
+
+
+def test_dispatch_reminders_fire_sends_the_one_named_slot(client, test_user):
+    """The actual precise mechanism: committer-svc's Cloud Task hits this
+    directly with a specific item_id/slot, not a batch scan. Real DB,
+    real endpoint, no Calendar mocking (proof it never touches Calendar,
+    same reasoning as the poll-fallback test above)."""
+    user_id, phone = test_user
+    due_at = datetime.now(UTC) + timedelta(hours=1)
+    item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=60)
+
+    with patch("dispatcher_svc.main._send_sms") as mock_sms:
+        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "sent"
+    mock_sms.assert_called_once()
+    assert "⏰" in mock_sms.call_args.kwargs["body"]
+
+    with get_connection() as conn:
+        reminder_1_sent_at, reminder_2_sent_at = conn.execute(
+            "SELECT reminder_1_sent_at, reminder_2_sent_at FROM obligations WHERE item_id = %s",
+            (str(item_id),),
+        ).fetchone()
+    assert reminder_1_sent_at is not None
+    assert reminder_2_sent_at is None  # only the named slot fired
+
+
+def test_dispatch_reminders_fire_is_idempotent_on_redelivery(client, test_user):
+    """Cloud Tasks delivers at-least-once — a redelivered task for an
+    already-sent slot must be a real no-op against the DB, not a second
+    text."""
+    user_id, phone = test_user
+    due_at = datetime.now(UTC) + timedelta(hours=1)
+    item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=60)
+
+    with patch("dispatcher_svc.main._send_sms"):
+        client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+
+    with patch("dispatcher_svc.main._send_sms") as mock_sms_second:
+        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "already_sent"
+    mock_sms_second.assert_not_called()
+
+
+def test_dispatch_reminders_fire_skips_a_deleted_item(client, test_user):
+    """A task enqueued at commit time can fire long after the user
+    deletes the item — the fire endpoint must check real current state,
+    not just blindly trust the task existed."""
+    user_id, phone = test_user
+    due_at = datetime.now(UTC) + timedelta(hours=1)
+    item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=60)
+    with get_connection() as conn:
+        conn.execute("UPDATE items SET state = 'CANCELLED' WHERE id = %s", (str(item_id),))
+        conn.commit()
+
+    with patch("dispatcher_svc.main._send_sms") as mock_sms:
+        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "skipped"
+    mock_sms.assert_not_called()
 
 
 # --- step 14: accept-path full cycle --------------------------------------
