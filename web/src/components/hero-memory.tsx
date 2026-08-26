@@ -20,7 +20,15 @@ export interface MemoryRowData {
  * own height grows smoothly to an unknown content height, rather than
  * snapping in via display:none/block or guessing a max-height.
  */
-export function HeroMemory({ rows }: { rows: MemoryRowData[] }) {
+interface HeroMemoryProps {
+  rows: MemoryRowData[];
+  // Optional, dashboard-only — the landing hero never passes this, so
+  // nothing renders differently there. Deleting is a dashboard concept,
+  // not part of the approved landing demo.
+  onDelete?: (key: string) => void;
+}
+
+export function HeroMemory({ rows, onDelete }: HeroMemoryProps) {
   return (
     <div className="mt-8 rounded-[10px] border-[1.5px] border-dashed border-border px-[18px] pb-[14px] pt-4">
       <p className="mb-[3px] flex items-center gap-[7px] font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
@@ -54,7 +62,19 @@ export function HeroMemory({ rows }: { rows: MemoryRowData[] }) {
               >
                 {row.title}
               </span>
-              <span className="whitespace-nowrap text-muted-foreground">{row.status}</span>
+              <span className="flex items-baseline gap-1.5">
+                <span className="whitespace-nowrap text-muted-foreground">{row.status}</span>
+                {onDelete && (
+                  <button
+                    type="button"
+                    onClick={() => onDelete(row.key)}
+                    aria-label={`Remove ${row.title}`}
+                    className="relative z-[1] shrink-0 text-muted-foreground/60 hover:text-destructive"
+                  >
+                    ×
+                  </button>
+                )}
+              </span>
               {/* the retrieved strikethrough spans the WHOLE row — title
                   through the status text — not just the title, so it reads
                   as "this whole entry is done," not half-crossed-off */}
