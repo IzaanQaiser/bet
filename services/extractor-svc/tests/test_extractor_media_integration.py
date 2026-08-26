@@ -84,7 +84,7 @@ def test_downloads_real_gcs_object_and_extracts(
         title="Pay rent",
         summary="Pay rent by Friday, from a photographed note.",
         due_at=None,
-        effort_minutes="15",
+        effort_minutes=15,
         focus_depth="shallow",
         confidence=0.9,
         missing_fields=["due_at"],

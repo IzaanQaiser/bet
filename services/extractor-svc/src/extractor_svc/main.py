@@ -45,9 +45,12 @@ app = FastAPI()
 
 # Gemini's structured-output schema only supports string enum values, not
 # integer ones (Literal[15, ...] fails Vertex AI schema validation outright —
-# found empirically, see agent-contracts.md §2's "Resolved gap"). This is the
-# wire schema the model actually fills in; effort_minutes is cast to int
-# below when building the real ExtractedItemMessage.
+# found empirically, see agent-contracts.md §2's "Resolved gap"). Not an
+# enum anymore though (migrations/0016): effort_minutes must carry an
+# event's exact stated duration, not one of 5 buckets, so it's a plain
+# unconstrained int here — the gap above was specifically about a Literal
+# of integers, not a bare int field (confidence: float already proved an
+# unconstrained numeric field works fine in this same schema).
 class _ExtractionResult(BaseModel):
     is_actionable: bool = True
     chat_reply: str | None = None
@@ -55,7 +58,7 @@ class _ExtractionResult(BaseModel):
     title: str | None = None
     summary: str | None = None
     due_at: str | None = None
-    effort_minutes: Literal["15", "30", "60", "120", "240"] | None = None
+    effort_minutes: int | None = None
     focus_depth: Literal["shallow", "deep"] | None = None
     is_scheduled_event: bool = False
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -100,18 +103,21 @@ Rules:
   assumed "due tonight" meant 11:59pm and "due tmr" meant 6pm, both
   fabricated, neither ever stated to the user until they asked or pushed
   back on it.
-- effort_minutes must be exactly one of "15", "30", "60", "120", "240"
-  (as a string). For a task/latent (is_scheduled_event false) always pick
-  the closest realistic bucket yourself, even on thin signal — never leave
-  it null and never add "effort_minutes" to missing_fields (user-directed:
-  asking about it added real friction for little value). For a real
-  scheduled event (is_scheduled_event true) it's different: a wrong guess
-  directly mis-sizes a real Calendar block someone else might see it on,
-  so only fill effort_minutes when the message actually states or clearly
-  implies the event's length — an explicit duration ("1 hour meeting",
-  "quick 15 min call") or a start+end span ("3-4pm", "9 to 10:30"),
-  rounded to the nearest bucket. If the message gives no duration signal
-  at all for the event, leave effort_minutes null and add
+- effort_minutes: for a task/latent (is_scheduled_event false) pick the
+  closest realistic bucket yourself, even on thin signal — one of 15, 30,
+  60, 120, or 240 — never leave it null and never add "effort_minutes" to
+  missing_fields (user-directed: asking about it added real friction for
+  little value; buckets are fine here since this is never shown to the
+  user directly, just a rough work-time guess). For a real scheduled
+  event (is_scheduled_event true) it's different: this becomes a real
+  Calendar event's exact end time the user sees, so only fill
+  effort_minutes when the message actually states or clearly implies the
+  event's length — an explicit duration ("1 hour meeting" -> 60, "1.5
+  hour call" -> 90, "quick 15 min call" -> 15) or a start+end span
+  ("3-4pm" -> 60, "9 to 10:30" -> 90) — and use the EXACT number of
+  minutes, never rounded to a bucket (a real bug, found live: "1.5 hours"
+  silently became a 2-hour Calendar event). If the message gives no
+  duration signal at all for the event, leave effort_minutes null and add
   "effort_minutes" to missing_fields so the next turn asks how long it
   runs.
 - title should be a short, specific label for what this is ("Pay rent",
@@ -257,7 +263,7 @@ async def pubsub_push(request: Request):
         title=result.title,
         summary=result.summary,
         due_at=result.due_at,
-        effort_minutes=int(result.effort_minutes) if result.effort_minutes else None,
+        effort_minutes=result.effort_minutes,
         focus_depth=result.focus_depth,
         is_scheduled_event=result.is_scheduled_event,
         confidence=result.confidence,

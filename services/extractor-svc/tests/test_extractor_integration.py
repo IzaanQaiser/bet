@@ -57,7 +57,7 @@ def test_raw_to_extracted_end_to_end(extracted_subscription):
         title="Pay rent",
         summary="Pay rent by Friday.",
         due_at=None,
-        effort_minutes="15",
+        effort_minutes=15,
         focus_depth="shallow",
         confidence=0.95,
         missing_fields=["due_at"],
@@ -72,7 +72,7 @@ def test_raw_to_extracted_end_to_end(extracted_subscription):
     assert len(pulled.received_messages) == 1
     published = json.loads(pulled.received_messages[0].message.data)
     assert published["item_id"] == str(raw.item_id)
-    assert published["effort_minutes"] == 15  # cast from wire string "15"
+    assert published["effort_minutes"] == 15
     assert published["due_at"] is None
     subscriber.acknowledge(
         subscription=sub_path, ack_ids=[m.ack_id for m in pulled.received_messages]

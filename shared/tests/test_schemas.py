@@ -51,7 +51,27 @@ def test_confirmed_item_message_valid():
     )
 
 
-def test_extracted_item_message_rejects_invalid_effort_minutes():
+def test_extracted_item_message_accepts_exact_non_bucketed_duration():
+    """migrations/0016 — effort_minutes is no longer restricted to the 5
+    task-sizing buckets; a scheduled event's exact stated duration (e.g.
+    90 minutes for "1.5 hours") must round-trip unchanged."""
+    message = ExtractedItemMessage(
+        item_id=uuid4(),
+        user_id=uuid4(),
+        type="obligation",
+        title="Planning",
+        summary="x",
+        due_at=None,
+        effort_minutes=90,
+        focus_depth="shallow",
+        confidence=0.5,
+        missing_fields=[],
+        reasoning="x",
+    )
+    assert message.effort_minutes == 90
+
+
+def test_extracted_item_message_rejects_out_of_range_effort_minutes():
     with pytest.raises(ValidationError):
         ExtractedItemMessage(
             item_id=uuid4(),
@@ -60,7 +80,7 @@ def test_extracted_item_message_rejects_invalid_effort_minutes():
             title="x",
             summary="x",
             due_at=None,
-            effort_minutes=45,  # not one of the 5 allowed buckets
+            effort_minutes=0,  # sanity bound is 1-1440, not a bucket check anymore
             focus_depth="shallow",
             confidence=0.5,
             missing_fields=[],
