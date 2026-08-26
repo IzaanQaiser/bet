@@ -40,6 +40,7 @@ from dispatcher_svc.capacity_engine import (
     CapacitySnapshot,
     Interval,
     LatentCandidate,
+    block_fit,
     booked_minutes,
     fragmentation_index,
     free_intervals,
@@ -246,6 +247,12 @@ def _resolve_stale_suggestions(conn, user_id) -> int:
 
 
 def _eligible_latents(conn, user_id, tz) -> list[LatentCandidate]:
+    """Named for its original one caller (select_suggestion, which does
+    its own is_eligible() filtering internally) — this actually returns
+    every committed latent, unfiltered. _update_next_fit_slots below
+    relies on that: a dashboard preview should compute a fit for every
+    idea, not just ones the proactive-suggestion gates would currently
+    allow texting about."""
     rows = conn.execute(
         """
         SELECT i.id, i.created_at, i.effort_minutes, i.focus_depth,
@@ -271,6 +278,36 @@ def _eligible_latents(conn, user_id, tz) -> list[LatentCandidate]:
         )
         for r in rows
     ]
+
+
+def _next_fitting_slot(
+    day_context: dict, tz, effort_minutes: int, focus_depth: str
+) -> datetime | None:
+    """User-directed: the dashboard shows, per idea, when it could
+    actually happen — not the revival_score-weighted "best" day
+    select_suggestion picks (which can prefer a later but better-scored
+    day over an earlier but choppier one), just the earliest day whose
+    largest free block physically fits this item. Eligibility gates
+    (age/dormancy/cooldown/REVIVAL_THRESHOLD) deliberately don't apply
+    here — those exist to avoid annoying, unsolicited texts, not to hide
+    computable information from a page the user is voluntarily looking
+    at. None when nothing in the 7-day forward window fits."""
+    for d in sorted(day_context):
+        ctx = day_context[d]
+        if ctx.largest_interval is None:
+            continue
+        if block_fit(ctx.snapshot.largest_contiguous_block, effort_minutes, focus_depth):
+            return datetime.combine(d, ctx.largest_interval.start, tzinfo=tz)
+    return None
+
+
+def _update_next_fit_slots(conn, latents: list[LatentCandidate], day_context: dict, tz) -> None:
+    for item in latents:
+        next_fit = _next_fitting_slot(day_context, tz, item.effort_minutes, item.focus_depth)
+        conn.execute(
+            "UPDATE latents SET next_fit_start = %s WHERE item_id = %s",
+            (next_fit, item.item_id),
+        )
 
 
 def _send_suggestion(conn, user_id, phone, tz, day_context: dict, today, latents) -> bool:
@@ -370,6 +407,8 @@ async def dispatch():
             reminders_sent = _send_reminders(conn, user_id, phone, now_utc, tz)
             stale_resolved = _resolve_stale_suggestions(conn, user_id)
             latents = _eligible_latents(conn, user_id, tz)
+            _update_next_fit_slots(conn, latents, day_context, tz)
+            conn.commit()
             suggestion_sent = _send_suggestion(
                 conn, user_id, phone, tz, day_context, today, latents
             )
