@@ -224,33 +224,12 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
         reminder_2_at = _localize(confirmed.reminder_2_at, timezone)
         calendar_event_id = _write_calendar_event(confirmed, timezone, creds, due_at)
 
-        with get_connection() as conn:
-            conn.execute(
-                """
-                INSERT INTO obligations
-                    (item_id, due_at, calendar_event_id, action_type, reminder_1_at, reminder_2_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    str(confirmed.item_id),
-                    due_at,
-                    calendar_event_id,
-                    confirmed.action_type,
-                    reminder_1_at,
-                    reminder_2_at,
-                ),
-            )
-            conn.execute(
-                "UPDATE items SET type = %s, state = 'COMMITTED', updated_at = now() WHERE id = %s",
-                (confirmed.type, str(confirmed.item_id)),
-            )
-            conn.commit()
         # Real finding, live: confirming something close to its own due
         # time (a meeting 2 minutes out) meant reminder_1_at (due - effort,
         # meant as advance notice) was already in the past by commit time.
         # Cloud Tasks doesn't hold a past schedule_time for later — it
         # dispatches immediately, so the "heads up, starting soon" text
-        # fired at the same instant as confirmation, right next to the
+        # would fire at the same instant as confirmation, right next to the
         # real on-time "starting now" reminder a minute later. That's not
         # a missed reminder being rescued (the old "better late than
         # never" reasoning, still correct for the /dispatch/reminders
@@ -259,10 +238,51 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
         # passed before it was ever scheduled. Skip enqueueing a slot
         # that's already overdue at commit time instead of firing it
         # immediately as stale noise.
+        #
+        # Second real bug, found live right after the first fix: skipping
+        # the enqueue isn't enough on its own — it left reminder_N_sent_at
+        # NULL forever, and /dispatch/reminders' own fallback poll (its
+        # genuine job is catching a slot a lost/failed Cloud Task never
+        # fired) has no way to tell "genuinely missed" apart from
+        # "deliberately never scheduled" — it just sees an unsent, past-due
+        # slot and fires it late, exactly the stale noise the first fix
+        # was meant to prevent (a "heads up" reminder arriving AFTER the
+        # event's own "starting now" reminder already fired). A slot
+        # that's skipped here is done, not pending: mark it sent at insert
+        # time so the fallback's own `IS NULL` idempotency check correctly
+        # leaves it alone, the same way it already leaves a genuinely-sent
+        # slot alone.
         now = datetime.now(UTC)
-        if reminder_1_at and reminder_1_at > now:
+        reminder_1_already_past = bool(reminder_1_at and reminder_1_at <= now)
+        reminder_2_already_past = bool(reminder_2_at and reminder_2_at <= now)
+
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO obligations
+                    (item_id, due_at, calendar_event_id, action_type, reminder_1_at, reminder_2_at,
+                     reminder_1_sent_at, reminder_2_sent_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(confirmed.item_id),
+                    due_at,
+                    calendar_event_id,
+                    confirmed.action_type,
+                    reminder_1_at,
+                    reminder_2_at,
+                    now if reminder_1_already_past else None,
+                    now if reminder_2_already_past else None,
+                ),
+            )
+            conn.execute(
+                "UPDATE items SET type = %s, state = 'COMMITTED', updated_at = now() WHERE id = %s",
+                (confirmed.type, str(confirmed.item_id)),
+            )
+            conn.commit()
+        if reminder_1_at and not reminder_1_already_past:
             _enqueue_reminder_task(confirmed.item_id, 1, reminder_1_at)
-        if reminder_2_at and reminder_2_at > now:
+        if reminder_2_at and not reminder_2_already_past:
             _enqueue_reminder_task(confirmed.item_id, 2, reminder_2_at)
         return
 
