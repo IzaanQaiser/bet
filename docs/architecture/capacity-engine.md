@@ -177,6 +177,18 @@ Reproduces the exact suggestion text from PRD §5.3, with real numbers, so this 
 
 ---
 
+### 6.1 `next_fit_start` — a dashboard preview, not the suggestion engine
+
+Every committed latent also gets `latents.next_fit_start` (`migrations/0018`): the earliest day in the next 7 whose `largest_contiguous_block` physically fits `effort_minutes` (`_next_fitting_slot`, dispatcher-svc/main.py), computed for *every* committed idea regardless of §5's eligibility gates or `REVIVAL_THRESHOLD` — those gates exist to avoid annoying, unsolicited texts, not to hide computable information from a dashboard the user is voluntarily looking at. It's deliberately not the `revival_score`-weighted "best" day `select_suggestion` picks (which can prefer a later but better-scored day over an earlier but choppier one) — just "when could this actually happen," the more literal question a dashboard card answers.
+
+**Two write paths, both landing on the same column:**
+- **Batch, all committed latents:** part of the twice-daily `/dispatch` sweep (`_update_next_fit_slots`, called once per user per run over every latent found by `_eligible_latents`) — reuses that run's already-fetched 7-day forward Calendar read, no extra API calls.
+- **Synchronous, one latent, on commit:** `POST /latents/{item_id}/next-fit` (dispatcher-svc) — a real bug fix, user-directed: before this existed, a freshly-committed idea showed "someday" on the dashboard for however long it took the next twice-daily sweep to reach it, up to ~6 hours. `committer-svc`'s `_commit_latent` now enqueues an immediate (no `schedule_time`, dispatched as soon as Cloud Tasks can) Cloud Task at this endpoint right after the `INSERT INTO latents` — same `reminders` queue and OIDC-as-`sa-dispatcher` pattern already used for reminder delivery (`_enqueue_reminder_task`), just a different target path. Best-effort: a failed enqueue (logged, swallowed) just means that one idea falls back to the next batch sweep instead of updating within seconds. This is the one deliberate exception to §1's "every cross-service handoff is Pub/Sub" framing in `overview.md` §1 — reused because Cloud Tasks was already the established mechanism here (reminders), and a one-off targeted Calendar read for a single new item doesn't fit the topic/subscription shape the rest of the pipeline uses.
+
+If the user has no linked Google account, both paths no-op (`next_fit_start` stays null, same as it starts) — there's no Calendar to read.
+
+---
+
 ## 7. Deliberately not built
 
 - Buffer/transition time around meetings (§2).

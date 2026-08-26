@@ -131,6 +131,39 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
         )
 
 
+def _enqueue_next_fit_task(item_id) -> None:
+    """User-directed real bug fix: without this, a freshly-committed idea
+    shows "someday" on the dashboard (next_fit_start is null) until the
+    next twice-daily /dispatch sweep happens to reach it. Fires an
+    immediate (schedule_time=now) Cloud Task at dispatcher-svc's
+    /latents/{item_id}/next-fit — same queue/OIDC-as-sa-dispatcher pattern
+    as _enqueue_reminder_task above, just a different target path and no
+    future schedule_time. Best-effort, not fatal to the commit: a failed
+    enqueue just means this one idea relies on the next batch sweep
+    instead of showing a real slot within seconds."""
+    try:
+        project_id = os.environ["GCP_PROJECT_ID"]
+        dispatcher_url = os.environ["DISPATCHER_SVC_URL"]
+        url = f"{dispatcher_url}/latents/{item_id}/next-fit"
+        dispatcher_sa = f"sa-dispatcher@{project_id}.iam.gserviceaccount.com"
+        client = tasks_v2.CloudTasksClient()
+        parent = client.queue_path(project_id, TASKS_LOCATION, TASKS_QUEUE)
+        client.create_task(
+            parent=parent,
+            task={
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": url,
+                    "oidc_token": {"service_account_email": dispatcher_sa, "audience": url},
+                },
+            },
+        )
+    except Exception:
+        logger.exception(
+            "failed to enqueue next-fit task item_id=%s (falling back to next sweep)", item_id
+        )
+
+
 def _user_credentials(user_id, scope: str) -> tuple[Credentials, str]:
     """Returns (Credentials, timezone) for the given user, or raises if the
     user has no linked Google account — real error, no fallback (per PRD
@@ -330,6 +363,7 @@ def _commit_latent(confirmed: ConfirmedItemMessage) -> None:
             (str(confirmed.item_id),),
         )
         conn.commit()
+    _enqueue_next_fit_task(confirmed.item_id)
 
 
 def _already_committed(conn, confirmed: ConfirmedItemMessage) -> bool:

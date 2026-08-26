@@ -281,17 +281,54 @@ def test_latent_branch_does_not_call_calendar(client):
     with (
         patch("committer_svc.main.get_connection", return_value=conn),
         patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+        patch("committer_svc.main._enqueue_next_fit_task") as mock_enqueue_next_fit,
     ):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 200
     mock_session_cls.assert_not_called()
+    mock_enqueue_next_fit.assert_called_once_with(confirmed.item_id)
 
     # call 0 is the idempotency guard's items.state check.
     insert_sql = conn.execute.call_args_list[1][0][0]
     assert "INSERT INTO latents" in insert_sql
     update_sql = conn.execute.call_args_list[2][0][0]
     assert "state = 'COMMITTED'" in update_sql
+
+
+def test_enqueue_next_fit_task_targets_dispatcher_immediately(monkeypatch):
+    """No schedule_time set (unlike _enqueue_reminder_task) — this fires as
+    soon as Cloud Tasks can dispatch it, not at some future instant."""
+    from committer_svc.main import _enqueue_next_fit_task
+
+    monkeypatch.setenv("GCP_PROJECT_ID", "obligation-engine-hack")
+    monkeypatch.setenv("DISPATCHER_SVC_URL", "https://dispatcher-svc.example.run.app")
+    item_id = uuid4()
+
+    with patch("committer_svc.main.tasks_v2.CloudTasksClient") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.queue_path.return_value = "projects/p/locations/us-central1/queues/reminders"
+        _enqueue_next_fit_task(item_id)
+
+    mock_client.create_task.assert_called_once()
+    task = mock_client.create_task.call_args.kwargs["task"]
+    assert task["http_request"]["url"] == (
+        f"https://dispatcher-svc.example.run.app/latents/{item_id}/next-fit"
+    )
+    assert task["http_request"]["oidc_token"]["service_account_email"] == (
+        "sa-dispatcher@obligation-engine-hack.iam.gserviceaccount.com"
+    )
+    assert "schedule_time" not in task
+
+
+def test_enqueue_next_fit_task_swallows_failure(monkeypatch):
+    from committer_svc.main import _enqueue_next_fit_task
+
+    monkeypatch.setenv("GCP_PROJECT_ID", "obligation-engine-hack")
+    monkeypatch.setenv("DISPATCHER_SVC_URL", "https://dispatcher-svc.example.run.app")
+
+    with patch("committer_svc.main.tasks_v2.CloudTasksClient", side_effect=RuntimeError("boom")):
+        _enqueue_next_fit_task(uuid4())  # does not raise
 
 
 def test_calendar_failure_does_not_mark_committed(client):
