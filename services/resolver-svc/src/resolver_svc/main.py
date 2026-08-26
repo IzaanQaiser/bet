@@ -198,6 +198,35 @@ def _recent_history(conn, user_id, limit: int = 10) -> list[str]:
     ]
 
 
+def _other_items_context(
+    conn, user_id, exclude_item_id, tz_name: str, limit: int = 20
+) -> list[str]:
+    """Cross-item situational awareness (user-directed, real gap found live:
+    an assignment confirmed in one conversation was never referenced in a
+    completely separate party conversation right after — converse() had no
+    structured awareness of anything beyond the current item). COMMITTED
+    only, not AWAITING_CONFIRMATION/CLARIFYING — those are still being
+    negotiated and could still change, so stating them as settled fact
+    would be actively misleading. Same items JOIN obligations WHERE
+    state = 'COMMITTED' ORDER BY due_at shape already proven in
+    dashboard-svc's /me/items and dispatcher-svc's own queries."""
+    rows = conn.execute(
+        """
+        SELECT i.title, o.due_at
+        FROM items i JOIN obligations o ON o.item_id = i.id
+        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND i.id != %s AND o.due_at IS NOT NULL
+        ORDER BY o.due_at ASC
+        LIMIT %s
+        """,
+        (str(user_id), str(exclude_item_id), limit),
+    ).fetchall()
+    tz = ZoneInfo(tz_name)
+    return [
+        f"{title} — due {due_at.astimezone(tz).strftime('%a %-d %b, %-I:%M %p')}"
+        for title, due_at in rows
+    ]
+
+
 def _route_as_new_item(conn, original_item_id, user_id, text: str, *, reason: str) -> dict:
     """Spins up a brand-new item for text that arrived while a different
     item was open but doesn't actually relate to it (agent-contracts.md
@@ -405,6 +434,7 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
     with get_connection() as conn:
         phone, tz_name = _user_phone_and_timezone(conn, extracted.user_id)
         history = _recent_history(conn, extracted.user_id)
+        other_items = _other_items_context(conn, extracted.user_id, extracted.item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
     result = await converse(
@@ -423,6 +453,7 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
         latest_reply=None,
         dedupe_candidate_title=dedupe.duplicate_title,
         awaiting_dedupe_reply=False,
+        other_items=other_items,
     )
 
     with get_connection() as conn:
@@ -461,6 +492,7 @@ async def _start_clarification(
     with get_connection() as conn:
         phone, tz_name = _user_phone_and_timezone(conn, extracted.user_id)
         history = _recent_history(conn, extracted.user_id)
+        other_items = _other_items_context(conn, extracted.user_id, extracted.item_id, tz_name)
 
     resolved_fields = _initial_resolved_fields(extracted)
     effort_minutes = extracted.effort_minutes
@@ -485,6 +517,7 @@ async def _start_clarification(
         latest_reply=None,
         reminder_1_at=reminder_1_at,
         reminder_2_at=reminder_2_at,
+        other_items=other_items,
     )
     if result.due_at_filled and result.due_at:
         resolved_fields["due_at"] = result.due_at
@@ -620,6 +653,7 @@ async def _handle_clarification_reply(
     pending_fields, resolved_fields, exchange_count = convo_row
     thread_attach_title = resolved_fields.get("_thread_attach_title")
     history = _recent_history(conn, user_id)
+    other_items = _other_items_context(conn, user_id, item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
     reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
@@ -641,6 +675,7 @@ async def _handle_clarification_reply(
         latest_reply=latest_reply,
         reminder_1_at=reminder_1_at,
         reminder_2_at=reminder_2_at,
+        other_items=other_items,
     )
     if not result.relates_to_item:
         return _route_as_new_item(
@@ -724,6 +759,7 @@ async def _handle_duplicate_reply(
     match_title = resolved_fields.get("_dedupe_match_title") or "that item"
     thread_attach_title = resolved_fields.get("_thread_attach_title")
     history = _recent_history(conn, user_id)
+    other_items = _other_items_context(conn, user_id, item_id, tz_name)
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
     dedupe_result = await converse(
         session_id=f"{item_id}-{uuid4().hex[:8]}",
@@ -741,6 +777,7 @@ async def _handle_duplicate_reply(
         latest_reply=text,
         dedupe_candidate_title=match_title,
         awaiting_dedupe_reply=True,
+        other_items=other_items,
     )
     if not dedupe_result.relates_to_item:
         return _route_as_new_item(
@@ -792,6 +829,7 @@ async def _handle_duplicate_reply(
             latest_reply=None,
             reminder_1_at=reminder_1_at,
             reminder_2_at=reminder_2_at,
+            other_items=other_items,
         )
         if result.due_at_filled and result.due_at:
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
@@ -856,6 +894,7 @@ async def _handle_confirmation_reply(
     resolved_fields = convo_row[0] if convo_row else {}
     thread_attach_title = resolved_fields.get("_thread_attach_title")
     history = _recent_history(conn, user_id)
+    other_items = _other_items_context(conn, user_id, item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
     reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
@@ -877,6 +916,7 @@ async def _handle_confirmation_reply(
         latest_reply=latest_reply,
         reminder_1_at=reminder_1_at,
         reminder_2_at=reminder_2_at,
+        other_items=other_items,
     )
     if not result.relates_to_item:
         return _route_as_new_item(

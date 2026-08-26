@@ -84,8 +84,10 @@ ALREADY been sent for this item (awaiting_confirmation), a pending
 thread-attach candidate title if any, a possible-duplicate candidate title
 if any (dedupe_candidate_title) and whether a reply to THAT question is
 being interpreted right now (awaiting_dedupe_reply), recent message
-history, and the user's latest reply (absent on the very first turn for a
-new item).
+history, the user's other real committed obligations if any
+(other_items — what's already on their plate, separate from this item),
+and the user's latest reply (absent on the very first turn for a new
+item).
 
 Do, in order:
 
@@ -201,6 +203,16 @@ Do, in order:
    - If ATTACH: a short casual line confirming the attach.
    - If OTHER: a short casual line asking them to clarify (yes/no/what to
      change, or — for a dedupe reply — whether it's the same thing or not).
+   If other_items is non-empty, use it like a friend who actually remembers
+   what's going on would — bring one up ONLY when it's a genuine, concrete
+   connection to what's being said right now (a real timing consideration:
+   this new thing and something already on their plate land close together,
+   the same day, back-to-back, etc.), phrased naturally as part of the
+   reply, not a bolted-on aside. Never force a mention just because
+   other_items is non-empty — most turns, none of it is actually relevant,
+   and forcing one in anyway reads as noise, not attentiveness. Never treat
+   anything in other_items as needing confirmation or a yes/no of its own —
+   it's context for THIS item's reply, not a second topic to resolve.
    Whenever a due date/time is mentioned anywhere in reply_text, word it as
    when the task is DUE, never as when a reminder will arrive — the actual
    reminder goes out in advance of the deadline, never at the deadline
@@ -295,6 +307,7 @@ async def converse(
     awaiting_dedupe_reply: bool = False,
     reminder_1_at: str | None = None,
     reminder_2_at: str | None = None,
+    other_items: list[str] | None = None,
 ) -> ConversationTurnResult:
     _t0 = time.monotonic()
     await _session_service.create_session(
@@ -304,6 +317,7 @@ async def converse(
     runner = Runner(app_name="conversation", agent=_agent, session_service=_session_service)
     reply_text = f"'{latest_reply}'" if latest_reply else "(none, first turn)"
     hist_block = "\n".join(history) if history else "(none yet)"
+    other_items_block = "\n".join(other_items) if other_items else "(none)"
     effort_line = f"{effort_minutes} min" if effort_minutes is not None else "unknown"
     message_text = (
         f"Current date/time: {now_local.isoformat()}, timezone: {tz_name}\n"
@@ -318,6 +332,8 @@ async def converse(
         f"awaiting_dedupe_reply: {awaiting_dedupe_reply}\n"
         f"reminder_1_at: {reminder_1_at}\n"
         f"reminder_2_at: {reminder_2_at}\n"
+        f"User's other real committed obligations (other_items, separate from this item):\n"
+        f"{other_items_block}\n"
         f"Recent message history (oldest first):\n{hist_block}\n"
         f"User's latest reply: {reply_text}\n"
     )
