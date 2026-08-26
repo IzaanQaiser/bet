@@ -2,16 +2,12 @@
 
 import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
-
-// ITU E.164: a leading +, then 1-15 digits, first digit non-zero — same
-// rule registration-svc validates server-side (this is just faster
-// feedback, not the real gate).
-const E164_RE = /^\+[1-9]\d{1,14}$/;
+import { digitsOnly, formatPhoneDisplay, toE164 } from "@/lib/phone";
 
 type Status = "idle" | "submitting" | "joined" | "error";
 
 export function WaitlistForm() {
-  const [phone, setPhone] = useState("");
+  const [phoneDigits, setPhoneDigits] = useState("");
   const [name, setName] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -20,9 +16,9 @@ export function WaitlistForm() {
     e.preventDefault();
     setError(null);
 
-    const trimmed = phone.trim();
-    if (!E164_RE.test(trimmed)) {
-      setError("Enter your number in E.164 format, e.g. +15551234567");
+    const phoneE164 = toE164(phoneDigits);
+    if (!phoneE164) {
+      setError("Enter a 10-digit phone number");
       return;
     }
     const trimmedName = name.trim();
@@ -42,7 +38,7 @@ export function WaitlistForm() {
       const res = await fetch(`${baseUrl}/waitlist/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone_e164: trimmed, name: trimmedName }),
+        body: JSON.stringify({ phone_e164: phoneE164, name: trimmedName }),
       });
       if (!res.ok) throw new Error(`request failed: ${res.status}`);
       setStatus("joined");
@@ -59,7 +55,8 @@ export function WaitlistForm() {
           You&apos;re on the list.
         </h1>
         <p className="max-w-[42ch] text-base leading-relaxed text-muted-foreground">
-          We&apos;ll text {phone.trim()} when you&apos;re approved, with a link to finish setup.
+          We&apos;ll text {formatPhoneDisplay(phoneDigits)} when you&apos;re approved, with a link
+          to finish setup.
         </p>
       </>
     );
@@ -83,11 +80,11 @@ export function WaitlistForm() {
           <input
             id="phone"
             type="tel"
-            inputMode="tel"
+            inputMode="numeric"
             autoComplete="tel"
-            placeholder="+15551234567"
-            value={phone}
-            onChange={(e) => setPhone(e.target.value)}
+            placeholder="(555) 123-4567"
+            value={formatPhoneDisplay(phoneDigits)}
+            onChange={(e) => setPhoneDigits(digitsOnly(e.target.value))}
             required
             className="h-10 rounded-[10px] border border-border bg-background px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           />
