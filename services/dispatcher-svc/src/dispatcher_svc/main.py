@@ -1,22 +1,31 @@
-"""dispatcher-svc — step 8. `POST /dispatch` (Cloud Scheduler + manual
-trigger, infrastructure.md §5): computes 7 forward `capacity_snapshots`
-rows from real Calendar reads, sends idempotent obligation reminders, and
-sends at most one latent-revival suggestion per run.
+"""dispatcher-svc — `POST /dispatch` (Cloud Scheduler + manual trigger,
+infrastructure.md §5): computes 7 forward `capacity_snapshots` rows from
+real Calendar reads and sends idempotent obligation reminders.
 
-Step 14 adds `POST /reply` — the Y/N/Later response to a sent
-suggestion (state-machine.md §2.2/§2.3), routed here by `ingest-svc`
-once a suggestion is actually reachable to reply to. `N` increments
-`dismissal_count` (>= 2 → 30d dormancy via `dormant_until`, reused from
-snoozing per §2.2's decision — one column, two callers); `Later` snoozes
-7d with no penalty; `Y` re-fetches *real, current* Calendar availability
-for the suggested day (the original snapshot can be stale by the time a
-reply arrives — hours or a day later) and publishes directly to
-`items.confirmed`, bypassing resolver-svc entirely (§2.3 — no Gemini
-call, every field is already known). Also adds the 24h no-response
-timeout (§2.2) at the top of `/dispatch`'s per-user loop, resolved
-before that same run scores any new suggestion — otherwise a stale open
-suggestion would wrongly keep excluding its own latent from
-reconsideration.
+ADR 0009 replaced the old revival_score/REVIVAL_THRESHOLD "at most one
+suggestion per run" engine with a per-idea auto-scheduled placeholder
+model, user-directed: every committed latent gets a real, tagged
+`[idea] {title}` Calendar event written at its own `next_fit_start` (via
+committer-svc — dispatcher-svc still never calls the Calendar write API
+itself, see committer_client.py), and gets texted at the exact instant
+that slot arrives (`POST /latents/{item_id}/fire`, a Cloud Task —
+tasks_client.py). `_recompute_and_reschedule` is the one place that ever
+writes `next_fit_start`/`placeholder_event_id`; every other latent's own
+placeholder is real Calendar busy time to everything else, which is the
+entire mechanism behind a declined idea landing after every
+already-scheduled one — no explicit cross-item reflow needed
+(capacity-engine.md §5).
+
+`POST /reply` — the Y/N/Later response to a fired suggestion
+(state-machine.md §2.2/§2.3), routed here by `ingest-svc`. `Y` re-fetches
+*real, current* Calendar availability for the placeholder's slot (it can
+be stale by the time a reply arrives) and publishes directly to
+`items.confirmed`; committer-svc promotes the same placeholder event in
+place rather than writing a duplicate. `N` increments `dismissal_count`
+and immediately reschedules to the next available slot (>= 2 → 30d
+dormancy instead, placeholder cleared). `Later` snoozes 7d, placeholder
+cleared, no dismissal penalty. The 24h no-response timeout (§2.2) still
+runs at the top of `/dispatch`'s per-user loop.
 """
 
 import logging
@@ -35,6 +44,7 @@ from obligation_engine_shared.schemas import ConfirmedItemMessage, RoutedReplyMe
 from pydantic import BaseModel
 from twilio.rest import Client as TwilioClient
 
+from dispatcher_svc import committer_client, tasks_client
 from dispatcher_svc.calendar_client import fetch_events_for_range, user_credentials
 from dispatcher_svc.capacity_engine import (
     CapacitySnapshot,
@@ -47,17 +57,17 @@ from dispatcher_svc.capacity_engine import (
     free_minutes,
     largest_contiguous_block,
     load_delta,
-    select_suggestion,
 )
 from dispatcher_svc.templates import (
     render_accepted,
+    render_deferred,
     render_dismissed,
     render_event_reminder_early,
     render_event_reminder_start,
+    render_fire_suggestion,
     render_reminder_early,
     render_reminder_final,
     render_snoozed,
-    render_suggestion,
 )
 
 logger = logging.getLogger("dispatcher_svc")
@@ -247,111 +257,132 @@ def _resolve_stale_suggestions(conn, user_id) -> int:
 
 
 def _eligible_latents(conn, user_id, tz) -> list[LatentCandidate]:
-    """Named for its original one caller (select_suggestion, which does
-    its own is_eligible() filtering internally) — this actually returns
-    every committed latent, unfiltered. _update_next_fit_slots below
-    relies on that: a dashboard preview should compute a fit for every
-    idea, not just ones the proactive-suggestion gates would currently
-    allow texting about."""
+    """Every committed latent that isn't currently dormant — dormancy
+    (7d snooze / 30d second-dismissal) short-circuits a sweep recompute
+    entirely rather than needing floor-clipping in the slot search
+    itself; the item just reappears here, and gets a real recompute,
+    once dormant_until passes on its own (a plain timestamp comparison,
+    no job). has_open_suggestion is still returned (not filtered here)
+    so callers can skip recomputing/re-texting something already
+    mid-conversation without a second query."""
     rows = conn.execute(
         """
-        SELECT i.id, i.created_at, i.effort_minutes,
+        SELECT i.id, i.title, i.effort_minutes,
                l.dismissal_count, l.dormant_until, l.last_surfaced_at,
                EXISTS (
                    SELECT 1 FROM suggestions s WHERE s.item_id = i.id AND s.outcome IS NULL
-               ) AS has_open_suggestion
+               ) AS has_open_suggestion,
+               l.next_fit_start, l.placeholder_event_id
         FROM latents l JOIN items i ON i.id = l.item_id
         WHERE i.user_id = %s AND i.type = 'latent' AND i.state = 'COMMITTED'
+          AND (l.dormant_until IS NULL OR l.dormant_until <= now())
         """,
         (str(user_id),),
     ).fetchall()
     return [
         LatentCandidate(
             item_id=str(r[0]),
-            created_at=r[1].astimezone(tz).date(),
+            title=r[1],
             effort_minutes=r[2],
             dismissal_count=r[3],
             dormant_until=r[4].astimezone(tz).date() if r[4] else None,
             last_surfaced_at=r[5].astimezone(tz).date() if r[5] else None,
             has_open_suggestion=r[6],
+            next_fit_start=r[7],
+            placeholder_event_id=r[8],
         )
         for r in rows
     ]
 
 
-def _next_fitting_slot(day_context: dict, tz, effort_minutes: int) -> datetime | None:
-    """User-directed: the dashboard shows, per idea, when it could
-    actually happen — not the revival_score-weighted "best" day
-    select_suggestion picks (which can prefer a later but better-scored
-    day over an earlier but choppier one), just the earliest day whose
-    largest free block physically fits this item. Eligibility gates
-    (age/dormancy/cooldown/REVIVAL_THRESHOLD) deliberately don't apply
-    here — those exist to avoid annoying, unsolicited texts, not to hide
-    computable information from a page the user is voluntarily looking
-    at. None when nothing in the 7-day forward window fits."""
-    for d in sorted(day_context):
-        ctx = day_context[d]
-        if ctx.largest_interval is None:
+def _next_fitting_slot(
+    forward_events: dict, tz, wh_start, wh_end, now_local, today, effort_minutes: int,
+    exclude_event_id: str | None,
+) -> datetime | None:
+    """The earliest day in the given window whose largest free block
+    physically fits this item, excluding this same item's own current
+    placeholder from what counts as busy (capacity-engine.md §5's
+    self-exclusion note — every *other* item's placeholder is left in,
+    which is what makes a declined idea naturally land after every
+    already-scheduled one). None when nothing in the window fits."""
+    for d in sorted(forward_events):
+        day_wh_start = _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+        intervals = free_intervals(
+            d, forward_events[d], day_wh_start, wh_end, exclude_event_id=exclude_event_id
+        )
+        largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
+        if largest is None:
             continue
-        if block_fit(ctx.snapshot.largest_contiguous_block, effort_minutes):
-            return datetime.combine(d, ctx.largest_interval.start, tzinfo=tz)
+        if block_fit(largest_contiguous_block(intervals), effort_minutes):
+            return datetime.combine(d, largest.start, tzinfo=tz)
     return None
 
 
-def _update_next_fit_slots(conn, latents: list[LatentCandidate], day_context: dict, tz) -> None:
-    for item in latents:
-        next_fit = _next_fitting_slot(day_context, tz, item.effort_minutes)
-        conn.execute(
-            "UPDATE latents SET next_fit_start = %s WHERE item_id = %s",
-            (next_fit, item.item_id),
-        )
-
-
-def _send_suggestion(conn, user_id, phone, tz, day_context: dict, today, latents) -> bool:
-    snapshots = [ctx.snapshot for ctx in day_context.values()]
-    best = select_suggestion(latents, snapshots, today)
-    if best is None:
-        return False
-
-    ctx = day_context[best.snapshot.date]
-    if ctx.largest_interval is None:
-        logger.error(
-            "selected suggestion has no free interval, skipping item_id=%s", best.item.item_id
-        )
-        return False
-
-    trailing_booked = [c.booked for c in day_context.values()]
-    title_row = conn.execute(
-        "SELECT title FROM items WHERE id = %s", (best.item.item_id,)
-    ).fetchone()
-    days_since_capture = (today - best.item.created_at).days
-
-    body = render_suggestion(
-        day_name=best.snapshot.date.strftime("%A"),
-        block_start_hour=ctx.largest_interval.start.hour,
-        block_minutes=ctx.largest_interval.duration_minutes,
-        booked_today=ctx.booked,
-        trailing_booked_minutes=trailing_booked,
-        load_delta=best.snapshot.load_delta,
-        item_title=title_row[0],
-        days_since_capture=days_since_capture,
+def _clear_placeholder(conn, user_id, item: LatentCandidate) -> None:
+    """No fitting slot found, or the item just went dormant — remove any
+    existing real placeholder and null both columns. Best-effort on the
+    Calendar delete: if it fails, the DB write still proceeds (a leftover
+    tagged placeholder on the calendar is a much smaller problem than a
+    latent stuck pointing at a since-deleted event id)."""
+    if item.placeholder_event_id is not None:
+        try:
+            committer_client.delete_placeholder(
+                UUID(item.item_id), user_id, item.placeholder_event_id
+            )
+        except Exception:
+            logger.exception("failed to delete placeholder item_id=%s", item.item_id)
+    conn.execute(
+        "UPDATE latents SET next_fit_start = NULL, placeholder_event_id = NULL WHERE item_id = %s",
+        (item.item_id,),
     )
-    _send_sms(user_id, to=phone, body=body)
+
+
+def _recompute_and_reschedule(
+    conn, user_id, tz, wh_start, wh_end, now_local, today, forward_events, item: LatentCandidate
+) -> None:
+    """The one place that ever writes latents.next_fit_start/
+    placeholder_event_id — every writer (initial commit, working-hours
+    change, the sweep, a post-decline reschedule) goes through this.
+    Diffs against the value already stored and only touches the
+    Calendar/Cloud Tasks when it actually changed, which bounds Cloud
+    Tasks volume to "once per real slot change" and guarantees at most
+    one live fire-task per latent (an old one that fires anyway is a
+    guaranteed no-op — see /latents/{item_id}/fire's staleness check).
+    Returns the resulting next_fit_start (None if cleared/never found) so
+    callers (e.g. /reply's N-path, which texts back the new day) don't
+    need a second query to learn what this just wrote."""
+    new_next_fit = _next_fitting_slot(
+        forward_events, tz, wh_start, wh_end, now_local, today, item.effort_minutes,
+        exclude_event_id=item.placeholder_event_id,
+    )
+
+    if new_next_fit == item.next_fit_start:
+        return new_next_fit
+
+    if new_next_fit is None:
+        _clear_placeholder(conn, user_id, item)
+        return None
+
+    try:
+        new_event_id = committer_client.upsert_placeholder(
+            UUID(item.item_id), user_id, item.title, new_next_fit, item.effort_minutes,
+            item.placeholder_event_id,
+        )
+    except Exception:
+        logger.exception("failed to upsert placeholder item_id=%s", item.item_id)
+        return item.next_fit_start
 
     conn.execute(
-        "INSERT INTO suggestions (item_id, user_id, snapshot_id) VALUES (%s, %s, %s)",
-        (best.item.item_id, str(user_id), ctx.snapshot_id),
+        "UPDATE latents SET next_fit_start = %s, placeholder_event_id = %s WHERE item_id = %s",
+        (new_next_fit, new_event_id, item.item_id),
     )
-    conn.execute(
-        """
-        UPDATE latents
-        SET last_surfaced_at = now(), surface_count = surface_count + 1
-        WHERE item_id = %s
-        """,
-        (best.item.item_id,),
-    )
-    conn.commit()
-    return True
+
+    try:
+        tasks_client.enqueue_fire_task(UUID(item.item_id), new_next_fit)
+    except Exception:
+        logger.exception("failed to enqueue fire task item_id=%s", item.item_id)
+
+    return new_next_fit
 
 
 @app.post("/dispatch")
@@ -404,11 +435,15 @@ async def dispatch():
             reminders_sent = _send_reminders(conn, user_id, phone, now_utc, tz)
             stale_resolved = _resolve_stale_suggestions(conn, user_id)
             latents = _eligible_latents(conn, user_id, tz)
-            _update_next_fit_slots(conn, latents, day_context, tz)
+            recomputed = 0
+            for item in latents:
+                if item.has_open_suggestion:
+                    continue
+                _recompute_and_reschedule(
+                    conn, user_id, tz, wh_start, wh_end, now_local, today, forward_events, item
+                )
+                recomputed += 1
             conn.commit()
-            suggestion_sent = _send_suggestion(
-                conn, user_id, phone, tz, day_context, today, latents
-            )
 
         results.append(
             {
@@ -416,7 +451,7 @@ async def dispatch():
                 "snapshots_persisted": len(day_context),
                 "reminders_sent": reminders_sent,
                 "stale_suggestions_resolved": stale_resolved,
-                "suggestion_sent": suggestion_sent,
+                "latents_recomputed": recomputed,
             }
         )
 
@@ -424,28 +459,26 @@ async def dispatch():
     return {"status": "ok", "results": results}
 
 
+def _fetch_forward_events(refresh_ref, tz_name, today) -> dict:
+    session = AuthorizedSession(user_credentials(refresh_ref))
+    forward_end = today + timedelta(days=FORWARD_DAYS - 1)
+    return fetch_events_for_range(session, today, forward_end, tz_name)
+
+
 @app.post("/latents/{item_id}/next-fit")
 async def compute_next_fit(item_id: UUID):
-    """User-directed real bug fix: a freshly-committed idea previously
-    showed "someday" on the dashboard until the next twice-daily /dispatch
-    sweep happened to reach it — up to ~6 hours of staleness. committer-svc
-    enqueues an immediate (schedule_time=now) Cloud Task at this endpoint
-    right after inserting the latents row (same reminders queue/OIDC-as-
-    sa-dispatcher pattern already used for reminder delivery), so
-    next_fit_start is real within seconds of commit instead of waiting for
-    the batch sweep. Forward-only Calendar read for just this one item/user
-    — no trailing window, no other latents, no reminders, no suggestion
-    scoring. Deliberately does NOT persist capacity_snapshots rows (real
-    bug, caught live: load_delta needs the trailing-14-day mean this
-    endpoint never fetches, and that column is NOT NULL — an earlier draft
-    tried reusing _persist_snapshot here and 500'd on exactly that). Snapshot
-    freshness for days outside the twice-daily sweep stays out of scope for
-    this endpoint; it only ever writes latents.next_fit_start."""
+    """Fired by committer-svc's _commit_latent, immediately on commit —
+    real bug fix, user-directed: without this, a freshly-committed idea
+    showed "someday" until the next twice-daily sweep, up to ~6 hours of
+    staleness. Recomputes and (via _recompute_and_reschedule) writes the
+    real [idea]-tagged placeholder for this one item."""
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT i.effort_minutes, u.timezone, u.working_hours_start,
-                   u.working_hours_end, u.google_refresh_token_ref
+            SELECT i.title, i.effort_minutes, i.user_id, u.timezone, u.working_hours_start,
+                   u.working_hours_end, u.google_refresh_token_ref,
+                   l.dismissal_count, l.dormant_until, l.last_surfaced_at,
+                   l.next_fit_start, l.placeholder_event_id
             FROM items i
             JOIN latents l ON l.item_id = i.id
             JOIN users u ON u.id = i.user_id
@@ -455,7 +488,8 @@ async def compute_next_fit(item_id: UUID):
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="unknown latent item_id")
-    effort_minutes, tz_name, wh_start, wh_end, refresh_ref = row
+    (title, effort_minutes, user_id, tz_name, wh_start, wh_end, refresh_ref, dismissal_count,
+     dormant_until, last_surfaced_at, next_fit_start, placeholder_event_id) = row
 
     if refresh_ref is None:
         logger.info(
@@ -467,46 +501,37 @@ async def compute_next_fit(item_id: UUID):
     now_utc = datetime.now(UTC)
     today = now_utc.astimezone(tz).date()
     now_local = now_utc.astimezone(tz)
-    forward_end = today + timedelta(days=FORWARD_DAYS - 1)
+    forward_events = _fetch_forward_events(refresh_ref, tz_name, today)
 
-    session = AuthorizedSession(user_credentials(refresh_ref))
-    forward_events = fetch_events_for_range(session, today, forward_end, tz_name)
-
-    day_context = {}
-    for d in sorted(forward_events):
-        day_wh_start = _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
-        day_context[d] = _compute_day(forward_events[d], d, day_wh_start, wh_end, None)
-
-    next_fit = _next_fitting_slot(day_context, tz, effort_minutes)
+    item = LatentCandidate(
+        item_id=str(item_id),
+        title=title,
+        effort_minutes=effort_minutes,
+        dismissal_count=dismissal_count,
+        dormant_until=dormant_until.astimezone(tz).date() if dormant_until else None,
+        last_surfaced_at=last_surfaced_at.astimezone(tz).date() if last_surfaced_at else None,
+        has_open_suggestion=False,
+        next_fit_start=next_fit_start,
+        placeholder_event_id=placeholder_event_id,
+    )
     with get_connection() as conn:
-        conn.execute(
-            "UPDATE latents SET next_fit_start = %s WHERE item_id = %s",
-            (next_fit, str(item_id)),
+        _recompute_and_reschedule(
+            conn, user_id, tz, wh_start, wh_end, now_local, today, forward_events, item
         )
         conn.commit()
 
-    logger.info("computed next_fit_start=%s item_id=%s", next_fit, item_id)
-    return {
-        "status": "ok",
-        "item_id": str(item_id),
-        "next_fit_start": next_fit.isoformat() if next_fit else None,
-    }
+    logger.info("recomputed next-fit item_id=%s", item_id)
+    return {"status": "ok", "item_id": str(item_id)}
 
 
 @app.post("/users/{user_id}/next-fit")
 async def compute_next_fit_for_user(user_id: UUID):
-    """User-directed real bug fix (follow-up to the single-idea version
-    above): changing working hours on the dashboard didn't recompute any
-    existing committed idea's next_fit_start — a stale slot from before
-    the change stuck around until the next twice-daily sweep. dashboard-
-    svc's PATCH /me/profile now enqueues an immediate Cloud Task at this
-    endpoint whenever working_hours_start/working_hours_end actually
-    changes, same reminders-queue/OIDC-as-sa-dispatcher pattern as
-    everything else here. Recomputes every committed latent for this one
-    user in a single Calendar read (_eligible_latents already returns
-    every committed latent unfiltered, same as the /dispatch sweep uses)
-    — same no-snapshot-write scoping as /latents/{item_id}/next-fit, for
-    the same NOT-NULL-load_delta reason."""
+    """Fired by dashboard-svc's PATCH /me/profile whenever working hours
+    actually change — real bug fix, user-directed follow-up: without
+    this, an existing idea's placeholder stayed at its old, now-stale
+    slot even after the working hours that determined it changed.
+    Recomputes every non-dormant committed latent for this one user off
+    a single Calendar read, each with its own self-exclusion."""
     with get_connection() as conn:
         row = conn.execute(
             "SELECT timezone, working_hours_start, working_hours_end, google_refresh_token_ref "
@@ -527,22 +552,19 @@ async def compute_next_fit_for_user(user_id: UUID):
     now_utc = datetime.now(UTC)
     today = now_utc.astimezone(tz).date()
     now_local = now_utc.astimezone(tz)
-    forward_end = today + timedelta(days=FORWARD_DAYS - 1)
-
-    session = AuthorizedSession(user_credentials(refresh_ref))
-    forward_events = fetch_events_for_range(session, today, forward_end, tz_name)
-
-    day_context = {}
-    for d in sorted(forward_events):
-        day_wh_start = _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
-        day_context[d] = _compute_day(forward_events[d], d, day_wh_start, wh_end, None)
+    forward_events = _fetch_forward_events(refresh_ref, tz_name, today)
 
     with get_connection() as conn:
         latents = _eligible_latents(conn, user_id, tz)
-        _update_next_fit_slots(conn, latents, day_context, tz)
+        for item in latents:
+            if item.has_open_suggestion:
+                continue
+            _recompute_and_reschedule(
+                conn, user_id, tz, wh_start, wh_end, now_local, today, forward_events, item
+            )
         conn.commit()
 
-    logger.info("recomputed next_fit_start for %d latent(s) user_id=%s", len(latents), user_id)
+    logger.info("recomputed next-fit for %d latent(s) user_id=%s", len(latents), user_id)
     return {"status": "ok", "user_id": str(user_id), "latents_updated": len(latents)}
 
 
@@ -665,6 +687,112 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
     return {"status": "sent", "item_id": str(payload.item_id)}
 
 
+class FirePayload(BaseModel):
+    scheduled_for: datetime
+
+
+@app.post("/latents/{item_id}/fire")
+async def fire(item_id: UUID, payload: FirePayload):
+    """The Cloud Task tasks_client.enqueue_fire_task schedules for exactly
+    a latent's next_fit_start. Re-verifies the block is still actually
+    free (a stored next_fit_start can be hours or days old) before
+    texting — if it's gone, silently reschedules instead, no SMS, since
+    nothing's been asked of the user yet."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT i.title, i.effort_minutes, i.user_id, u.timezone, u.working_hours_start,
+                   u.working_hours_end, u.google_refresh_token_ref, u.phone_e164,
+                   l.dismissal_count, l.dormant_until, l.last_surfaced_at,
+                   l.next_fit_start, l.placeholder_event_id,
+                   EXISTS (
+                       SELECT 1 FROM suggestions s WHERE s.item_id = i.id AND s.outcome IS NULL
+                   ) AS has_open_suggestion
+            FROM items i
+            JOIN latents l ON l.item_id = i.id
+            JOIN users u ON u.id = i.user_id
+            WHERE i.id = %s AND i.type = 'latent' AND i.state = 'COMMITTED'
+            """,
+            (str(item_id),),
+        ).fetchone()
+    if row is None:
+        logger.info("fire skipped item_id=%s (no longer a committed latent)", item_id)
+        return {"status": "skipped", "item_id": str(item_id)}
+    (title, effort_minutes, user_id, tz_name, wh_start, wh_end, refresh_ref, phone,
+     dismissal_count, dormant_until, last_surfaced_at, next_fit_start, placeholder_event_id,
+     has_open_suggestion) = row
+
+    if next_fit_start != payload.scheduled_for:
+        logger.info(
+            "fire skipped item_id=%s (stale task, current next_fit_start=%s != %s)",
+            item_id, next_fit_start, payload.scheduled_for,
+        )
+        return {"status": "stale_task_skipped", "item_id": str(item_id)}
+
+    if has_open_suggestion:
+        logger.info("fire skipped item_id=%s (already has an open suggestion)", item_id)
+        return {"status": "already_open", "item_id": str(item_id)}
+
+    tz = ZoneInfo(tz_name)
+    now_utc = datetime.now(UTC)
+    today = now_utc.astimezone(tz).date()
+    now_local = now_utc.astimezone(tz)
+
+    item = LatentCandidate(
+        item_id=str(item_id),
+        title=title,
+        effort_minutes=effort_minutes,
+        dismissal_count=dismissal_count,
+        dormant_until=dormant_until.astimezone(tz).date() if dormant_until else None,
+        last_surfaced_at=last_surfaced_at.astimezone(tz).date() if last_surfaced_at else None,
+        has_open_suggestion=False,
+        next_fit_start=next_fit_start,
+        placeholder_event_id=placeholder_event_id,
+    )
+
+    # Single-day re-verify, same "don't trust a possibly stale value"
+    # pattern _accept_suggestion already uses for the Y path.
+    forward_events = _fetch_forward_events(refresh_ref, tz_name, today)
+    slot_day = next_fit_start.astimezone(tz).date()
+    day_wh_start = (
+        _buffered_wh_start(wh_start, wh_end, now_local) if slot_day == today else wh_start
+    )
+    intervals = free_intervals(
+        slot_day, forward_events.get(slot_day, []), day_wh_start, wh_end,
+        exclude_event_id=placeholder_event_id,
+    )
+    largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
+    still_fits = (
+        largest is not None and block_fit(largest_contiguous_block(intervals), effort_minutes)
+    )
+
+    if not still_fits:
+        logger.info("fire item_id=%s slot no longer fits, rescheduling silently", item_id)
+        with get_connection() as conn:
+            _recompute_and_reschedule(
+                conn, user_id, tz, wh_start, wh_end, now_local, today, forward_events, item
+            )
+            conn.commit()
+        return {"status": "rescheduled_silently", "item_id": str(item_id)}
+
+    with get_connection() as conn:
+        _send_sms(user_id, phone, render_fire_suggestion(title, largest.duration_minutes))
+        conn.execute(
+            "INSERT INTO suggestions (item_id, user_id, snapshot_id, scheduled_for) "
+            "VALUES (%s, %s, NULL, %s)",
+            (str(item_id), str(user_id), next_fit_start),
+        )
+        conn.execute(
+            "UPDATE latents SET last_surfaced_at = now(), surface_count = surface_count + 1 "
+            "WHERE item_id = %s",
+            (str(item_id),),
+        )
+        conn.commit()
+
+    logger.info("FIRED item_id=%s", item_id)
+    return {"status": "fired", "item_id": str(item_id)}
+
+
 def _capped_effort_minutes(original: int, block_minutes: int) -> int:
     """state-machine.md §2.3: "duration = effort_minutes, capped at the
     block length." ConfirmedItemMessage.effort_minutes is a strict
@@ -677,16 +805,20 @@ def _capped_effort_minutes(original: int, block_minutes: int) -> int:
 
 
 def _open_suggestion_context(conn, item_id):
+    """scheduled_for (the exact instant /latents/{item_id}/fire actually
+    texted about) replaces the old snapshot-derived date — a fire-time
+    suggestion has no capacity_snapshots row to join to at all (ADR 0009,
+    migrations/0020)."""
     return conn.execute(
         """
-        SELECT s.id, s.snapshot_id, i.title, i.summary, i.effort_minutes,
-               l.dismissal_count, u.timezone, u.working_hours_start, u.working_hours_end,
-               u.google_refresh_token_ref, u.phone_e164, cs.date
+        SELECT s.id, i.title, i.summary, i.effort_minutes,
+               l.dismissal_count, l.placeholder_event_id,
+               u.timezone, u.working_hours_start, u.working_hours_end,
+               u.google_refresh_token_ref, u.phone_e164, s.scheduled_for
         FROM suggestions s
         JOIN items i ON i.id = s.item_id
         JOIN latents l ON l.item_id = s.item_id
         JOIN users u ON u.id = s.user_id
-        JOIN capacity_snapshots cs ON cs.id = s.snapshot_id
         WHERE s.item_id = %s AND s.outcome IS NULL
         ORDER BY s.sent_at DESC LIMIT 1
         """,
@@ -695,24 +827,26 @@ def _open_suggestion_context(conn, item_id):
 
 
 def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
-    (_id, _snapshot_id, title, summary, effort_minutes, _dismissal_count, tz_name, wh_start,
-     wh_end, refresh_ref, phone, snapshot_date) = ctx
+    (_id, title, summary, effort_minutes, _dismissal_count, placeholder_event_id, tz_name,
+     wh_start, wh_end, refresh_ref, phone, scheduled_for) = ctx
 
     if refresh_ref is None:
         logger.error("user_id=%s has no linked Google account, cannot accept", payload.user_id)
         raise HTTPException(status_code=500, detail="no linked Google account")
 
-    # Real current availability, not the (possibly stale) snapshot from
-    # when the suggestion was sent — a reply can arrive hours or a day
-    # later, and the day's Calendar state can have changed since. Same
-    # SUGGESTION_LEAD buffer as the original scoring pass, for the same
-    # reason: if the suggested day is today and the reply itself arrives
-    # late (the originally-suggested slot already started), don't let
-    # due_at land in the past or with no real notice — re-derive today's
-    # effective start from right now, not from whatever it was when this
-    # suggestion first went out.
+    # Real current availability, not the (possibly stale) suggestion from
+    # when it was sent — a reply can arrive hours or a day later, and the
+    # day's Calendar state can have changed since. Same SUGGESTION_LEAD
+    # buffer as the original scoring pass, for the same reason: if the
+    # suggested day is today and the reply itself arrives late (the
+    # originally-suggested slot already started), don't let due_at land
+    # in the past or with no real notice — re-derive today's effective
+    # start from right now, not from whatever it was when this suggestion
+    # first went out. The item's own real placeholder is on the calendar
+    # too by now — exclude it, or it would incorrectly read as busy.
     tz = ZoneInfo(tz_name)
     now_local = datetime.now(UTC).astimezone(tz)
+    snapshot_date = scheduled_for.astimezone(tz).date()
     is_today = snapshot_date == now_local.date()
     effective_wh_start = (
         _buffered_wh_start(wh_start, wh_end, now_local) if is_today else wh_start
@@ -720,7 +854,8 @@ def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
     session = AuthorizedSession(user_credentials(refresh_ref))
     events_by_day = fetch_events_for_range(session, snapshot_date, snapshot_date, tz_name)
     intervals = free_intervals(
-        snapshot_date, events_by_day[snapshot_date], effective_wh_start, wh_end
+        snapshot_date, events_by_day[snapshot_date], effective_wh_start, wh_end,
+        exclude_event_id=placeholder_event_id,
     )
     largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
 
@@ -777,8 +912,8 @@ async def reply(payload: RoutedReplyMessage):
         logger.warning("reply routed for item_id=%s with no open suggestion", payload.item_id)
         return {"status": "unexpected_state", "item_id": str(payload.item_id)}
     (
-        suggestion_id, _snapshot_id, _title, _summary, _effort_minutes, dismissal_count,
-        _tz_name, _wh_start, _wh_end, _refresh_ref, phone, _snapshot_date,
+        suggestion_id, title, _summary, effort_minutes, dismissal_count, placeholder_event_id,
+        tz_name, wh_start, wh_end, refresh_ref, phone, _scheduled_for,
     ) = ctx
 
     classification = classify_reply(payload.text)
@@ -794,27 +929,78 @@ async def reply(payload: RoutedReplyMessage):
                 (suggestion_id,),
             )
             if new_count >= 2:
+                # Second dismissal: 30d dormancy, same as before — but now
+                # also clear the real placeholder rather than leaving a
+                # stale [idea] event sitting on the calendar for a month.
+                item = LatentCandidate(
+                    item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
+                    dismissal_count=new_count, dormant_until=None, last_surfaced_at=None,
+                    has_open_suggestion=False, next_fit_start=None,
+                    placeholder_event_id=placeholder_event_id,
+                )
+                _clear_placeholder(conn, payload.user_id, item)
                 conn.execute(
                     "UPDATE latents SET dismissal_count = %s, "
                     "dormant_until = now() + interval '30 days' WHERE item_id = %s",
                     (new_count, str(payload.item_id)),
                 )
-            else:
-                conn.execute(
-                    "UPDATE latents SET dismissal_count = %s WHERE item_id = %s",
-                    (new_count, str(payload.item_id)),
+                conn.commit()
+                _send_sms(payload.user_id, phone, render_dismissed())
+                logger.info(
+                    "DISMISSED (dormant) item_id=%s dismissal_count=%d",
+                    payload.item_id, new_count,
                 )
+                return {"status": "dismissed", "item_id": str(payload.item_id)}
+
+            conn.execute(
+                "UPDATE latents SET dismissal_count = %s WHERE item_id = %s",
+                (new_count, str(payload.item_id)),
+            )
             conn.commit()
-        _send_sms(payload.user_id, phone, render_dismissed())
-        logger.info("DISMISSED item_id=%s dismissal_count=%d", payload.item_id, new_count)
+
+        # First dismissal: reschedule to the next available slot right
+        # away, user-directed — a decline isn't a "don't ask again for a
+        # while" signal on its own, only a second one is.
+        new_next_fit = None
+        if refresh_ref is not None:
+            tz = ZoneInfo(tz_name)
+            now_utc = datetime.now(UTC)
+            today = now_utc.astimezone(tz).date()
+            now_local = now_utc.astimezone(tz)
+            forward_events = _fetch_forward_events(refresh_ref, tz_name, today)
+            item = LatentCandidate(
+                item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
+                dismissal_count=new_count, dormant_until=None, last_surfaced_at=None,
+                has_open_suggestion=False, next_fit_start=None,
+                placeholder_event_id=placeholder_event_id,
+            )
+            with get_connection() as conn:
+                new_next_fit = _recompute_and_reschedule(
+                    conn, payload.user_id, tz, wh_start, wh_end, now_local, today,
+                    forward_events, item,
+                )
+                conn.commit()
+            tz_for_render = tz
+        else:
+            tz_for_render = UTC
+
+        _send_sms(payload.user_id, phone, render_deferred(new_next_fit, tz_for_render))
+        logger.info("DEFERRED item_id=%s next_fit_start=%s", payload.item_id, new_next_fit)
         return {"status": "dismissed", "item_id": str(payload.item_id)}
 
     if classification == "LATER":
+        item = LatentCandidate(
+            item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
+            dismissal_count=dismissal_count, dormant_until=None, last_surfaced_at=None,
+            has_open_suggestion=False, next_fit_start=None,
+            placeholder_event_id=placeholder_event_id,
+        )
         with get_connection() as conn:
             conn.execute(
                 "UPDATE suggestions SET outcome = 'snoozed', responded_at = now() WHERE id = %s",
                 (suggestion_id,),
             )
+            _clear_placeholder(conn, payload.user_id, item)
             conn.execute(
                 "UPDATE latents SET dormant_until = now() + interval '7 days' WHERE item_id = %s",
                 (str(payload.item_id),),

@@ -18,3 +18,4 @@ Write-scope isolation is enforced structurally, at the infrastructure layer:
 ## Consequences
 - This is the answer to "what stops a malicious photo from writing to my calendar": the service that reads the photo cannot write to the calendar, full stop, regardless of what the model outputs.
 - Costs real infra setup — five service accounts with distinct IAM bindings instead of one shared identity. Accepted; this is exactly what `docs/architecture/infrastructure.md` will need to specify precisely.
+- See ADR [0009](0009-tentative-placeholder-write-before-confirm.md) for a narrow, explicitly-scoped exception (tentative idea placeholders, written before confirmation) — the "exactly one service ever calls the Calendar write API" boundary this ADR establishes is preserved there; only the timing relative to confirmation changes, and only for that one, always-tagged, always-reversible write.

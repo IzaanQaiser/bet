@@ -16,3 +16,4 @@ If you're about to change one of these, read the Context/Alternatives section fi
 | [0006](0006-python-runtime.md) | Python across all services |
 | [0007](0007-no-generalized-execution.md) | Generalized agentic task execution is excluded permanently, not deferred |
 | [0008](0008-email-action-reuses-pipeline.md) | Email draft+send reuses the existing commit pipeline instead of a new subsystem |
+| [0009](0009-tentative-placeholder-write-before-confirm.md) | A tentative Calendar placeholder may be written before confirmation, narrowly — the single-writer boundary from 0003 stays intact |

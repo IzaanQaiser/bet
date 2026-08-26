@@ -9,6 +9,7 @@ dependencies = [
     "google-auth>=2.35",
     "requests>=2.32",
     "google-cloud-secret-manager>=2.20",
+    "google-cloud-tasks>=2.16",
     "twilio>=9.3",
 ]
 

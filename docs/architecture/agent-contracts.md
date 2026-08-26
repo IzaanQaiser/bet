@@ -363,21 +363,27 @@ About {effort} left if you start now.
 
 This is also what makes `effort_minutes` conversationally askable now, not just silently guessed: extractor-svc only guesses a bucket when the message gives real signal; when it doesn't, `"effort_minutes"` joins `missing_fields` alongside `due_at`/`email_recipient` and resolver-svc's `converse()` asks for it directly (conversation.py §3.2/§3.3's field-merge step), since the two reminder times can't be computed without it.
 
-### 4.2 Suggestion — exact rendering, ties to `capacity-engine.md` §6
+### 4.2 Fire-time suggestion — exact rendering (ADR 0009, replaces the old scored one)
 
 ```
-{Day name} looks open — {block_hours} clear {time_of_day_phrase},
-{evidence_line}.
+yo u have {block_hours} free right now — wanna bang out "{item_title}"?
 
-💡 "{item_title}"
-   (you mentioned this {days_since_capture} days ago)
-
-Want it on the calendar? Y / N / Later
+Y / N / Later
 ```
 
-- `{block_hours}`: `largest_contiguous_block` formatted as `"Nh"` or `"Nh Mmin"`.
-- `{time_of_day_phrase}`: `"in the morning"` / `"in the afternoon"` / `"in the evening"`, derived from whether the block's start falls before 12:00, before 17:00, or after, in the user's local time.
-- `{evidence_line}`: per `capacity-engine.md` §6's two-tier rule — `"lightest day you've had in two weeks"` if today's `booked_minutes` is the minimum of the trailing 14 daily values, else `"lighter than usual"` if `load_delta < -0.15`, else omitted entirely (the paragraph reads `"{Day} looks open — {block_hours} clear {time_of_day_phrase}."` with no evidence clause) rather than forcing a weak claim. **Decision made here:** never state evidence that isn't actually true — an omitted evidence line is better than a generic one that undercuts the "the system actually looked" premise.
+- `{block_hours}`: the re-verified largest free interval's duration at fire time (capacity-engine.md §5.4 step 3), formatted as `"Nh"` or `"Nh Mmin"`.
+- `render_fire_suggestion(item_title, block_minutes)` (dispatcher_svc/templates.py). Deliberately terser than the old `render_suggestion` it replaces — no time-of-day clause, no "lightest day" evidence line, no "you mentioned this N days ago." The moment itself (the text arrives exactly when the slot opens) is the pitch; `days_since_capture`/`evidence_line`/`_time_of_day_phrase` are all removed along with the scoring engine they served.
+
+**N (first dismissal) and Later replies** — the placeholder moves or clears (capacity-engine.md §5.4), and the reply differs from a flat "got it":
+
+```
+np — i'll text you again {new_next_fit_start weekday}.
+```
+or, if nothing in the 7-day window fits:
+```
+np, i'll keep an eye out for room.
+```
+`render_deferred(next_fit_start, tz)`. `render_dismissed()` ("Got it, I won't suggest that again for a while.") is now reached **only** on the second dismissal (30d dormancy) — its "for a while" wording would be actively wrong for a first decline, which reschedules within the same reply. `render_snoozed()` ("OK, I'll check back in about a week.") is unchanged — `Later`'s 7d framing was always accurate.
 
 ### 4.3 Reply parsing — shared, deterministic classifier
 
@@ -402,7 +408,9 @@ def classify_reply(text: str) -> Literal["Y", "N", "LATER", "ATTACH", "OTHER"]:
 
 ### 4.4 Accepted-suggestion → `ConfirmedItemMessage`
 
-Per `state-machine.md` §2.3: on `"Y"` to a suggestion, `dispatcher-svc` constructs a `ConfirmedItemMessage` directly (`type="obligation"`, `due_at` = the computed slot start time, `action_type="calendar"`) and publishes it — no Gemini call, the fields are already fully known from the `items`/`latents`/`capacity_snapshots` rows involved.
+Per `state-machine.md` §2.3: on `"Y"` to a suggestion, `dispatcher-svc` constructs a `ConfirmedItemMessage` directly (`type="obligation"`, `due_at` = the computed slot start time, `action_type="calendar"`) and publishes it — no Gemini call, the fields are already fully known from the `items`/`latents` rows involved (`capacity_snapshots` is no longer part of this path, ADR 0009 — `suggestions.scheduled_for` carries the slot instead, `migrations/0020`).
+
+**ADR 0009 addition — placeholder promotion, inside `committer-svc`:** on consuming this message, `committer-svc` checks `latents.placeholder_event_id` for the item first. If set (true for every latent that reached `Y` via the fire-time flow), it `PATCH`es that same Calendar event in place — `[idea] ` stripped from the title, the real `summary`/`due_at` set — instead of `POST`ing a new event, then clears `placeholder_event_id`/`next_fit_start`. Falls back to a fresh `POST` if the `PATCH` 404s (the user deleted the placeholder by hand).
 
 ---
 

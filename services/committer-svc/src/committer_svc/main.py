@@ -60,6 +60,7 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request
@@ -69,7 +70,7 @@ from google.oauth2.credentials import Credentials
 from google.protobuf import timestamp_pb2
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.pubsub import decode_dead_letter_envelope, decode_push_envelope
-from obligation_engine_shared.schemas import ConfirmedItemMessage
+from obligation_engine_shared.schemas import ConfirmedItemMessage, PlaceholderUpsertRequest
 from psycopg.types.json import Json
 
 logger = logging.getLogger("committer_svc")
@@ -233,6 +234,97 @@ def _write_calendar_event(
     return response.json()["id"]
 
 
+# ADR 0009 — the only Calendar write for a latent's tentative slot, always
+# tagged so it reads as tentative on the user's real calendar, always
+# inert (no reminders, no obligations row) until an explicit Y promotes
+# it via _promote_placeholder_event below.
+PLACEHOLDER_TITLE_PREFIX = "[idea] "
+PLACEHOLDER_DESCRIPTION = "Auto-scheduled — you'll get a text when it's time."
+
+
+def _create_placeholder_event(payload: PlaceholderUpsertRequest, timezone: str, creds) -> str:
+    end_at = payload.start + timedelta(minutes=payload.effort_minutes)
+    session = AuthorizedSession(creds)
+    response = session.post(
+        CALENDAR_EVENTS_URL,
+        json={
+            "summary": f"{PLACEHOLDER_TITLE_PREFIX}{payload.title}",
+            "description": PLACEHOLDER_DESCRIPTION,
+            "start": {"dateTime": payload.start.isoformat(), "timeZone": timezone},
+            "end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
+        },
+    )
+    response.raise_for_status()
+    return response.json()["id"]
+
+
+def _move_placeholder_event(
+    event_id: str, payload: PlaceholderUpsertRequest, timezone: str, creds
+) -> str | None:
+    """PATCH the same event in place — returns None on 404/410 (the user
+    deleted it by hand), letting the caller fall back to a fresh create
+    rather than erroring the whole recompute out."""
+    end_at = payload.start + timedelta(minutes=payload.effort_minutes)
+    session = AuthorizedSession(creds)
+    response = session.patch(
+        f"{CALENDAR_EVENTS_URL}/{event_id}",
+        json={
+            "summary": f"{PLACEHOLDER_TITLE_PREFIX}{payload.title}",
+            "start": {"dateTime": payload.start.isoformat(), "timeZone": timezone},
+            "end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
+        },
+    )
+    if response.status_code in (404, 410):
+        return None
+    response.raise_for_status()
+    return response.json()["id"]
+
+
+def _promote_placeholder_event(
+    event_id: str, confirmed: ConfirmedItemMessage, timezone: str, creds, due_at
+) -> str | None:
+    """Accept (Y): the placeholder becomes the real event in place — same
+    PATCH mechanics as _move_placeholder_event, but strips the [idea] tag
+    and the auto-scheduled description rather than keeping them."""
+    end_at = due_at + timedelta(minutes=confirmed.effort_minutes)
+    session = AuthorizedSession(creds)
+    response = session.patch(
+        f"{CALENDAR_EVENTS_URL}/{event_id}",
+        json={
+            "summary": confirmed.title,
+            "description": confirmed.summary,
+            "start": {"dateTime": due_at.isoformat(), "timeZone": timezone},
+            "end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
+        },
+    )
+    if response.status_code in (404, 410):
+        return None
+    response.raise_for_status()
+    return response.json()["id"]
+
+
+@app.put("/latents/{item_id}/placeholder")
+async def upsert_placeholder(item_id: str, payload: PlaceholderUpsertRequest):
+    creds, timezone = _user_credentials(payload.user_id, CALENDAR_SCOPE)
+    if payload.existing_event_id is not None:
+        event_id = _move_placeholder_event(payload.existing_event_id, payload, timezone, creds)
+        if event_id is None:
+            event_id = _create_placeholder_event(payload, timezone, creds)
+    else:
+        event_id = _create_placeholder_event(payload, timezone, creds)
+    return {"event_id": event_id}
+
+
+@app.delete("/latents/{item_id}/placeholder")
+async def delete_placeholder(item_id: str, user_id: UUID, event_id: str):
+    creds, _timezone = _user_credentials(user_id, CALENDAR_SCOPE)
+    session = AuthorizedSession(creds)
+    response = session.delete(f"{CALENDAR_EVENTS_URL}/{event_id}")
+    if response.status_code not in (200, 204, 404, 410):
+        response.raise_for_status()
+    return {"status": "ok"}
+
+
 def _send_email(confirmed: ConfirmedItemMessage, creds: Credentials) -> None:
     """state-machine.md §1.5 — a base64url-encoded RFC 2822 message via
     Gmail's users.messages.send, same AuthorizedSession/refresh-token
@@ -255,7 +347,36 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
         due_at = _localize(confirmed.due_at, timezone)
         reminder_1_at = _localize(confirmed.reminder_1_at, timezone)
         reminder_2_at = _localize(confirmed.reminder_2_at, timezone)
-        calendar_event_id = _write_calendar_event(confirmed, timezone, creds, due_at)
+
+        # ADR 0009 — a resurfaced latent already has a real [idea]-tagged
+        # placeholder on the calendar (dispatcher-svc's accept path always
+        # confirms the item at its own placeholder's slot). Promote that
+        # same event in place instead of creating a duplicate second one;
+        # a resolver-confirmed obligation that was never a latent has no
+        # placeholder row at all, so this is a no-op there.
+        placeholder_row = None
+        with get_connection() as _conn:
+            placeholder_row = _conn.execute(
+                "SELECT placeholder_event_id FROM latents WHERE item_id = %s",
+                (str(confirmed.item_id),),
+            ).fetchone()
+        existing_placeholder_id = placeholder_row[0] if placeholder_row else None
+
+        calendar_event_id = None
+        if existing_placeholder_id is not None:
+            calendar_event_id = _promote_placeholder_event(
+                existing_placeholder_id, confirmed, timezone, creds, due_at
+            )
+        if calendar_event_id is None:
+            calendar_event_id = _write_calendar_event(confirmed, timezone, creds, due_at)
+        if existing_placeholder_id is not None:
+            with get_connection() as _conn:
+                _conn.execute(
+                    "UPDATE latents SET placeholder_event_id = NULL, next_fit_start = NULL "
+                    "WHERE item_id = %s",
+                    (str(confirmed.item_id),),
+                )
+                _conn.commit()
 
         # Real finding, live: confirming something close to its own due
         # time (a meeting 2 minutes out) meant reminder_1_at (due - effort,

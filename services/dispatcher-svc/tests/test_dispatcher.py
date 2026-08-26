@@ -6,18 +6,18 @@ file's plan, reorganized for a cleaner separation of concerns."""
 
 from datetime import UTC, date, datetime, time
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from dispatcher_svc.capacity_engine import CapacitySnapshot, Event, Interval, LatentCandidate
+from dispatcher_svc.capacity_engine import Event, Interval, LatentCandidate
 from dispatcher_svc.main import (
-    DayComputation,
     _buffered_wh_start,
+    _clear_placeholder,
     _compute_day,
     _eligible_latents,
     _next_fitting_slot,
+    _recompute_and_reschedule,
     _send_reminders,
-    _send_suggestion,
-    _update_next_fit_slots,
 )
 
 TZ = ZoneInfo("America/Toronto")
@@ -182,24 +182,25 @@ def test_compute_day_with_buffered_start_shrinks_todays_block():
     assert computation.largest_interval == Interval(start=time(10, 0), end=time(15, 0))
 
 
-# --- next_fit_start dashboard preview (v1, user-directed) ------------------
-# The earliest day an idea could physically fit, not the revival_score-
-# weighted "best" day — and computed for every committed latent, not just
-# ones the proactive-suggestion eligibility gates would currently allow
-# texting about (this is a dashboard preview, not a send decision).
+# --- next_fit_start / auto-scheduled placeholders (ADR 0009) ---------------
+# The earliest day an idea could physically fit, excluding that same
+# item's own placeholder from what counts as busy — every *other* item's
+# placeholder stays counted as real busy time (that's the whole mechanism
+# behind a declined idea landing after every already-scheduled one).
 
 
-def _day_computation(largest_start, largest_end, block_minutes) -> DayComputation:
-    return DayComputation(
-        booked=0,
-        snapshot=CapacitySnapshot(
-            date=A_DAY,
-            free_minutes=block_minutes,
-            largest_contiguous_block=block_minutes,
-            fragmentation_index=0.0,
-            load_delta=0.0,
-        ),
-        largest_interval=Interval(start=largest_start, end=largest_end),
+ITEM_UUID = "11111111-1111-1111-1111-111111111111"
+
+
+def _latent(
+    item_id=ITEM_UUID, effort_minutes=120, next_fit_start=None, placeholder_event_id=None,
+    dismissal_count=0, dormant_until=None, last_surfaced_at=None, has_open_suggestion=False,
+):
+    return LatentCandidate(
+        item_id=item_id, title="Some idea", effort_minutes=effort_minutes,
+        dismissal_count=dismissal_count, dormant_until=dormant_until,
+        last_surfaced_at=last_surfaced_at, has_open_suggestion=has_open_suggestion,
+        next_fit_start=next_fit_start, placeholder_event_id=placeholder_event_id,
     )
 
 
@@ -207,131 +208,130 @@ def test_next_fitting_slot_picks_earliest_day_that_physically_fits():
     day1 = date(2026, 8, 27)  # too small a block — 60min, needs 120
     day2 = date(2026, 8, 28)  # fits — 180min block
     day3 = date(2026, 8, 29)  # also fits, but later — must not be picked
-    day_context = {
-        day1: _day_computation(time(9, 0), time(10, 0), 60),
-        day2: _day_computation(time(13, 0), time(16, 0), 180),
-        day3: _day_computation(time(9, 0), time(15, 0), 360),
+    forward_events = {
+        day1: [Event(start=time(9, 15), end=time(18, 0))],  # only 9:00-9:15 free, too small
+        day2: [],  # fully free
+        day3: [],
     }
-    result = _next_fitting_slot(day_context, TZ, effort_minutes=120)
-    assert result == datetime(2026, 8, 28, 13, 0, tzinfo=TZ)
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    result = _next_fitting_slot(
+        forward_events, TZ, WH_START, WH_END, now_local, today=day1, effort_minutes=120,
+        exclude_event_id=None,
+    )
+    assert result == datetime(2026, 8, 28, 9, 0, tzinfo=TZ)
 
 
 def test_next_fitting_slot_none_when_nothing_fits():
-    day_context = {A_DAY: _day_computation(time(9, 0), time(10, 0), 60)}
-    result = _next_fitting_slot(day_context, TZ, effort_minutes=120)
+    forward_events = {A_DAY: [Event(start=time(9, 15), end=time(18, 0))]}  # 15min free only
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    result = _next_fitting_slot(
+        forward_events, TZ, WH_START, WH_END, now_local, today=A_DAY, effort_minutes=120,
+        exclude_event_id=None,
+    )
     assert result is None
 
 
-def test_update_next_fit_slots_writes_a_row_per_latent():
-    latents = [
-        LatentCandidate(
-            item_id="item-1", created_at=A_DAY, effort_minutes=60,
-            dismissal_count=0, dormant_until=None, last_surfaced_at=None,
-            has_open_suggestion=False,
-        ),
-        LatentCandidate(
-            item_id="item-2", created_at=A_DAY, effort_minutes=999,
-            dismissal_count=0, dormant_until=None, last_surfaced_at=None,
-            has_open_suggestion=False,
-        ),
-    ]
-    day_context = {A_DAY: _day_computation(time(9, 0), time(10, 0), 60)}
-    conn = MagicMock()
-    _update_next_fit_slots(conn, latents, day_context, TZ)
-
-    assert conn.execute.call_count == 2
-    calls = {c.args[1][1]: c.args[1][0] for c in conn.execute.call_args_list}
-    assert calls["item-1"] == datetime(2026, 8, 27, 9, 0, tzinfo=TZ)  # fits
-    assert calls["item-2"] is None  # 999min never fits anywhere
+def test_next_fitting_slot_excludes_own_placeholder():
+    """The self-exclusion case: a 9-10am block tagged as this item's own
+    existing placeholder must not block it from being offered that exact
+    slot again."""
+    forward_events = {A_DAY: [Event(start=time(9, 0), end=time(10, 0), google_event_id="mine")]}
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    result = _next_fitting_slot(
+        forward_events, TZ, WH_START, WH_END, now_local, today=A_DAY, effort_minutes=480,
+        exclude_event_id="mine",
+    )
+    assert result == datetime(2026, 8, 27, 9, 0, tzinfo=TZ)  # the whole day, "mine" excluded
 
 
-def test_eligible_latents_maps_rows_to_local_dates():
-    created_at = datetime(2026, 8, 9, 3, 0, tzinfo=UTC)  # 23:00 local Aug 8 in America/Toronto
+def test_eligible_latents_excludes_dormant_and_maps_columns():
     conn = _mock_connection(
-        fetchall_result=[("item-1", created_at, 120, "deep", 0, None, None, False)]
+        fetchall_result=[
+            ("item-1", "Learn pottery", 120, 0, None, None, False, None, None),
+        ]
     )
     latents = _eligible_latents(conn, "user-1", TZ)
     assert len(latents) == 1
-    assert latents[0].created_at == date(2026, 8, 8)  # local date, not the UTC date
+    assert latents[0].title == "Learn pottery"
+    assert latents[0].effort_minutes == 120
+    sql = conn.execute.call_args.args[0]
+    assert "dormant_until IS NULL OR l.dormant_until <= now()" in sql
 
 
-def test_send_suggestion_returns_false_when_no_candidate_clears_threshold():
-    conn = _mock_connection()
-    day_context = {
-        A_DAY: DayComputation(
-            booked=210,
-            snapshot=CapacitySnapshot(
-                date=A_DAY,
-                free_minutes=330,
-                largest_contiguous_block=180,
-                fragmentation_index=0.0,
-                load_delta=-0.30,
-            ),
-            largest_interval=Interval(start=time(12, 0), end=time(15, 0)),
-            snapshot_id="snap-1",
+def test_recompute_unchanged_slot_is_a_full_noop():
+    """Diffing against the currently stored value is what bounds Cloud
+    Tasks/Calendar churn to "once per real slot change" — an unchanged
+    recompute must not touch either."""
+    existing = datetime(2026, 8, 27, 9, 0, tzinfo=TZ)
+    item = _latent(effort_minutes=480, next_fit_start=existing, placeholder_event_id="evt-1")
+    forward_events = {A_DAY: []}  # fully free — would recompute to the same 9am slot
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    conn = MagicMock()
+    with (
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.tasks_client") as mock_tasks,
+    ):
+        _recompute_and_reschedule(
+            conn, "user-1", TZ, WH_START, WH_END, now_local, A_DAY, forward_events, item
         )
-    }
-    young_latent = LatentCandidate(
-        item_id="x",
-        created_at=A_DAY,  # captured today — fails the days_since_capture >= 3 gate
-        effort_minutes=120,
-        dismissal_count=0,
-        dormant_until=None,
-        last_surfaced_at=None,
-        has_open_suggestion=False,
-    )
-    with patch("dispatcher_svc.main._send_sms") as mock_sms:
-        result = _send_suggestion(
-            conn, "user-1", "+15551234567", TZ, day_context, A_DAY, [young_latent]
-        )
-    assert result is False
-    mock_sms.assert_not_called()
-    insert_calls = [
-        c for c in conn.execute.call_args_list if "INSERT INTO suggestions" in c.args[0]
-    ]
-    assert insert_calls == []
+    mock_committer.upsert_placeholder.assert_not_called()
+    mock_tasks.enqueue_fire_task.assert_not_called()
+    conn.execute.assert_not_called()
 
 
-def test_send_suggestion_sends_exactly_one_and_writes_rows():
-    conn = _mock_connection(fetchone_result=("Rewrite the ingest pipeline in Rust",))
-    day_context = {
-        A_DAY: DayComputation(
-            booked=210,
-            snapshot=CapacitySnapshot(
-                date=A_DAY,
-                free_minutes=330,
-                largest_contiguous_block=180,
-                fragmentation_index=0.0,
-                load_delta=-0.30,
-            ),
-            largest_interval=Interval(start=time(12, 0), end=time(15, 0)),
-            snapshot_id="snap-1",
-        )
-    }
-    old_latent = LatentCandidate(
-        item_id="rust-item",
-        created_at=date(2026, 8, 9),  # 18 days old — matches capacity-engine.md §6
-        effort_minutes=120,
-        dismissal_count=0,
-        dormant_until=None,
-        last_surfaced_at=None,
-        has_open_suggestion=False,
-    )
-    with patch("dispatcher_svc.main._send_sms") as mock_sms:
-        result = _send_suggestion(
-            conn, "user-1", "+15551234567", TZ, day_context, A_DAY, [old_latent]
+def test_recompute_changed_slot_upserts_placeholder_and_enqueues_task():
+    item = _latent(effort_minutes=120, next_fit_start=None, placeholder_event_id=None)
+    forward_events = {A_DAY: []}
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    conn = MagicMock()
+    with (
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.tasks_client") as mock_tasks,
+    ):
+        mock_committer.upsert_placeholder.return_value = "new-evt-id"
+        _recompute_and_reschedule(
+            conn, "user-1", TZ, WH_START, WH_END, now_local, A_DAY, forward_events, item
         )
 
-    assert result is True
-    mock_sms.assert_called_once()
-    assert "Rewrite the ingest pipeline in Rust" in mock_sms.call_args.kwargs["body"]
-
-    insert_calls = [
-        c for c in conn.execute.call_args_list if "INSERT INTO suggestions" in c.args[0]
-    ]
-    assert len(insert_calls) == 1
-    assert insert_calls[0].args[1] == ("rust-item", "user-1", "snap-1")
-
+    mock_committer.upsert_placeholder.assert_called_once()
+    mock_tasks.enqueue_fire_task.assert_called_once()
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE latents" in c.args[0]]
     assert len(update_calls) == 1
-    assert update_calls[0].args[1] == ("rust-item",)
+    assert update_calls[0].args[1][1] == "new-evt-id"
+
+
+def test_recompute_no_fit_clears_existing_placeholder():
+    item = _latent(
+        effort_minutes=999, next_fit_start=datetime(2026, 8, 27, 9, 0, tzinfo=TZ),
+        placeholder_event_id="evt-1",
+    )
+    forward_events = {A_DAY: []}  # a whole free day still can't fit 999 minutes
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    conn = MagicMock()
+    with patch("dispatcher_svc.main.committer_client") as mock_committer:
+        _recompute_and_reschedule(
+            conn, "user-1", TZ, WH_START, WH_END, now_local, A_DAY, forward_events, item
+        )
+
+    mock_committer.delete_placeholder.assert_called_once()
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE latents" in c.args[0]]
+    assert len(update_calls) == 1
+    assert "next_fit_start = NULL" in update_calls[0].args[0]
+
+
+def test_clear_placeholder_deletes_and_nulls_columns():
+    item = _latent(placeholder_event_id="evt-1")
+    conn = MagicMock()
+    with patch("dispatcher_svc.main.committer_client") as mock_committer:
+        _clear_placeholder(conn, "user-1", item)
+    mock_committer.delete_placeholder.assert_called_once_with(UUID(ITEM_UUID), "user-1", "evt-1")
+    conn.execute.assert_called_once()
+
+
+def test_clear_placeholder_noop_calendar_call_when_nothing_to_delete():
+    item = _latent(placeholder_event_id=None)
+    conn = MagicMock()
+    with patch("dispatcher_svc.main.committer_client") as mock_committer:
+        _clear_placeholder(conn, "user-1", item)
+    mock_committer.delete_placeholder.assert_not_called()
+    conn.execute.assert_called_once()  # still nulls the columns, defensively

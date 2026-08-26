@@ -2,7 +2,7 @@
 
 Fourth doc in the architecture set — see `overview.md` §0. This is the differentiator (PRD §1, §6) — the thing that makes a suggestion read as "the system actually looked" rather than a random nudge. Every number here must be reproducible by hand from a `capacity_snapshots` row, per ADR [0005](../decisions/0005-vector-search-scope.md)'s point that resurfacing is arithmetic, not a black-box similarity search.
 
-Owned here: how a `capacity_snapshots` row gets computed from raw Calendar data, and how `dispatcher-svc` turns that plus the `latents` backlog into at most one suggestion per run. Formulas are stated exactly, including the constants the PRD left as prose ("~0.5", "~1.0") — a coding agent implementing this should not have to invent a curve.
+Owned here: how a `capacity_snapshots` row gets computed from raw Calendar data, and how `dispatcher-svc` turns that plus the `latents` backlog into a real, tagged placeholder event and a fire-time text for every eligible idea (ADR [0009](../decisions/0009-tentative-placeholder-write-before-confirm.md), §5) — not, as an earlier revision of this doc had it, a scored "at most one suggestion per run" pick. Formulas are stated exactly, including the constants the PRD left as prose ("~0.5", "~1.0") where they're still load-bearing (§3's `load_delta`) — a coding agent implementing this should not have to invent a curve.
 
 ---
 
@@ -72,133 +72,91 @@ rolling_mean = mean(booked_minutes(d) for d in trailing_14_days)
 
 ---
 
-## 4. Fit score
+## 4. Block fit — the whole scoring model, v1
 
-```
-fit_score = block_fit × load_fit
-```
+**Removed, user-directed, twice over:**
+- `focus_depth` and everything derived from it (separate margins, `depth_fit`'s reward/penalty curve over `fragmentation_index`) — judged too verbose for v1, stripped from every layer.
+- `revival_score`/`REVIVAL_THRESHOLD`/`select_suggestion`/`load_fit`/`fit_score` — the entire batch-scoring, "at most one suggestion per run" engine (formerly this section) is gone, replaced by ADR [0009](../decisions/0009-tentative-placeholder-write-before-confirm.md)'s auto-scheduled-placeholder model, §5 below. `fragmentation_index` and `load_delta` are still computed and persisted to `capacity_snapshots` (§3) — nothing else in this codebase reads them anymore, but they're kept as-is rather than removed, since `capacity_snapshots` remains a real per-day record of the user's calendar shape, independent of whatever consumes it.
 
-**Removed, v1, user-directed: `focus_depth` and everything derived from it** — the deep/shallow distinction (separate margins, `depth_fit`'s reward/penalty curve over `fragmentation_index`) was judged too verbose for v1 and stripped from every layer: extraction no longer classifies it, `items` no longer has the column, and the fit formula no longer includes a `depth_fit` term. `fragmentation_index` itself is unaffected — still computed and persisted (§3), just no longer consumed by `fit_score`.
-
-### 4.1 `block_fit` — hard gate, 0 or 1
-
-**Resolved inconsistency with the PRD:** PRD §6.2 states the gate as `free_minutes ≥ effort_minutes` (summed across all gaps). That's wrong given `state-machine.md` §2.3, which places an accepted item at the *start of a single contiguous block* — three 10-minute gaps summing to 30 free minutes cannot host one 30-minute event. The gate below is on a single contiguous block, with no margin — one universal rule for every item, v1:
+What's left is a single hard gate, unchanged from before:
 
 ```python
 def block_fit(largest_contiguous_block: int, effort_minutes: int) -> int:
     return 1 if largest_contiguous_block >= effort_minutes else 0
 ```
 
-### 4.2 `load_fit` — distance below the personal baseline
+**Resolved inconsistency with the PRD:** PRD §6.2 originally stated the gate as `free_minutes ≥ effort_minutes` (summed across all gaps). That's wrong given `state-machine.md` §2.3, which places an item at the *start of a single contiguous block* — three 10-minute gaps summing to 30 free minutes cannot host one 30-minute event. The gate above is on a single contiguous block, with no margin — one universal rule for every item, v1.
 
-PRD §6.2 gives two anchor points in prose: a day at the mean scores `~0.5`, a day 40% below scores `~1.0`. Solved exactly for a line through both points:
+---
+
+## 5. Auto-scheduled placeholders (ADR 0009)
+
+Every committed, non-dormant latent gets a real, tagged `[idea] {title}` event written to the user's **main** Google Calendar at its own `next_fit_start` — the earliest day/time in the next 7 whose `largest_contiguous_block` clears `block_fit` for that item's `effort_minutes`. At the exact instant that slot arrives, the user is texted; **Y** promotes the same placeholder event in place (tag removed, real event); **N**/**Later** clears it and reschedules to the next available slot. There is no scoring, no threshold, no "at most one per run" — every eligible idea gets its own slot and its own text, independently.
+
+### 5.1 `_next_fitting_slot` — per-item, self-excluding
 
 ```python
-def load_fit(load_delta: float) -> float:
-    return clip(0.5 - load_delta * 1.25, 0.0, 1.0)
+def _next_fitting_slot(forward_events, tz, wh_start, wh_end, now_local, today,
+                        effort_minutes, exclude_event_id) -> datetime | None:
+    for d in sorted(forward_events):
+        day_wh_start = buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+        intervals = free_intervals(d, forward_events[d], day_wh_start, wh_end, exclude_event_id)
+        largest = max(intervals, key=duration, default=None)
+        if largest is not None and block_fit(largest_duration, effort_minutes):
+            return datetime.combine(d, largest.start, tzinfo=tz)
+    return None
 ```
 
-Check: `load_delta = 0` → `0.5` ✓. `load_delta = -0.4` → `0.5 + 0.5 = 1.0` ✓. A day 40% *busier* than the user's own baseline (`load_delta = +0.4`) scores `0.0` — effectively excluded without a separate rule, which is correct: "busier than usual" is never the day to add something new, regardless of what the raw calendar looks like.
+`exclude_event_id` is the self-exclusion fix: an item's own existing placeholder is a real Calendar event, so without excluding it by id, recomputing that same item's slot would see its own placeholder as busy and needlessly evict itself every time it's recomputed. Every *other* item's placeholder is deliberately left in `forward_events` and still counts as busy — this is the entire mechanism behind a declined idea landing after every already-scheduled one (§5.3), with no cross-item cascade or reflow bookkeeping required.
+
+### 5.2 The write-boundary problem, and how it's resolved
+
+Writing a placeholder happens **before** user confirmation — a deliberate, narrow departure from the "never write on inference alone" invariant (ADR 0003), recorded in ADR 0009 rather than made silently. The invariant that actually matters — exactly one service ever calls the Calendar write API — is preserved: `committer-svc` stays the sole writer. `dispatcher-svc` (which owns all Calendar *reads* and all `next_fit_start` computation) requests the write via a new synchronous call, `PUT /latents/{item_id}/placeholder` / `DELETE /latents/{item_id}/placeholder` on committer-svc — the second synchronous cross-service asymmetry in this codebase (the first being `ingest-svc`'s direct forward to resolver-svc/dispatcher-svc, `overview.md` §2). A synchronous call, not Pub/Sub, because dispatcher-svc needs the real Calendar event id back immediately, to persist into `latents.placeholder_event_id`.
+
+`PUT` is a single upsert: `existing_event_id=None` creates; a real id tries to `PATCH` that event in place, falling back to a fresh create if it 404s (the user deleted it by hand). Committer-svc's Calendar-write helpers (`_create_placeholder_event`/`_move_placeholder_event`) are siblings of the existing `_write_calendar_event`, tagging the summary `[idea] {title}` and a fixed description ("Auto-scheduled — you'll get a text when it's time.").
+
+### 5.3 `_recompute_and_reschedule` — the one writer of `next_fit_start`
+
+Every writer of `latents.next_fit_start`/`placeholder_event_id` (initial commit, a working-hours change, the twice-daily sweep, a post-decline reschedule) goes through one function. It diffs the freshly computed slot against the value already stored and only touches the Calendar/Cloud Tasks queue when it actually changed:
+
+- **Unchanged** → pure no-op, no Calendar call, no Cloud Task.
+- **A new slot found** → `PUT .../placeholder` (upsert, §5.2), persist the returned event id + slot, then enqueue a Cloud Task for `POST /latents/{item_id}/fire` at exactly that instant (reusing the `reminders` queue — already multi-purpose — not a new one).
+- **No slot fits anywhere in the 7-day window** → `DELETE .../placeholder` if one existed, both columns go `NULL`.
+
+This bounds Cloud Tasks volume to "once per real slot change" and guarantees at most one *live* fire-task per latent at any time. An old, superseded task is never actively cancelled — Cloud Tasks has no clean primitive for that here — it's instead a guaranteed no-op when it fires: `/latents/{item_id}/fire` compares the `scheduled_for` it was enqueued with against the item's *current* `next_fit_start`, and skips silently (`stale_task_skipped`) on any mismatch.
+
+### 5.4 Firing, and the Y/N/Later outcomes
+
+`POST /latents/{item_id}/fire` (dispatcher-svc), on a real Cloud Task at the scheduled instant:
+1. No-op if the item is no longer a committed latent, or the task is stale (5.3).
+2. No-op if an open `suggestions` row already exists for it (never re-text mid-conversation).
+3. **Re-verify** the block is still actually free right now — a single-day Calendar re-fetch, same "don't trust a possibly-stale value" pattern the accept path already used before ADR 0009. If the slot's gone (a real meeting landed on it since), silently recompute + reschedule via §5.3 — no SMS, since nothing's been asked yet.
+4. Otherwise: send the text (`render_fire_suggestion`, agent-contracts.md §4.2), open a `suggestions` row (`snapshot_id` left `NULL` — no batch-scoring snapshot exists for this path anymore, `scheduled_for` carries the instant instead — `migrations/0020`).
+
+From there, the **existing** Y/N/Later `/reply` machinery is reused almost entirely unchanged (`state-machine.md` §2.2/§2.3):
+- **Y** — re-verifies real current availability (excluding the item's own placeholder, §5.1), publishes `ConfirmedItemMessage` to `items.confirmed` exactly as before. committer-svc's `_commit_obligation` now checks for an existing `placeholder_event_id` first and promotes that same event via `PATCH` (tag/description stripped, real title/time set) instead of `POST`ing a duplicate — the placeholder columns are cleared in the same transaction.
+- **N, first dismissal** (`dismissal_count` about to become `< 2`) — **reschedules immediately** via §5.3, user-directed: a single decline isn't a "don't ask again for a while" signal on its own. Reply text (`render_deferred`) names the new day, or apologizes if nothing fit.
+- **N, second dismissal** (`dismissal_count` reaches `2`) — unchanged 30-day `dormant_until`, but now also clears the placeholder (`DELETE`) rather than leaving a stale tagged event sitting on the calendar for a month.
+- **Later** — unchanged 7-day `dormant_until`, no dismissal penalty, placeholder cleared the same way.
+
+### 5.5 Eligibility, reconsidered without a scorer
+
+`_eligible_latents` (dispatcher-svc/main.py) now returns every committed latent that isn't currently dormant — the SQL filters `dormant_until IS NULL OR dormant_until <= now()` directly, since there's no scorer left to gate anything downstream of that. Two of the old scoring-era gates are gone entirely, because they'd now be actively wrong:
+- `days_since_capture < 3` — removed. There's no scoring left to protect from a too-young item; suppressing a fresh idea's own first slot would directly contradict "schedule it for the next eligible slot."
+- `last_surfaced_at` within 10 days — removed. A first-dismissal reschedule is very often *inside* that window by design (§5.4) — suppressing it there would break the reschedule this whole model exists to provide.
+
+`has_open_suggestion` stays, unchanged — never recompute or re-text something already mid-conversation. `dormant_until` stays too, but its role changed: instead of being checked at scoring time, a dormant item is simply absent from `_eligible_latents`'s result set, so no sweep ever touches it — no floor-clipping logic needed in the slot search itself. It reappears, and gets a real recompute, the moment `dormant_until` passes (a plain timestamp comparison, no job).
 
 ---
 
-## 5. Revival score and selection
-
-Per PRD §6.3, exactly:
-
-```python
-def revival_score(item: Latent, snapshot: CapacitySnapshot, fit: float) -> float:
-    days_since_capture = (today - item.created_at).days
-    recency_decay = 1 - exp(-days_since_capture / 14)
-    dismissal_penalty = 1 / (1 + item.dismissal_count)
-    return recency_decay * dismissal_penalty * fit
-```
-
-**Eligibility filter**, applied before scoring (state-machine.md §2.1 — repeated here since this is where it's enforced):
-- `days_since_capture < 3` → excluded.
-- `latents.dormant_until` in the future → excluded.
-- `latents.last_surfaced_at` within the last 10 days → excluded.
-- an open (`outcome IS NULL`) `suggestions` row already exists for this item → excluded (it's already `SURFACED`, can't be re-surfaced).
-
-**Selection, once per dispatcher run:**
-
-```python
-REVIVAL_THRESHOLD = 0.4   # tunable — see rationale below
-
-best = None
-for item in eligible_latents:
-    for snapshot in next_7_days_snapshots:
-        fit = fit_score(snapshot, item.effort_minutes)
-        score = revival_score(item, snapshot, fit)
-        if best is None or score > best.score:
-            best = Candidate(item, snapshot, score)
-
-if best is not None and best.score > REVIVAL_THRESHOLD:
-    send_suggestion(best.item, best.snapshot)
-```
-
-Read literally: for each latent, find *its* best day among the next 7 (this is what PRD §5.3 step 4's "score every eligible latent against the best snapshot" means precisely — "best" is per-latent, not a single day chosen up front). Then take the single highest-scoring `(latent, day)` pair across the whole backlog. If it clears the threshold, that's the one suggestion this run sends — everything else, however close, is silent this cycle.
-
-**On the threshold constant:** `0.4` is a starting point, not a derived value — flagged explicitly as tunable. Reasoning: `recency_decay` alone doesn't cross `~0.63` until an item is 18 days old (see the worked example, §6), so `0.4` requires either meaningful age *or* a very strong fit, not just one or the other. Tune this against real demo data before recording — it is the single knob most likely to need adjustment once you see actual suggestions fire (or fail to).
-
----
-
-## 6. Worked example
-
-Reproduces the exact suggestion text from PRD §5.3, with real numbers, so this is checkable against Cloud Logging output on camera.
-
-**Setup:** Thursday, working hours 09:00–18:00 (540 min). Calendar: a meeting 09:00–12:00 (merged 3h block) and a meeting 15:00–15:30. Trailing 14-day rolling mean: 300 booked min/day.
-
-**Snapshot computation:**
-- Free intervals: `[12:00–15:00]` (180 min), `[15:30–18:00]` (150 min).
-- `free_minutes = 330`
-- `largest_contiguous_block = 180` (the 12:00–15:00 block)
-- `fragmentation_index = 0 / 2 = 0.0` (neither gap is under 45 min)
-- `booked_minutes = 540 - 330 = 210`
-- `load_delta = (210 - 300) / 300 = -0.30`
-
-**Candidate latent:** "Rewrite the ingest pipeline in Rust" — captured 18 days ago, `effort_minutes = 120`, `dismissal_count = 0`.
-
-**Fit:**
-- `block_fit`: needs `120` ≤ `180` → `1`
-- `load_fit`: `0.5 - (-0.30 × 1.25) = 0.5 + 0.375 = 0.875`
-- `fit_score = 1 × 0.875 = 0.875`
-
-**Revival:**
-- `recency_decay = 1 - exp(-18/14) = 1 - 0.2765 = 0.7235`
-- `dismissal_penalty = 1 / (1 + 0) = 1.0`
-- `revival_score = 0.7235 × 1.0 × 0.875 ≈ 0.633`
-
-`0.633 > 0.4` → suggestion fires, into the `12:00–15:00` block on Thursday.
-
-**Evidence line generation** ("lightest day you've had in two weeks"): a separate check from `load_fit` itself — is this day's `booked_minutes` (210) the minimum among the trailing 14 daily values? If yes, use that superlative; otherwise fall back to a plainer phrasing ("Thursday looks lighter than usual"). Two different uses of the same 14-day window: `load_fit` wants a smooth distance-from-mean, the suggestion copy wants a discrete "is this the best one" fact. `agent-contracts.md` owns the exact phrasing rules.
-
-**Contrast — a candidate that doesn't clear the gate:** same day, a latent "Read the Rust book" captured 4 days ago, `effort_minutes = 240`. `block_fit`: needs `240`, block is `180` → `0`. `fit_score = 0` regardless of `load_fit` — excluded from consideration for this day entirely, correctly, since there's nowhere to put 4 hours today.
-
----
-
-### 6.1 `next_fit_start` — a dashboard preview, not the suggestion engine
-
-Every committed latent also gets `latents.next_fit_start` (`migrations/0018`): the earliest day in the next 7 whose `largest_contiguous_block` physically fits `effort_minutes` (`_next_fitting_slot`, dispatcher-svc/main.py), computed for *every* committed idea regardless of §5's eligibility gates or `REVIVAL_THRESHOLD` — those gates exist to avoid annoying, unsolicited texts, not to hide computable information from a dashboard the user is voluntarily looking at. It's deliberately not the `revival_score`-weighted "best" day `select_suggestion` picks (which can prefer a later but better-scored day over an earlier but choppier one) — just "when could this actually happen," the more literal question a dashboard card answers.
-
-**Three write paths, all landing on the same column, none of them persist `capacity_snapshots`** except the batch one (the other two have no trailing-14-day window to compute `load_delta` from, and that column is `NOT NULL` — a real bug, caught by live verification of the first synchronous path, not by its mocked unit tests):
-- **Batch, all committed latents:** part of the twice-daily `/dispatch` sweep (`_update_next_fit_slots`, called once per user per run over every latent found by `_eligible_latents`) — reuses that run's already-fetched 7-day forward Calendar read, no extra API calls. The only path that also persists `capacity_snapshots`.
-- **Synchronous, one latent, on commit:** `POST /latents/{item_id}/next-fit` (dispatcher-svc) — a real bug fix, user-directed: before this existed, a freshly-committed idea showed "someday" on the dashboard for however long it took the next twice-daily sweep to reach it, up to ~6 hours. `committer-svc`'s `_commit_latent` now enqueues an immediate (no `schedule_time`, dispatched as soon as Cloud Tasks can) Cloud Task at this endpoint right after the `INSERT INTO latents` — same `reminders` queue and OIDC-as-`sa-dispatcher` pattern already used for reminder delivery (`_enqueue_reminder_task`), just a different target path.
-- **Synchronous, every committed latent for one user, on a working-hours change:** `POST /users/{user_id}/next-fit` (dispatcher-svc) — a second real bug fix, user-directed follow-up found live: without this, widening working hours to fit an idea into today left every existing idea's `next_fit_start` stale until the next sweep, so the dashboard visibly didn't react to the exact setting that should have changed its answer. `dashboard-svc`'s `PATCH /me/profile` enqueues an immediate Cloud Task here whenever `working_hours_start`/`working_hours_end` actually changes (not on a bare timezone update) — same queue/OIDC pattern again, `sa-dashboard` granted `cloudtasks.enqueuer` on `reminders` and `iam.serviceAccountUser` on `sa-dispatcher` to do it. Recomputes via the same `_eligible_latents`/`_update_next_fit_slots` pair the batch sweep uses, just for one user off a fresh single-user Calendar read instead of the sweep's per-user loop.
-
-Both synchronous paths are best-effort: a failed enqueue (logged, swallowed) just means that user/idea falls back to the next batch sweep instead of updating within seconds — never fatal to the commit or the profile save. Both are also the one deliberate exception to §1's "every cross-service handoff is Pub/Sub" framing in `overview.md` §1 — reused because Cloud Tasks was already the established mechanism here (reminders), and a one-off targeted Calendar read doesn't fit the topic/subscription shape the rest of the pipeline uses.
-
-If the user has no linked Google account, all three paths no-op (`next_fit_start` stays null, same as it starts) — there's no Calendar to read.
-
----
-
-## 7. Deliberately not built
+## 6. Deliberately not built
 
 - Buffer/transition time around meetings (§2).
-- Any cross-day lookahead beyond "each latent's best day in the next 7" — e.g. holding a very strong candidate for a slightly better day two weeks out. The 7-day window and one-shot-per-run selection (PRD §5.3) is the whole model; no queueing of near-misses.
-- Per-latent custom thresholds. One global `REVIVAL_THRESHOLD` for all items and all users.
+- Any cross-day lookahead beyond "the next fitting slot in 7 days" — e.g. holding a very strong candidate for a slightly better day two weeks out.
+- Any global rate limit on how many ideas can be pre-scheduled/texted across a day. Restraint was the deliberate design of the pre-ADR-0009 engine (`REVIVAL_THRESHOLD`, one suggestion per run); ADR 0009 explicitly replaces that with "every eligible idea gets its own slot, independently" — a user with many committed ideas will get proportionally many placeholder events and, over time, many texts, one per idea's own slot. Not engineered around; noted here so it isn't mistaken for an oversight.
 
-## 8. Open items for sibling docs
+## 7. Open items for sibling docs
 
-- ~~Exact SMS rendering of the suggestion and evidence line (including the "lightest day" fallback wording from §6)~~ → done, see `agent-contracts.md` §4.2.
+- ~~Exact SMS rendering of the fire-time suggestion~~ → done, see `agent-contracts.md` §4.2.
 - ~~Which service account runs the Calendar read... `infrastructure.md` should confirm the Calendar API quota this implies~~ → done, see `infrastructure.md` §4 (default quota comfortably covers this).
+- ~~How dispatcher-svc gets a placeholder written given only committer-svc holds Calendar write credentials~~ → done, see ADR 0009 and §5.2 above.

@@ -97,12 +97,14 @@ def test_obligation_branch_calls_calendar_write(client):
     assert kwargs["json"]["summary"] == "Pay rent"
 
     # call 0 is the idempotency guard's items.state check; 1 is the SELECT
-    # in _user_credentials; 2 is the obligations INSERT; 3 is the items UPDATE.
-    insert_sql, insert_params = conn.execute.call_args_list[2][0]
+    # in _user_credentials; 2 is the ADR 0009 placeholder-lookup SELECT
+    # (no placeholder here, so it falls straight to a fresh Calendar
+    # POST); 3 is the obligations INSERT; 4 is the items UPDATE.
+    insert_sql, insert_params = conn.execute.call_args_list[3][0]
     assert "INSERT INTO obligations" in insert_sql
     assert insert_params[2] == "gcal-event-123"  # calendar_event_id
 
-    update_sql, update_params = conn.execute.call_args_list[3][0]
+    update_sql, update_params = conn.execute.call_args_list[4][0]
     assert "state = 'COMMITTED'" in update_sql
     assert update_params == (confirmed.type, str(confirmed.item_id))
 
@@ -133,7 +135,7 @@ def test_calendar_branch_localizes_due_at_before_insert(client):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 200
-    _insert_sql, insert_params = conn.execute.call_args_list[2][0]
+    _insert_sql, insert_params = conn.execute.call_args_list[3][0]
     assert insert_params[1] == datetime(2026, 8, 28, 14, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
@@ -157,7 +159,7 @@ def test_calendar_branch_persists_reminder_times(client):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 200
-    insert_sql, insert_params = conn.execute.call_args_list[2][0]
+    insert_sql, insert_params = conn.execute.call_args_list[3][0]
     assert "reminder_1_at" in insert_sql
     assert "reminder_2_at" in insert_sql
     # Real bug, found live: these used to be inserted still-naive, which
@@ -242,7 +244,7 @@ def test_calendar_branch_skips_a_reminder_slot_already_overdue_at_commit(client)
     mock_enqueue.assert_called_once()
     assert mock_enqueue.call_args.args[1] == 2  # only the still-future slot 2 enqueued
 
-    insert_sql, insert_params = conn.execute.call_args_list[2][0]
+    insert_sql, insert_params = conn.execute.call_args_list[3][0]
     assert "reminder_1_sent_at" in insert_sql
     assert "reminder_2_sent_at" in insert_sql
     assert insert_params[6] is not None  # slot 1: skipped, so marked closed out immediately
@@ -346,11 +348,173 @@ def test_calendar_failure_does_not_mark_committed(client):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 500
-    # The idempotency guard's state check, then the credentials SELECT,
-    # happened — the calendar call raised before the obligations INSERT /
-    # items UPDATE were ever reached.
-    assert conn.execute.call_count == 2
+    # The idempotency guard's state check, the credentials SELECT, and
+    # the ADR 0009 placeholder-lookup SELECT all happened — the calendar
+    # call raised before the obligations INSERT / items UPDATE were ever
+    # reached.
+    assert conn.execute.call_count == 3
     assert "SELECT" in conn.execute.call_args_list[1][0][0]
+    assert "SELECT" in conn.execute.call_args_list[2][0][0]
+
+
+# --- ADR 0009: placeholder promotion + PUT/DELETE endpoints ------------
+
+
+def _mock_promotion_connection(*, placeholder_event_id, user_row):
+    """A resurfaced latent's accept path: _already_committed's own
+    'FROM obligations' check must report not-yet-committed, while the
+    ADR 0009 placeholder-lookup SELECT (also 'FROM latents', like
+    _already_committed's own latent-branch check) must return a real
+    existing placeholder id — distinct enough intents that _mock_connection's
+    single already_committed flag can't express both at once."""
+
+    def execute_side_effect(sql, params=None):
+        result = MagicMock()
+        if "FROM obligations" in sql:
+            result.fetchone.return_value = None  # not already committed
+        elif "SELECT placeholder_event_id FROM latents" in sql:
+            result.fetchone.return_value = (placeholder_event_id,)
+        elif "FROM users" in sql:
+            result.fetchone.return_value = user_row
+        else:
+            result.fetchone.return_value = None
+        return result
+
+    conn = MagicMock()
+    conn.execute.side_effect = execute_side_effect
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    return conn
+
+
+def test_accept_promotes_existing_placeholder_in_place(client):
+    """A resurfaced latent already has a real [idea]-tagged placeholder
+    on the calendar (dispatcher-svc's accept path always confirms at the
+    placeholder's own slot) — promote that same event via PATCH instead
+    of POSTing a duplicate, and clear the now-stale placeholder columns."""
+    confirmed = _confirmed_message()
+    conn = _mock_promotion_connection(
+        placeholder_event_id="evt-placeholder",
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles"),
+    )
+    patch_response = MagicMock()
+    patch_response.status_code = 200
+    patch_response.json.return_value = {"id": "evt-placeholder"}
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.patch.return_value = patch_response
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    mock_session_cls.return_value.patch.assert_called_once()
+    mock_session_cls.return_value.post.assert_not_called()  # no duplicate event
+
+    clear_calls = [
+        c for c in conn.execute.call_args_list
+        if "UPDATE latents" in c.args[0] and "placeholder_event_id = NULL" in c.args[0]
+    ]
+    assert len(clear_calls) == 1
+
+
+def test_accept_falls_back_to_create_when_placeholder_was_deleted(client):
+    """The user (or some other process) deleted the placeholder event by
+    hand — the promotion PATCH 404s, so this must fall back to a fresh
+    POST rather than failing the whole commit."""
+    confirmed = _confirmed_message()
+    conn = _mock_promotion_connection(
+        placeholder_event_id="evt-gone",
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles"),
+    )
+    patch_response = MagicMock()
+    patch_response.status_code = 404
+    post_response = MagicMock()
+    post_response.json.return_value = {"id": "gcal-event-fresh"}
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.patch.return_value = patch_response
+        mock_session_cls.return_value.post.return_value = post_response
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    mock_session_cls.return_value.post.assert_called_once()
+
+
+def test_upsert_placeholder_creates_when_no_existing_event(client):
+    with (
+        patch(
+            "committer_svc.main._user_credentials",
+            return_value=(MagicMock(), "America/Vancouver"),
+        ),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.post.return_value.json.return_value = {"id": "new-evt"}
+        resp = client.put(
+            f"/latents/{uuid4()}/placeholder",
+            json={
+                "user_id": str(uuid4()), "title": "Nerf gun turret",
+                "start": "2026-08-27T09:00:00", "effort_minutes": 240,
+                "existing_event_id": None,
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"event_id": "new-evt"}
+    mock_session_cls.return_value.post.assert_called_once()
+    summary = mock_session_cls.return_value.post.call_args.kwargs["json"]["summary"]
+    assert summary == "[idea] Nerf gun turret"
+
+
+def test_upsert_placeholder_moves_when_existing_event_given(client):
+    with (
+        patch(
+            "committer_svc.main._user_credentials",
+            return_value=(MagicMock(), "America/Vancouver"),
+        ),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        patch_response = MagicMock()
+        patch_response.status_code = 200
+        patch_response.json.return_value = {"id": "same-evt"}
+        mock_session_cls.return_value.patch.return_value = patch_response
+        resp = client.put(
+            f"/latents/{uuid4()}/placeholder",
+            json={
+                "user_id": str(uuid4()), "title": "Nerf gun turret",
+                "start": "2026-08-27T09:00:00", "effort_minutes": 240,
+                "existing_event_id": "same-evt",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"event_id": "same-evt"}
+    mock_session_cls.return_value.post.assert_not_called()
+
+
+def test_delete_placeholder_calls_calendar_delete(client):
+    with (
+        patch(
+            "committer_svc.main._user_credentials",
+            return_value=(MagicMock(), "America/Vancouver"),
+        ),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.delete.return_value.status_code = 204
+        resp = client.request(
+            "DELETE",
+            f"/latents/{uuid4()}/placeholder",
+            params={"user_id": str(uuid4()), "event_id": "evt-to-delete"},
+        )
+
+    assert resp.status_code == 200
+    mock_session_cls.return_value.delete.assert_called_once()
 
 
 def test_no_linked_google_account_fails_without_writing(client):

@@ -299,13 +299,22 @@ case "$SERVICE" in
     # triggered (POST /dispatch), not a topic consumer. Twilio outbound
     # send needs the API Key secret (infrastructure.md §4.1); Calendar
     # read needs the same OAuth client as committer-svc.
+    # COMMITTER_SVC_URL: ADR 0009's synchronous placeholder PUT/DELETE
+    # call to committer-svc (capacity-engine.md §5.2). The Cloud Tasks
+    # queue/IAM this also needs (sa-dispatcher: cloudtasks.enqueuer on
+    # "reminders", run.invoker on committer-svc) are provisioned once by
+    # hand, not by this script — see infrastructure.md §5.1.
+    COMMITTER_SVC_URL=$(gcloud run services describe committer-svc \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-dispatcher@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID}" \
+      --set-env-vars="DB_USER=sa-dispatcher@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID},COMMITTER_SVC_URL=${COMMITTER_SVC_URL}" \
       --set-secrets="GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest,TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
       --min-instances=0 \
       --no-allow-unauthenticated \
@@ -314,6 +323,18 @@ case "$SERVICE" in
     SERVICE_URL=$(gcloud run services describe "$SERVICE" \
       --project="$PROJECT_ID" --region="$REGION" \
       --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
+    # DISPATCHER_SVC_URL: tasks_client.py's own fire-task enqueue targets
+    # this service's own URL (ADR 0009 — dispatcher-svc enqueueing a
+    # Cloud Task at itself for the first time). Set via update, not the
+    # initial deploy above, since the URL isn't known until the service
+    # exists — same "needs itself to exist first" ordering every other
+    # URL-dependent step in this script already has.
+    echo "Setting DISPATCHER_SVC_URL=${SERVICE_URL} on ${SERVICE}..."
+    gcloud run services update "$SERVICE" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --update-env-vars="DISPATCHER_SVC_URL=${SERVICE_URL}" \
+      --account=waslyrideshare@gmail.com
 
     # Cloud Scheduler jobs need the live URL, same "needs the service to
     # exist first" reasoning as setup_push_subscription — not Terraform,

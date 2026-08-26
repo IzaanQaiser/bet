@@ -130,28 +130,34 @@ else:
 ```mermaid
 stateDiagram-v2
     [*] --> ELIGIBLE: item COMMITTED as latent
-    ELIGIBLE --> SURFACED: dispatcher run scores it highest, sends suggestion
+    ELIGIBLE --> ELIGIBLE: next_fit_start computed, real [idea]-tagged placeholder written (ADR 0009)
+    ELIGIBLE --> SURFACED: the item's own next_fit_start arrives, fire-time text sent
     SURFACED --> ACCEPTED: user replies Y
-    SURFACED --> ELIGIBLE: user replies N, dismissal_count < 2
-    SURFACED --> DORMANT: user replies N, dismissal_count reaches 2
-    SURFACED --> ELIGIBLE: user replies "Later" (snoozed 7d via dormant_until, no dismissal_count change)
+    SURFACED --> ELIGIBLE: user replies N, dismissal_count < 2 (rescheduled immediately, new placeholder)
+    SURFACED --> DORMANT: user replies N, dismissal_count reaches 2 (placeholder cleared)
+    SURFACED --> ELIGIBLE: user replies "Later" (snoozed 7d via dormant_until, placeholder cleared, no dismissal_count change)
     SURFACED --> ELIGIBLE: no reply within 24h (outcome=no_response, no penalty)
     DORMANT --> ELIGIBLE: dormant_until passes (pure timestamp comparison, no job needed)
     ACCEPTED --> [*]: converted to obligation, follows obligation lifecycle from here
 ```
 
-### 2.1 Eligibility gate (`ELIGIBLE` phase, scored by dispatcher)
+**Revised, ADR [0009](../decisions/0009-tentative-placeholder-write-before-confirm.md), user-directed:** `ELIGIBLE → SURFACED` no longer happens because a dispatcher run scored this item highest against every other candidate — the old `revival_score`/`REVIVAL_THRESHOLD` engine and its "at most one suggestion per run" restraint are gone. Every non-dormant committed latent gets its own `next_fit_start` and its own real, tagged placeholder event on the calendar (capacity-engine.md §5), independently of every other latent; `SURFACED` now triggers off that specific item's own slot arriving (a Cloud Task), not a cross-item comparison.
 
-Per PRD §6.3, a latent in `ELIGIBLE` phase is only a *candidate* — the dispatcher still filters before scoring:
-- `days_since_capture < 3` → excluded (ideas need to breathe).
-- `last_surfaced_at` within the last 10 days → excluded, even if technically `ELIGIBLE` by the phase derivation above (this is why "surfaced in the last 10 days" is a separate rule from the `SURFACED`/`ELIGIBLE` phase split — a dismissed-and-returned-to-`ELIGIBLE` item is still cooling down).
+### 2.1 Eligibility gate (`ELIGIBLE` phase — reconsidered without a scorer, ADR 0009)
+
+There is no scorer left to gate candidates *for*, so the PRD §6.3 filter is narrower than it originally was:
+- `days_since_capture < 3` — **removed**. Existed only to protect a batch score from a too-fresh item; with no score, suppressing a brand-new idea's own first slot would directly contradict "schedule it for the next eligible slot."
+- `last_surfaced_at` within the last 10 days — **removed**. A first-dismissal reschedule (§2.2) is very often inside that window by design — suppressing it there would break the reschedule the whole model exists to provide.
+- `dormant_until` in the future → still excluded — `_eligible_latents`'s own SQL filter, not a post-fetch check.
+- an open (`outcome IS NULL`) `suggestions` row already exists → still excluded (already `SURFACED`, never recompute/re-text mid-conversation).
 
 ### 2.2 `SURFACED` outcomes — decisions made in this doc
 
 PRD §6.3 defines `Later` (snooze 7d) and dismissal (`dismissal_count ≥ 2` → dormant 30d) but not what `dormant_until` means mechanically or what happens on no reply. Resolved here:
 
-- **`dormant_until` is reused for both snooze and dismissal-dormancy.** It generically means "not eligible until this timestamp." What differs is only whether `dismissal_count` was also incremented (dismissal: yes; snooze: no). One column, two callers. Carry this into `data-model.md` when it's written — don't add a second `snoozed_until` column.
-- **No reply within 24h → `outcome = 'no_response'`.** No dismissal penalty (silence isn't rejection), but the existing "not eligible within 10 days of `last_surfaced_at`" rule still applies, so it won't immediately resurface either. This closes the one PRD gap where a `suggestions` row could otherwise sit with `outcome IS NULL` forever, permanently stuck in the `SURFACED` phase per the derivation rule above (a live suggestion the user ignores must eventually resolve to *something*, or the item can never be surfaced again).
+- **`dormant_until` is reused for both snooze and dismissal-dormancy.** It generically means "not eligible until this timestamp." What differs is only whether `dismissal_count` was also incremented (dismissal: yes; snooze: no). One column, two callers.
+- **No reply within 24h → `outcome = 'no_response'`.** No dismissal penalty (silence isn't rejection). Since the "not eligible within 10 days of `last_surfaced_at`" rule that used to prevent an immediate resurface is gone (§2.1, ADR 0009), a no-response item can be recomputed and re-texted again as soon as the next sweep finds a fitting slot — closes the one PRD gap where a `suggestions` row could otherwise sit with `outcome IS NULL` forever, permanently stuck in `SURFACED`.
+- **ADR 0009: N and Later now also clear or move the real placeholder, not just the DB columns.** First dismissal (`dismissal_count` about to become `< 2`) reschedules immediately — the placeholder *moves* to the next fitting slot via `PUT .../placeholder` (capacity-engine.md §5.3), not left tagged at a slot the user just declined. Second dismissal (`dismissal_count` reaches 2) and `Later` both `DELETE` the placeholder outright, since neither has anywhere to move it to right now.
 
 ### 2.3 `ACCEPTED` — how a latent actually becomes a calendar write
 
@@ -159,7 +165,7 @@ PRD §6.3 defines `Later` (snooze 7d) and dismissal (`dismissal_count ≥ 2` →
 
 1. User replies `Y` to a suggestion. `ingest-svc` routes it to `dispatcher-svc` (§4).
 2. `dispatcher-svc` sets `suggestions.outcome = 'accepted'`, computes the target slot — **event start = the start of the `largest_contiguous_block` on the suggested day; duration = `effort_minutes`, capped at the block length** (decision made here; PRD names the block but not the exact slot placement) — and publishes directly to `items.confirmed` with `type` flipped to `obligation`, `due_at` set to that computed start time.
-3. `committer-svc` consumes it exactly as it would a resolver-confirmed item — it has no way to tell the two apart, and doesn't need to.
+3. `committer-svc` consumes it exactly as it would a resolver-confirmed item — it has no way to tell the two apart, and doesn't need to. **ADR 0009 addition:** before writing, it checks `latents.placeholder_event_id` for this item — if a real placeholder already exists (true for every latent surfaced via the ADR 0009 fire-time flow), it `PATCH`es that same Calendar event in place (tag/description stripped, real title/time set) instead of `POST`ing a duplicate, then clears the placeholder columns in the same transaction.
 
 This reuses the existing commit path instead of giving `dispatcher-svc` its own write credential, matching the reuse pattern in ADR 0008 and keeping the write-access matrix in `overview.md` unchanged in shape (one new topic-publish permission, no new external scope).
 
@@ -167,7 +173,7 @@ This reuses the existing commit path instead of giving `dispatcher-svc` its own 
 
 **Resolved gap, also found building step 14: `ConfirmedItemMessage.effort_minutes` is a strict `Literal[15, 30, 60, 120, 240]` (`schemas.py`) — "capped at the block length" can't mean an arbitrary integer.** Decided: use the largest of the five buckets that's `<=` both the item's original `effort_minutes` and the block's actual length, falling back to the smallest bucket (15) if even that overruns. An explicit user `Y` always gets scheduled somewhere rather than being silently refused over a small bucket-granularity overrun.
 
-**Resolved gap: the snapshot a suggestion was built from can be stale by the time a reply arrives** — a user might reply hours or a full day later, and the day's real Calendar state can have changed in between (more events booked, or the process that originally computed the block simply ran a while ago). `dispatcher-svc`'s accept handler re-fetches real, current Calendar events for the suggested day and recomputes the largest free interval at accept time rather than trusting the `capacity_snapshots` row's stored `largest_contiguous_block` figure. If the day has genuinely filled up since, the suggestion is dismissed with an apologetic message rather than scheduling into a conflict or silently failing.
+**Resolved gap: the slot a suggestion was built from can be stale by the time a reply arrives** — a user might reply hours or a full day later, and the day's real Calendar state can have changed in between (more events booked, or the fire-time computation simply ran a while ago). `dispatcher-svc`'s accept handler re-fetches real, current Calendar events for the suggested day and recomputes the largest free interval at accept time, **excluding the item's own real placeholder event from that re-fetch** (ADR 0009 — otherwise the placeholder itself would incorrectly read as busy time blocking its own slot). If the day has genuinely filled up since (some other real event), the suggestion is dismissed with an apologetic message rather than scheduling into a conflict or silently failing.
 
 ---
 

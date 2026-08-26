@@ -86,11 +86,13 @@ CREATE TABLE obligations (
 );
 
 CREATE TABLE latents (
-    item_id           uuid PRIMARY KEY REFERENCES items(id),
-    last_surfaced_at  timestamptz,
-    surface_count     int NOT NULL DEFAULT 0,
-    dismissal_count   int NOT NULL DEFAULT 0,
-    dormant_until     timestamptz          -- reused for both dismissal-dormancy (30d) and snooze (7d); see state-machine.md §2.2
+    item_id               uuid PRIMARY KEY REFERENCES items(id),
+    last_surfaced_at      timestamptz,
+    surface_count         int NOT NULL DEFAULT 0,
+    dismissal_count       int NOT NULL DEFAULT 0,
+    dormant_until         timestamptz,     -- reused for both dismissal-dormancy (30d) and snooze (7d); see state-machine.md §2.2
+    next_fit_start        timestamptz,     -- migrations/0018; capacity-engine.md §5 — the item's own currently-scheduled placeholder slot, when placeholder_event_id is set
+    placeholder_event_id  text             -- migrations/0020, ADR 0009 — real Calendar event id for the [idea]-tagged placeholder; null = none exists right now
 );
 CREATE INDEX idx_latents_dormant_until ON latents(dormant_until) WHERE dormant_until IS NOT NULL;
 
@@ -114,13 +116,14 @@ CREATE TABLE capacity_snapshots (
 );
 
 CREATE TABLE suggestions (
-    id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    item_id      uuid NOT NULL REFERENCES items(id),
-    user_id      uuid NOT NULL REFERENCES users(id),   -- denormalized; see §2.2
-    snapshot_id  uuid NOT NULL REFERENCES capacity_snapshots(id),
-    sent_at      timestamptz NOT NULL DEFAULT now(),
-    outcome      text CHECK (outcome IN ('accepted', 'dismissed', 'snoozed', 'no_response')),
-    responded_at timestamptz
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    item_id       uuid NOT NULL REFERENCES items(id),
+    user_id       uuid NOT NULL REFERENCES users(id),   -- denormalized; see §2.2
+    snapshot_id   uuid REFERENCES capacity_snapshots(id),  -- migrations/0020: nullable — ADR 0009's fire-time suggestions have no batch-scoring snapshot to attach to
+    scheduled_for timestamptz,                             -- migrations/0020: the instant this suggestion was actually made for; replaces capacity_snapshots.date for that purpose
+    sent_at       timestamptz NOT NULL DEFAULT now(),
+    outcome       text CHECK (outcome IN ('accepted', 'dismissed', 'snoozed', 'no_response')),
+    responded_at  timestamptz
 );
 CREATE INDEX idx_suggestions_user_open ON suggestions(user_id) WHERE outcome IS NULL;
 CREATE INDEX idx_suggestions_item ON suggestions(item_id);
@@ -197,6 +200,7 @@ The PRD is intentionally a first-pass sketch, not the canonical schema — this 
 | `latents` has no explicit snooze column | `dormant_until` reused for snooze, not a new column | `state-machine.md` §2.2 — one column, two callers, documented here per that doc's own note |
 | `items.type` was `NOT NULL` | Made nullable (migration 0002) | §2.6 — unknown until `EXTRACTED`, `ingest-svc` has no legitimate value to write |
 | No service had `SELECT` on `users` | Granted to all four service roles (migration 0003) | `infrastructure.md` §2.2 — found when `ingest-svc`'s phone lookup failed live; every service needs this eventually |
+| `suggestions.snapshot_id` was `NOT NULL` | Made nullable (migration 0020) | ADR 0009 — a fire-time suggestion has no `capacity_snapshots` row to attach to, since the batch-scoring engine that produced one is gone |
 
 ---
 
