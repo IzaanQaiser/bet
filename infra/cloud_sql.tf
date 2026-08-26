@@ -84,6 +84,13 @@ resource "google_sql_user" "registration" {
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }
 
+# Web division Phase 5 — dashboard-svc, same pattern.
+resource "google_sql_user" "dashboard" {
+  name     = trimsuffix(google_service_account.dashboard.email, ".gserviceaccount.com")
+  instance = google_sql_database_instance.main.name
+  type     = "CLOUD_IAM_SERVICE_ACCOUNT"
+}
+
 # roles/cloudsql.client — needed to open a connection via the Auth Proxy at all.
 resource "google_project_iam_member" "cloudsql_client" {
   for_each = {
@@ -92,6 +99,7 @@ resource "google_project_iam_member" "cloudsql_client" {
     committer    = google_service_account.committer.email
     dispatcher   = google_service_account.dispatcher.email
     registration = google_service_account.registration.email
+    dashboard    = google_service_account.dashboard.email
   }
   project = var.project_id
   role    = "roles/cloudsql.client"
@@ -110,6 +118,7 @@ resource "google_project_iam_member" "cloudsql_instance_user" {
     committer    = google_service_account.committer.email
     dispatcher   = google_service_account.dispatcher.email
     registration = google_service_account.registration.email
+    dashboard    = google_service_account.dashboard.email
   }
   project = var.project_id
   role    = "roles/cloudsql.instanceUser"
