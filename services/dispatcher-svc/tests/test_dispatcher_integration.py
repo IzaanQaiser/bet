@@ -118,14 +118,12 @@ def _insert_committed_latent(user_id, created_at):
 def _insert_committed_obligation(user_id, due_at, effort_minutes=15, is_scheduled_event=False):
     """reminder_1_at/reminder_2_at mirror resolver-svc's own
     _compute_reminder_times — real production formula, not a test-only
-    shortcut: a task (default) gets both reminders strictly before due_at
-    (due_at - 2*effort, due_at - effort); a scheduled event gets a fixed
-    30-minute heads-up before start (not effort-scaled — effort means
-    the event's own duration, not lead time) AND a reminder AT the
-    actual start time (due_at - 30min, due_at)."""
-    delta = timedelta(minutes=effort_minutes)
-    reminder_1_at = due_at - timedelta(minutes=30) if is_scheduled_event else due_at - 2 * delta
-    reminder_2_at = due_at if is_scheduled_event else due_at - delta
+    shortcut: one universal rule now, task or event, user-directed —
+    30 minutes before due_at, and at due_at itself. effort_minutes no
+    longer factors into reminder timing at all (still stored on items,
+    purely for Calendar event sizing)."""
+    reminder_1_at = due_at - timedelta(minutes=30)
+    reminder_2_at = due_at
     with get_connection() as conn:
         row = conn.execute(
             """
@@ -203,13 +201,13 @@ def test_dispatch_run_sends_at_most_one_suggestion(client, test_user):
 
 
 def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
-    """effort_minutes=120, due in 1h: reminder_1_at (due-4h) and
-    reminder_2_at (due-2h) have both already passed, so a single run
+    """due_at already 2 minutes in the past: both the flat 30-min-before
+    and the at-due-time reminder have already passed, so a single run
     fires both — real DB-backed idempotency for each slot independently,
     not just one shared reminder_sent_at."""
     user_id, phone = test_user
-    due_at = datetime.now(UTC) + timedelta(hours=1)
-    item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=120)
+    due_at = datetime.now(UTC) - timedelta(minutes=2)
+    item_id = _insert_committed_obligation(user_id, due_at)
 
     def mock_events_range(session, start, end, tz_name):
         return _mock_events_by_range(start, end, tz_name, forward_events=7)

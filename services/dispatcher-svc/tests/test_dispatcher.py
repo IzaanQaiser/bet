@@ -64,7 +64,7 @@ def test_reminder_not_resent_if_already_sent():
 
 def test_early_reminder_sent_marks_reminder_1_sent_at():
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_reminder_connection(early_rows=[("item-1", "Pay rent", due_at, 120, False)])
+    conn = _mock_reminder_connection(early_rows=[("item-1", "Pay rent", due_at, False)])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 1
@@ -82,7 +82,7 @@ def test_early_reminder_sent_marks_reminder_1_sent_at():
 
 def test_final_reminder_sent_marks_reminder_2_sent_at():
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_reminder_connection(final_rows=[("item-1", "Pay rent", due_at, 120, False)])
+    conn = _mock_reminder_connection(final_rows=[("item-1", "Pay rent", due_at, False)])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 1
@@ -103,8 +103,8 @@ def test_scheduled_event_gets_event_templates_not_task_templates():
     templates instead."""
     due_at = datetime(2026, 8, 25, 20, 39, tzinfo=UTC)
     conn = _mock_reminder_connection(
-        early_rows=[("item-1", "Meeting", due_at, 30, True)],
-        final_rows=[("item-1", "Meeting", due_at, 30, True)],
+        early_rows=[("item-1", "Meeting", due_at, True)],
+        final_rows=[("item-1", "Meeting", due_at, True)],
     )
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
@@ -121,8 +121,8 @@ def test_both_reminders_can_fire_in_the_same_run():
     late than never" semantics the old single reminder always had."""
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
     conn = _mock_reminder_connection(
-        early_rows=[("item-1", "Pay rent", due_at, 120, False)],
-        final_rows=[("item-1", "Pay rent", due_at, 120, False)],
+        early_rows=[("item-1", "Pay rent", due_at, False)],
+        final_rows=[("item-1", "Pay rent", due_at, False)],
     )
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)

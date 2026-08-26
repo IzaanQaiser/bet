@@ -128,22 +128,16 @@ Do, in order:
    finding, not theoretical: a live conversation silently assumed times
    like this on two separate real obligations, never stated to the user
    until they asked or pushed back on it. Same rule for email_recipient
-   (a literal address only, never guessed from a name). If effort_minutes
-   is listed as missing and the latest reply gives
-   any duration/scope signal ("3 hours probably", "maybe an hour", "quick
-   one"), resolve it to the nearest of 15/30/60/120/240 minutes — round up
-   on a tie (underestimating available work time is the worse failure
-   mode) — set effort_minutes_filled true, put the value in effort_minutes.
-   If the reply is still vague with no usable signal, leave
-   effort_minutes_filled false. Only touch fields actually listed as
-   missing, or explicitly updated during a correction. still_missing MUST
-   be a subset of the given missing fields — the only three field names
-   that can ever appear are "due_at", "email_recipient", and
-   "effort_minutes". Never add any other field name (e.g. "title") to
-   still_missing, even if the title/summary itself still seems vague — the
-   title is fixed by an earlier stage and isn't something this turn
-   resolves; if it genuinely reads as unclear, just work with it as given
-   rather than asking about it.
+   (a literal address only, never guessed from a name). Only touch fields
+   actually listed as missing, or explicitly updated during a correction.
+   still_missing MUST be a subset of the given missing fields — the only
+   two field names that can ever appear are "due_at" and "email_recipient"
+   (effort is never asked about — user-directed: it added real friction
+   for little value, always just a silent best-guess bucket upstream).
+   Never add any other field name (e.g. "title") to still_missing, even if
+   the title/summary itself still seems vague — the title is fixed by an
+   earlier stage and isn't something this turn resolves; if it genuinely
+   reads as unclear, just work with it as given rather than asking about it.
 
 2. Intent (ONLY set this if awaiting_confirmation OR awaiting_dedupe_reply
    is true — a question was already sent and this reply is responding to
@@ -232,17 +226,21 @@ Do, in order:
      language and reads wrong for something you just show up to. Real
      finding: a live conversation confirmed a party as "due at 3pm
      tomorrow", which read oddly for exactly this reason.
-   If reminder_1_at and reminder_2_at are both given (non-null) on this
-   turn's confirmation message or AFFIRM acknowledgment, state both given
-   times directly in the sentence — e.g. if given as 12:00 PM and 3:00 PM,
-   say something like "I'll remind you at 12pm and 3pm" using those exact
-   given values, not placeholders — so the user knows exactly when they'll
-   hear from the system again, not just that a reminder exists. For an
-   event, reminder_2_at legitimately equals the start time itself (that's
-   correct, not a mistake to smooth over) — still just state it plainly.
-   Don't mention them on any other kind of turn (a still-missing question,
-   DENY, CORRECTION, etc.) — only when stating what will happen has
-   already earned its place in the message per the rules above.
+   If reminder_1_at and/or reminder_2_at are given (non-null) on this
+   turn's confirmation message or AFFIRM acknowledgment, state whichever
+   ones are actually given directly in the sentence, using those exact
+   given values, not placeholders. Both given: "I'll remind you at 12pm
+   and 3pm." Only one given (the other is null — this happens for real:
+   confirming something inside its own 30-minute reminder window means
+   only the later one is still ahead of right now): "I'll remind you at
+   3pm," never mentioning a second time or implying there's an earlier
+   one too. Never invent or infer a missing one from the other — only
+   state exactly what's given, exactly as given. So the user knows
+   exactly when they'll hear from the system again, not just that a
+   reminder exists. Don't mention either at all on any other kind of turn
+   (a still-missing question, DENY, CORRECTION, etc.) — only when stating
+   what will happen has already earned its place in the message per the
+   rules above.
    Keep it SMS-length, under 160 characters where possible.
 
 Output must conform exactly to the provided schema. No text outside it.
@@ -255,15 +253,6 @@ class ConversationTurnResult(BaseModel):
     due_at: str | None = None
     email_recipient_filled: bool = False
     email_recipient: str | None = None
-    effort_minutes_filled: bool = False
-    # Plain int, not a Literal enum: Vertex AI structured output rejects an
-    # integer Literal outright (extractor-svc's _ExtractionResult hit this
-    # exact gap first, agent-contracts.md §2) but an unconstrained numeric
-    # field works fine (confidence: float already proves this). The prompt
-    # instructs the model to pick a bucket value directly; _round_to_bucket
-    # below re-buckets defensively regardless, rather than trusting the
-    # model's raw number to already be exactly one of the five.
-    effort_minutes: int | None = None
     still_missing: list[str] = []
     intent: Literal["AFFIRM", "DENY", "CORRECTION", "ATTACH", "OTHER"] | None = None
     reply_text: str
@@ -289,15 +278,6 @@ _agent = LlmAgent(
     ),
 )
 _session_service = InMemorySessionService()
-
-_EFFORT_BUCKETS = (15, 30, 60, 120, 240)
-
-
-def _round_to_bucket(minutes: int) -> int:
-    """Nearest of _EFFORT_BUCKETS, rounding up on an exact tie —
-    underestimating available work time is the worse failure mode (same
-    reasoning extractor-svc's own bucket-guessing already uses)."""
-    return min(_EFFORT_BUCKETS, key=lambda b: (abs(b - minutes), -b))
 
 
 async def converse(
@@ -372,22 +352,14 @@ async def converse(
     # Defensive, not just prompted: still_missing is an unconstrained
     # list[str] at the schema level (Vertex AI structured output doesn't
     # support a Literal-list here — untested combination, not worth risking
-    # given the three field names are already known statically). A real run
+    # given the two field names are already known statically). A real run
     # once returned "title" alongside "due_at" despite the prompt's
     # instruction — the pipeline has no merge logic for anything but
-    # due_at/email_recipient/effort_minutes, so an unrecognized name would
-    # silently strand the item asking about a field it can never resolve.
-    # Filtered here, the one choke point every caller goes through, rather
-    # than trusting the prompt alone.
-    result.still_missing = [
-        f for f in result.still_missing if f in ("due_at", "email_recipient", "effort_minutes")
-    ]
-
-    # Defensive re-bucketing, same reasoning as still_missing above: don't
-    # trust the model's raw number to already be exactly one of the five
-    # canonical buckets, even though the prompt asks for that directly.
-    if result.effort_minutes_filled and result.effort_minutes is not None:
-        result.effort_minutes = _round_to_bucket(result.effort_minutes)
+    # due_at/email_recipient, so an unrecognized name would silently
+    # strand the item asking about a field it can never resolve. Filtered
+    # here, the one choke point every caller goes through, rather than
+    # trusting the prompt alone.
+    result.still_missing = [f for f in result.still_missing if f in ("due_at", "email_recipient")]
 
     # Defensive, same reasoning as above: relates_to_item is only ever
     # meaningful when there's an actual reply to judge. Forcing it true on

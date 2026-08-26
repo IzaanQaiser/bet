@@ -279,91 +279,88 @@ def _initial_resolved_fields(extracted: ExtractedItemMessage) -> dict:
     return fields
 
 
-def _merge_effort_minutes(effort_minutes: int | None, result) -> int | None:
-    """effort_minutes lives on the items table itself, not the
-    conversations.resolved_fields scratchpad due_at/email_recipient use
-    (data-model.md §2.4) — merged into the in-memory value here;
-    _persist_effort_minutes_fill writes it back once a DB connection is
-    open."""
-    if result.effort_minutes_filled and result.effort_minutes is not None:
-        return result.effort_minutes
-    return effort_minutes
+_REMINDER_LEAD = timedelta(minutes=30)
 
 
-def _persist_effort_minutes_fill(conn, item_id, result) -> None:
-    if result.effort_minutes_filled and result.effort_minutes is not None:
-        conn.execute(
-            "UPDATE items SET effort_minutes = %s, updated_at = now() WHERE id = %s",
-            (result.effort_minutes, str(item_id)),
-        )
+def _compute_reminder_times(due_at_iso: str | None) -> tuple[datetime, datetime] | None:
+    """One universal rule, user-specified, no effort/type distinction:
+    a fixed 30-minute heads-up before due_at, and a reminder AT due_at
+    itself. Confirm 30+ minutes ahead of due_at and you get both; confirm
+    within 30 minutes of it and you get ONLY the at-due-time reminder,
+    nothing more — that half is committer-svc's job (_enqueue_reminder_task
+    skips any slot already in the past at commit time), not this
+    function's; this always returns both computed instants, before-the-fact.
 
+    Deliberately not effort-scaled — user-directed simplification: effort
+    (asking about it, bucketing it, scaling reminder timing off it) added
+    real complexity and real bugs for little value. effort_minutes still
+    exists elsewhere purely for Calendar event sizing, unrelated to this.
 
-_EVENT_REMINDER_LEAD = timedelta(minutes=30)
-
-
-def _compute_reminder_times(
-    due_at_iso: str | None, effort_minutes: int | None, is_scheduled_event: bool = False
-) -> tuple[datetime, datetime] | None:
-    """A task with a deadline (default) gets both reminders strictly
-    BEFORE due_at — due_at - 2x effort (early heads-up), due_at - effort
-    (start-by, last call) — never at the deadline itself, since there'd be
-    no time left.
-
-    A scheduled event you attend (is_scheduled_event=True) gets a fixed
-    30-minute heads-up before start (due_at - 30min, deliberately NOT
-    effort-scaled — effort means the event's own duration here, used for
-    the Calendar block's end time, not "how much advance notice to give";
-    reusing it for lead time was the original design, corrected on
-    user direction to a flat window instead) AND a reminder AT the actual
-    start time. User-specified exact behavior: confirm an event 30+
-    minutes out and you get both; confirm one within 30 minutes of its
-    own start and you get ONLY the at-start reminder, nothing more — that
-    second half is committer-svc's job (_enqueue_reminder_task skips any
-    slot already in the past at commit time), not this function's; this
-    function still always returns both computed instants, before-the-fact.
-
-    Both naive local, same "naive means local" convention due_at itself
-    already carries through this whole pipeline (committer-svc attaches
-    the real timezone at commit time). None whenever either input isn't
-    known yet — a latent, or an obligation still missing a piece."""
-    if not due_at_iso or effort_minutes is None:
+    Naive local, same "naive means local" convention due_at itself already
+    carries through this whole pipeline (committer-svc attaches the real
+    timezone at commit time). None when due_at isn't known yet — a latent,
+    or an obligation still missing it."""
+    if not due_at_iso:
         return None
     due_at = datetime.fromisoformat(due_at_iso)
-    if is_scheduled_event:
-        return due_at - _EVENT_REMINDER_LEAD, due_at
-    delta = timedelta(minutes=effort_minutes)
-    return due_at - 2 * delta, due_at - delta
+    return due_at - _REMINDER_LEAD, due_at
 
 
 def _format_reminder_time(dt: datetime) -> str:
     return dt.strftime("%-I:%M %p")
 
 
+def _future_reminder_strings(
+    due_at_iso: str | None, now_local: datetime
+) -> tuple[str | None, str | None]:
+    """The formatted, message-facing counterpart to _compute_reminder_times
+    — filters out any computed instant that's already in the past relative
+    to right now, not just at commit time. Real bug, found live: a
+    confirmation sent well after the 30-min-heads-up mark had already
+    passed still told the user "I'll remind you at 9:53pm" — a time that
+    had already come and gone before the message was even composed. This
+    is a separate check from committer-svc's own overdue-slot skip (which
+    only protects the real send, not what the text claims will happen) —
+    both are needed, since the text can be composed well before the
+    eventual commit (the very first clarifying/confirmation turn, not
+    just the AFFIRM one)."""
+    times = _compute_reminder_times(due_at_iso)
+    if times is None:
+        return None, None
+    now_naive = now_local.replace(tzinfo=None)
+    r1, r2 = times
+    return (
+        _format_reminder_time(r1) if r1 > now_naive else None,
+        _format_reminder_time(r2) if r2 > now_naive else None,
+    )
+
+
 def _ensure_reminder_mention(
     reply_text: str,
     reminder_1_at_passed: str | None,
     due_at_iso: str | None,
-    effort_minutes: int | None,
-    is_scheduled_event: bool = False,
+    now_local: datetime,
 ) -> str:
     """converse() is already asked to state reminder_1_at/reminder_2_at
     naturally whenever they're given as known context going into that
     call. But the one reply that resolves the LAST missing piece needed to
-    compute them (say, effort_minutes on the very turn still_missing
-    empties out) can't have had them passed in — nothing could compute
-    them before a call that is itself what fills them. This deterministic
-    append covers exactly that one gap (reminder_1_at_passed was None
-    going in, but both due_at/effort are known after merging this turn's
-    result); every other case already got a natural, in-voice mention from
-    converse() itself and this is a no-op."""
+    compute them (due_at itself, on the very turn still_missing empties
+    out) can't have had them passed in — nothing could compute them before
+    a call that is itself what fills them. This deterministic append
+    covers exactly that one gap (reminder_1_at_passed was None going in,
+    but due_at is known after merging this turn's result); every other
+    case already got a natural, in-voice mention from converse() itself
+    and this is a no-op. Mentions only whichever of the two is still
+    genuinely ahead of now — one, both, or (rare) neither."""
     if reminder_1_at_passed is not None:
         return reply_text
-    times = _compute_reminder_times(due_at_iso, effort_minutes, is_scheduled_event)
-    if times is None:
+    r1_str, r2_str = _future_reminder_strings(due_at_iso, now_local)
+    times = [t for t in (r1_str, r2_str) if t is not None]
+    if not times:
         return reply_text
-    r1, r2 = times
-    r1_str, r2_str = _format_reminder_time(r1), _format_reminder_time(r2)
-    return f"{reply_text} I'll remind you at {r1_str} and {r2_str}."
+    if len(times) == 1:
+        return f"{reply_text} I'll remind you at {times[0]}."
+    return f"{reply_text} I'll remind you at {times[0]} and {times[1]}."
 
 
 async def _handle_chat(extracted: ExtractedItemMessage) -> None:
@@ -524,11 +521,9 @@ async def _start_clarification(
     is_scheduled_event = extracted.is_scheduled_event
     thread_attach_title = thread_attach[1] if thread_attach else None
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_times = _compute_reminder_times(
-        resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+    reminder_1_at, reminder_2_at = _future_reminder_strings(
+        resolved_fields.get("due_at"), now_local
     )
-    reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
-    reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
         session_id=f"{extracted.item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -555,17 +550,11 @@ async def _start_clarification(
     if thread_attach:
         resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
         resolved_fields["_thread_attach_title"] = thread_attach[1]
-    effort_minutes = _merge_effort_minutes(effort_minutes, result)
     reply_text = _ensure_reminder_mention(
-        result.reply_text,
-        reminder_1_at,
-        resolved_fields.get("due_at"),
-        effort_minutes,
-        is_scheduled_event,
+        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
     )
 
     with get_connection() as conn:
-        _persist_effort_minutes_fill(conn, extracted.item_id, result)
         conn.execute(
             """
             INSERT INTO conversations
@@ -699,11 +688,9 @@ async def _handle_clarification_reply(
     other_items = _other_items_context(conn, user_id, item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_times = _compute_reminder_times(
-        resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+    reminder_1_at, reminder_2_at = _future_reminder_strings(
+        resolved_fields.get("due_at"), now_local
     )
-    reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
-    reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
         session_id=f"{item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -732,8 +719,6 @@ async def _handle_clarification_reply(
         resolved_fields = {**resolved_fields, "due_at": result.due_at}
     if result.email_recipient_filled and result.email_recipient:
         resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
-    effort_minutes = _merge_effort_minutes(effort_minutes, result)
-    _persist_effort_minutes_fill(conn, item_id, result)
 
     if result.still_missing:
         if exchange_count < MAX_EXCHANGES:
@@ -769,11 +754,7 @@ async def _handle_clarification_reply(
         return {"status": "needs_review", "item_id": str(item_id)}
 
     reply_text = _ensure_reminder_mention(
-        result.reply_text,
-        reminder_1_at,
-        resolved_fields.get("due_at"),
-        effort_minutes,
-        is_scheduled_event,
+        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
     )
     conn.execute(
         "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
@@ -871,11 +852,9 @@ async def _handle_duplicate_reply(
         # its one job — classifying the dedupe question — dedupe_result's
         # own reply_text was just the "keeping separate" acknowledgment,
         # not a real attempt at resolving missing fields).
-        reminder_times = _compute_reminder_times(
-            resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
-        )
-        reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
-        reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
+        reminder_1_at, reminder_2_at = _future_reminder_strings(
+        resolved_fields.get("due_at"), now_local
+    )
         result = await converse(
             session_id=f"{item_id}-{uuid4().hex[:8]}",
             now_local=now_local,
@@ -899,8 +878,6 @@ async def _handle_duplicate_reply(
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
         if result.email_recipient_filled and result.email_recipient:
             resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
-        effort_minutes = _merge_effort_minutes(effort_minutes, result)
-        _persist_effort_minutes_fill(conn, item_id, result)
 
         if result.still_missing:
             conn.execute(
@@ -920,11 +897,7 @@ async def _handle_duplicate_reply(
             return {"status": "clarifying", "item_id": str(item_id)}
 
         reply_text = _ensure_reminder_mention(
-            result.reply_text,
-            reminder_1_at,
-            resolved_fields.get("due_at"),
-            effort_minutes,
-            is_scheduled_event,
+            result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
         )
         conn.execute(
             "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
@@ -975,11 +948,9 @@ async def _handle_confirmation_reply(
     other_items = _other_items_context(conn, user_id, item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_times = _compute_reminder_times(
-        resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+    reminder_1_at, reminder_2_at = _future_reminder_strings(
+        resolved_fields.get("due_at"), now_local
     )
-    reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
-    reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
         session_id=f"{item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -1006,9 +977,15 @@ async def _handle_confirmation_reply(
         )
 
     if result.intent == "AFFIRM":
-        reminder_times = _compute_reminder_times(
-            resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
-        )
+        # Deliberately the raw, unfiltered _compute_reminder_times here —
+        # this becomes the real persisted obligations.reminder_1_at/
+        # reminder_2_at row, and committer-svc's own overdue-slot check
+        # (_enqueue_reminder_task, "skip if already past at commit time")
+        # is what actually decides whether it fires, not this function.
+        # Storing the value even when it'll never fire is correct, not a
+        # bug — it's a real record of what the ideal early heads-up would
+        # have been.
+        reminder_times = _compute_reminder_times(resolved_fields.get("due_at"))
         confirmed = ConfirmedItemMessage(
             item_id=item_id,
             user_id=user_id,
@@ -1048,7 +1025,6 @@ async def _handle_confirmation_reply(
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
         if result.email_recipient_filled and result.email_recipient:
             resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
-        _persist_effort_minutes_fill(conn, item_id, result)
         conn.execute(
             "UPDATE conversations SET resolved_fields = %s, last_message_at = now() "
             "WHERE item_id = %s",

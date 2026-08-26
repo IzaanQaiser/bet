@@ -28,22 +28,22 @@ def _format_block_hours(minutes: int) -> str:
     return f"{hours}h {mins}min"
 
 
-def render_reminder_early(title: str, due_at: datetime, effort_minutes: int, today: date) -> str:
-    """Fires at due_at - 2*effort — the early heads-up, not yet urgent."""
+def render_reminder_early(title: str, due_at: datetime, today: date) -> str:
+    """Fires at due_at - 30min — the early heads-up. Deliberately no
+    effort/duration claim (e.g. "block off ~2h") — user-directed
+    simplification: the reminder itself is a flat 30 minutes regardless of
+    effort, so a duration-based claim here would no longer even be true."""
     return (
         f"⏰ heads up — {title} is due {relative_due_description(due_at.date(), today)}, "
-        f"{format_due_at(due_at)}.\n"
-        f"Block off ~{_format_block_hours(effort_minutes)} for it soon."
+        f"{format_due_at(due_at)}."
     )
 
 
-def render_reminder_final(title: str, due_at: datetime, effort_minutes: int, today: date) -> str:
-    """Fires at due_at - effort — the start-by, last-call reminder: about
-    exactly enough time left to do the work, no more."""
+def render_reminder_final(title: str, due_at: datetime, today: date) -> str:
+    """Fires at due_at — the reminder at the deadline itself."""
     return (
         f"⏰ last call — {title} is due {relative_due_description(due_at.date(), today)}, "
-        f"{format_due_at(due_at)}.\n"
-        f"About {_format_block_hours(effort_minutes)} left if you start now."
+        f"{format_due_at(due_at)}."
     )
 
 

@@ -24,20 +24,14 @@ def test_relative_due_description_today_tomorrow_and_n_days():
 
 def test_render_reminder_early_exact_format():
     due = datetime(2026, 9, 4, 14, 0)  # a real Friday
-    body = render_reminder_early("Pay rent", due, 120, today=date(2026, 9, 3))
-    assert body == (
-        "⏰ heads up — Pay rent is due tomorrow, Fri 4 Sep, 2:00 PM.\n"
-        "Block off ~2h for it soon."
-    )
+    body = render_reminder_early("Pay rent", due, today=date(2026, 9, 3))
+    assert body == "⏰ heads up — Pay rent is due tomorrow, Fri 4 Sep, 2:00 PM."
 
 
 def test_render_reminder_final_exact_format():
     due = datetime(2026, 9, 4, 14, 0)
-    body = render_reminder_final("Pay rent", due, 90, today=date(2026, 9, 4))
-    assert body == (
-        "⏰ last call — Pay rent is due today, Fri 4 Sep, 2:00 PM.\n"
-        "About 1h 30min left if you start now."
-    )
+    body = render_reminder_final("Pay rent", due, today=date(2026, 9, 4))
+    assert body == "⏰ last call — Pay rent is due today, Fri 4 Sep, 2:00 PM."
 
 
 def test_render_event_reminder_early_exact_format():

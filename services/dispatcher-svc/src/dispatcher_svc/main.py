@@ -150,28 +150,29 @@ def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
     """Two independent fire conditions, not one (state-machine.md §4.1's
     old single reminder_window_hours/reminder_sent_at replaced by
     per-obligation reminder_1_at/reminder_2_at — resolver-svc computes both
-    from due_at/effort_minutes at confirm time). Each obligation can fire
-    both in the same /dispatch run if both thresholds already passed —
-    same forgiving "better late than never" semantics the old single
-    reminder always had."""
+    from due_at at confirm time, a flat 30-minute-before/at-due rule for
+    everything, no effort involved — user-directed simplification). Each
+    obligation can fire both in the same /dispatch run if both thresholds
+    already passed — same forgiving "better late than never" semantics
+    the old single reminder always had."""
     today_local = now_utc.astimezone(tz).date()
     sent = 0
 
     early_rows = conn.execute(
         """
-        SELECT o.item_id, i.title, o.due_at, i.effort_minutes, i.is_scheduled_event
+        SELECT o.item_id, i.title, o.due_at, i.is_scheduled_event
         FROM obligations o JOIN items i ON i.id = o.item_id
         WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_1_sent_at IS NULL
           AND o.reminder_1_at IS NOT NULL AND o.reminder_1_at <= %s
         """,
         (str(user_id), now_utc),
     ).fetchall()
-    for item_id, title, due_at, effort_minutes, is_scheduled_event in early_rows:
+    for item_id, title, due_at, is_scheduled_event in early_rows:
         local_due = due_at.astimezone(tz)
         body = (
             render_event_reminder_early(title, local_due, today_local)
             if is_scheduled_event
-            else render_reminder_early(title, local_due, effort_minutes, today_local)
+            else render_reminder_early(title, local_due, today_local)
         )
         _send_sms(user_id, to=phone, body=body)
         conn.execute(
@@ -182,19 +183,19 @@ def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
 
     final_rows = conn.execute(
         """
-        SELECT o.item_id, i.title, o.due_at, i.effort_minutes, i.is_scheduled_event
+        SELECT o.item_id, i.title, o.due_at, i.is_scheduled_event
         FROM obligations o JOIN items i ON i.id = o.item_id
         WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_2_sent_at IS NULL
           AND o.reminder_2_at IS NOT NULL AND o.reminder_2_at <= %s
         """,
         (str(user_id), now_utc),
     ).fetchall()
-    for item_id, title, due_at, effort_minutes, is_scheduled_event in final_rows:
+    for item_id, title, due_at, is_scheduled_event in final_rows:
         local_due = due_at.astimezone(tz)
         body = (
             render_event_reminder_start(title, local_due, today_local)
             if is_scheduled_event
-            else render_reminder_final(title, local_due, effort_minutes, today_local)
+            else render_reminder_final(title, local_due, today_local)
         )
         _send_sms(user_id, to=phone, body=body)
         conn.execute(
@@ -416,7 +417,7 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT i.title, o.due_at, i.effort_minutes, i.is_scheduled_event, i.user_id,
+            SELECT i.title, o.due_at, i.is_scheduled_event, i.user_id,
                    o.reminder_1_sent_at, o.reminder_2_sent_at, u.timezone, u.phone_e164
             FROM obligations o
             JOIN items i ON i.id = o.item_id
@@ -436,7 +437,6 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
         (
             title,
             due_at,
-            effort_minutes,
             is_scheduled_event,
             user_id,
             reminder_1_sent_at,
@@ -455,7 +455,7 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
             body = (
                 render_event_reminder_early(title, local_due, today_local)
                 if is_scheduled_event
-                else render_reminder_early(title, local_due, effort_minutes, today_local)
+                else render_reminder_early(title, local_due, today_local)
             )
             _send_sms(user_id, to=phone, body=body)
             conn.execute(
@@ -466,7 +466,7 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
             body = (
                 render_event_reminder_start(title, local_due, today_local)
                 if is_scheduled_event
-                else render_reminder_final(title, local_due, effort_minutes, today_local)
+                else render_reminder_final(title, local_due, today_local)
             )
             _send_sms(user_id, to=phone, body=body)
             conn.execute(
