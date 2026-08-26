@@ -7,6 +7,9 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "obligation-engine-shared",
     "twilio>=9.3",
+    "google-auth>=2.35",
+    "google-cloud-secret-manager>=2.20",
+    "requests>=2.32",
 ]
 
 [dependency-groups]

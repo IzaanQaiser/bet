@@ -1,13 +1,13 @@
-"""dashboard-svc — the read-only half of the web division's public API
-(docs/design plan, Phase 5). Phone+OTP login (Twilio Verify — same
-mechanism and the same Verify Service registration-svc's OTP step
-already uses), a ~7-day session JWT, then four /me/* endpoints scoped to
-the caller's own rows via the session's user_id claim — never a path
-parameter, so there's no way to ask for another user's data by editing
-a URL. GCP IAM keeps sa-dashboard SELECT-only at the table level
-(infrastructure.md §2's split); the per-caller row scoping below is the
-software half of that invariant, same as every other service in this
-project.
+"""dashboard-svc — the web division's per-user read/write API (docs/design
+plan, Phase 5). Phone+OTP login (Twilio Verify — same mechanism and the
+same Verify Service registration-svc's OTP step already uses), a ~7-day
+session JWT, then endpoints scoped to the caller's own rows via the
+session's user_id claim — never a path parameter, so there's no way to
+ask for another user's data by editing a URL. GCP IAM keeps sa-dashboard
+mostly SELECT at the table level (infrastructure.md §2's split), with a
+narrow UPDATE on items for the one write path (DELETE /me/items/{id});
+the per-caller row scoping below is the software half of that invariant,
+same as every other service in this project.
 """
 
 import os
@@ -16,6 +16,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from google.auth.transport.requests import AuthorizedSession
+from google.cloud import secretmanager
+from google.oauth2.credentials import Credentials
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.tokens import InvalidToken, mint_signed_token, verify_signed_token
 from pydantic import BaseModel
@@ -29,13 +32,15 @@ app = FastAPI()
 TWILIO_FROM_NUMBER = "+14152365420"
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 MESSAGES_DEFAULT_LIMIT = 50
+CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
-    allow_methods=["GET", "POST", "PATCH"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
@@ -303,6 +308,68 @@ async def me_profile_patch(
             f"UPDATE users SET {set_clause} WHERE id = %s",  # noqa: S608 — column names are our own fixed keys, not user input
             (*fields.values(), str(user_id)),
         )
+        conn.commit()
+    return {"status": "ok"}
+
+
+def _user_calendar_credentials(refresh_token_ref: str) -> Credentials:
+    client = secretmanager.SecretManagerServiceClient()
+    refresh_token = client.access_secret_version(name=refresh_token_ref).payload.data.decode()
+    return Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.environ["GOOGLE_OAUTH_CLIENT_ID"],
+        client_secret=os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
+        scopes=[CALENDAR_SCOPE],
+    )
+
+
+@app.delete("/me/items/{item_id}")
+async def delete_item(item_id: UUID, user_id: UUID = Depends(current_user_id)):
+    """Clears an item out of the caller's own dashboard — works for both
+    an in-progress "agent memory" entry and a committed calendar item.
+    Real feedback this exists for: deleting an event directly in Google
+    Calendar doesn't tell this system anything (no sync watches for
+    external deletions), so it stayed stranded in the dashboard — this
+    endpoint is the other direction: delete here, and it best-effort
+    deletes the real Calendar event too, not just our own row. Soft-
+    deletes (state='CANCELLED'), doesn't remove the row — obligations/
+    conversations/suggestions rows still reference it.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT i.user_id, o.calendar_event_id, u.google_refresh_token_ref
+            FROM items i
+            JOIN users u ON u.id = i.user_id
+            LEFT JOIN obligations o ON o.item_id = i.id
+            WHERE i.id = %s
+            """,
+            (str(item_id),),
+        ).fetchone()
+    if row is None or row[0] != user_id:
+        # Same as every other cross-user lookup here — a 404, not a 403,
+        # so this never confirms whether the item exists for someone else.
+        raise HTTPException(status_code=404, detail="not found")
+
+    _, calendar_event_id, refresh_token_ref = row
+    if calendar_event_id and refresh_token_ref:
+        try:
+            session = AuthorizedSession(_user_calendar_credentials(refresh_token_ref))
+            resp = session.delete(f"{CALENDAR_EVENTS_URL}/{calendar_event_id}")
+            # 404/410: already gone — e.g. the user deleted it directly in
+            # Google Calendar, which is exactly the case this endpoint
+            # exists to reconcile. That's the goal state, not a failure.
+            if resp.status_code not in (200, 204, 404, 410):
+                resp.raise_for_status()
+        except Exception:
+            # Best-effort: a Calendar API hiccup shouldn't block the user
+            # from clearing this item out of their own dashboard.
+            pass
+
+    with get_connection() as conn:
+        conn.execute("UPDATE items SET state = 'CANCELLED' WHERE id = %s", (str(item_id),))
         conn.commit()
     return {"status": "ok"}
 

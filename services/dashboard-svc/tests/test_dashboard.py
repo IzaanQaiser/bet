@@ -33,6 +33,8 @@ def _env(monkeypatch):
     monkeypatch.setenv("TWILIO_API_KEY_SID", "SKtest0000000000000000000000000")
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACtest0000000000000000000000000")
     monkeypatch.setenv("TWILIO_VERIFY_SERVICE_SID", "VAtest0000000000000000000000000")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-client-id.apps.googleusercontent.com")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "test-client-secret")
 
 
 @pytest.fixture
@@ -278,6 +280,138 @@ def test_me_profile_patch_rejects_empty_body(client):
         resp = client.patch("/me/profile", json={}, headers=_auth_header(uuid4()))
     assert resp.status_code == 400
     mock_get_conn.assert_not_called()
+
+
+# ---- DELETE /me/items/{id} ----
+
+
+def _mock_secret_client(refresh_token="real-refresh-token"):
+    client = MagicMock()
+    client.access_secret_version.return_value.payload.data = refresh_token.encode()
+    return client
+
+
+def test_delete_committed_item_deletes_calendar_event_and_cancels(client):
+    user_id, item_id = uuid4(), uuid4()
+    mock_conn = _mock_connection()
+    mock_conn.execute.return_value.fetchone.return_value = (
+        user_id,
+        "cal-evt-1",
+        "projects/test/secrets/user-refresh-token-x/versions/latest",
+    )
+    mock_session = MagicMock()
+    mock_session.delete.return_value = MagicMock(status_code=204)
+
+    with (
+        patch("dashboard_svc.main.get_connection", return_value=mock_conn),
+        patch(
+            "dashboard_svc.main.secretmanager.SecretManagerServiceClient",
+            return_value=_mock_secret_client(),
+        ),
+        patch("dashboard_svc.main.AuthorizedSession", return_value=mock_session),
+    ):
+        resp = client.delete(f"/me/items/{item_id}", headers=_auth_header(user_id))
+
+    assert resp.status_code == 200
+    mock_session.delete.assert_called_once_with(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events/cal-evt-1"
+    )
+    update_calls = [c for c in mock_conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert len(update_calls) == 1
+    assert update_calls[0].args[1] == (str(item_id),)
+    mock_conn.commit.assert_called_once()
+
+
+def test_delete_in_progress_item_skips_calendar_no_event_id(client):
+    user_id, item_id = uuid4(), uuid4()
+    mock_conn = _mock_connection()
+    mock_conn.execute.return_value.fetchone.return_value = (user_id, None, None)
+
+    with (
+        patch("dashboard_svc.main.get_connection", return_value=mock_conn),
+        patch("dashboard_svc.main.AuthorizedSession") as mock_authed_session,
+    ):
+        resp = client.delete(f"/me/items/{item_id}", headers=_auth_header(user_id))
+
+    assert resp.status_code == 200
+    mock_authed_session.assert_not_called()
+
+
+def test_delete_already_gone_calendar_event_still_succeeds(client):
+    """The exact case this endpoint exists for: the user already deleted
+    the event directly in Google Calendar. A 404 from Google here is the
+    goal state, not an error."""
+    user_id, item_id = uuid4(), uuid4()
+    mock_conn = _mock_connection()
+    mock_conn.execute.return_value.fetchone.return_value = (
+        user_id,
+        "cal-evt-1",
+        "projects/test/secrets/user-refresh-token-x/versions/latest",
+    )
+    mock_session = MagicMock()
+    mock_session.delete.return_value = MagicMock(status_code=404)
+
+    with (
+        patch("dashboard_svc.main.get_connection", return_value=mock_conn),
+        patch(
+            "dashboard_svc.main.secretmanager.SecretManagerServiceClient",
+            return_value=_mock_secret_client(),
+        ),
+        patch("dashboard_svc.main.AuthorizedSession", return_value=mock_session),
+    ):
+        resp = client.delete(f"/me/items/{item_id}", headers=_auth_header(user_id))
+
+    assert resp.status_code == 200
+
+
+def test_delete_calendar_api_error_is_best_effort_not_fatal(client):
+    user_id, item_id = uuid4(), uuid4()
+    mock_conn = _mock_connection()
+    mock_conn.execute.return_value.fetchone.return_value = (
+        user_id,
+        "cal-evt-1",
+        "projects/test/secrets/user-refresh-token-x/versions/latest",
+    )
+
+    with (
+        patch("dashboard_svc.main.get_connection", return_value=mock_conn),
+        patch(
+            "dashboard_svc.main.secretmanager.SecretManagerServiceClient",
+            return_value=_mock_secret_client(),
+        ),
+        patch("dashboard_svc.main.AuthorizedSession", side_effect=RuntimeError("network blip")),
+    ):
+        resp = client.delete(f"/me/items/{item_id}", headers=_auth_header(user_id))
+
+    assert resp.status_code == 200
+    update_calls = [c for c in mock_conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert len(update_calls) == 1
+
+
+def test_delete_item_rejects_other_users_item(client):
+    owner_id, requester_id, item_id = uuid4(), uuid4(), uuid4()
+    mock_conn = _mock_connection()
+    mock_conn.execute.return_value.fetchone.return_value = (owner_id, None, None)
+
+    with patch("dashboard_svc.main.get_connection", return_value=mock_conn):
+        resp = client.delete(f"/me/items/{item_id}", headers=_auth_header(requester_id))
+
+    assert resp.status_code == 404
+    update_calls = [c for c in mock_conn.execute.call_args_list if "UPDATE items" in c.args[0]]
+    assert len(update_calls) == 0
+
+
+def test_delete_nonexistent_item_returns_404(client):
+    mock_conn = _mock_connection()
+    mock_conn.execute.return_value.fetchone.return_value = None
+    with patch("dashboard_svc.main.get_connection", return_value=mock_conn):
+        resp = client.delete(f"/me/items/{uuid4()}", headers=_auth_header(uuid4()))
+    assert resp.status_code == 404
+
+
+def test_delete_item_rejects_missing_session(client):
+    resp = client.delete(f"/me/items/{uuid4()}")
+    assert resp.status_code == 401
 
 
 def test_health(client):

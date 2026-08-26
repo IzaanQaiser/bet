@@ -385,14 +385,24 @@ case "$SERVICE" in
     # Phase 5) — same shape as registration-svc: --allow-unauthenticated,
     # auth enforced at the app layer (session JWT), not IAM.
     # min-instances=0, same cost reasoning as registration-svc.
+    # GOOGLE_OAUTH_CLIENT_ID/SECRET: the Installed App client
+    # (bootstrap_oauth_token.py's, same as committer-svc/dispatcher-svc)
+    # for DELETE /me/items/{id}'s best-effort Calendar delete — refreshing
+    # a token requires the *same* client that originally issued it. Known
+    # gap, not solved here: a user onboarded through Phase 4's web flow
+    # instead got their refresh token from the Web Application client
+    # (google-oauth-client-secret-web); this endpoint would fail to
+    # refresh that token today. Only the original bootstrap-script demo
+    # user exists right now, so this isn't hit in practice yet — revisit
+    # once a real Phase-4-registered user needs this endpoint.
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-dashboard@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID}" \
-      --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest,TWILIO_VERIFY_SERVICE_SID=twilio-verify-service-sid:latest,WEB_SESSION_SIGNING_KEY=web-session-signing-key:latest" \
+      --set-env-vars="DB_USER=sa-dashboard@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}" \
+      --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest,TWILIO_VERIFY_SERVICE_SID=twilio-verify-service-sid:latest,WEB_SESSION_SIGNING_KEY=web-session-signing-key:latest,GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest" \
       --min-instances=0 \
       --allow-unauthenticated \
       --account=waslyrideshare@gmail.com
