@@ -9,6 +9,12 @@ interface MemoryListItem {
   last_message_at?: string | null;
   // "obligation" | "latent" — only ever present on a committed row.
   type?: string;
+  effort_minutes?: number | null;
+  // Idea-only: "deep" | "shallow", and the earliest upcoming slot the
+  // idea could physically fit into given the user's real Calendar —
+  // recomputed by dispatcher-svc on every /dispatch run.
+  focus_depth?: string | null;
+  next_fit_start?: string | null;
 }
 
 interface MemoryListProps {
@@ -25,13 +31,26 @@ function humanizeState(state: string | undefined): string {
 
 // Weekday + day + time, not just weekday — two items due on the same day
 // at different times used to render as literal duplicates ("Tue" / "Tue").
-function formatCommittedTime(iso: string | null | undefined, timeZone: string): string {
-  if (!iso) return "committed";
+function formatDateTime(iso: string, timeZone: string): string {
   const d = new Date(iso);
   const weekday = d.toLocaleDateString("en-US", { timeZone, weekday: "short" });
   const day = d.toLocaleDateString("en-US", { timeZone, day: "numeric" });
   const time = d.toLocaleTimeString("en-US", { timeZone, hour: "numeric", minute: "2-digit" });
   return `${weekday} ${day}, ${time}`;
+}
+
+function formatCommittedTime(iso: string | null | undefined, timeZone: string): string {
+  return iso ? formatDateTime(iso, timeZone) : "committed";
+}
+
+// effort_minutes is always a plain integer minute count now (migrations/
+// 0016 — no longer bucketed for an event's exact duration, but an idea's
+// guess is still a round-ish number from the same extraction step).
+function formatDuration(minutes: number | null | undefined): string | null {
+  if (!minutes) return null;
+  if (minutes < 60) return `${minutes}m`;
+  const hours = minutes / 60;
+  return `${Number.isInteger(hours) ? hours : hours.toFixed(1)}h`;
 }
 
 function relativeTime(iso: string | null | undefined): string | null {
@@ -142,7 +161,19 @@ export function MemoryList({ inProgress, committed, timeZone, onDelete }: Memory
             meta={(row) => formatCommittedTime(row.due_at, timeZone)}
             onDelete={onDelete}
           />
-          <Group label="Ideas" rows={ideas} meta={() => "someday"} onDelete={onDelete} />
+          <Group
+            label="Ideas"
+            rows={ideas}
+            meta={(row) => {
+              const parts = [
+                formatDuration(row.effort_minutes),
+                row.focus_depth === "deep" ? "deep" : row.focus_depth === "shallow" ? "shallow" : null,
+                row.next_fit_start ? formatDateTime(row.next_fit_start, timeZone) : "someday",
+              ];
+              return parts.filter(Boolean).join(" · ");
+            }}
+            onDelete={onDelete}
+          />
         </div>
       )}
     </div>

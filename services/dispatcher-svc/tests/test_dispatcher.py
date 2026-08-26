@@ -14,8 +14,10 @@ from dispatcher_svc.main import (
     _buffered_wh_start,
     _compute_day,
     _eligible_latents,
+    _next_fitting_slot,
     _send_reminders,
     _send_suggestion,
+    _update_next_fit_slots,
 )
 
 TZ = ZoneInfo("America/Toronto")
@@ -178,6 +180,77 @@ def test_compute_day_with_buffered_start_shrinks_todays_block():
     assert buffered_start == time(10, 0)
     computation = _compute_day(events, A_DAY, buffered_start, WH_END, [300] * 14)
     assert computation.largest_interval == Interval(start=time(10, 0), end=time(15, 0))
+
+
+# --- next_fit_start dashboard preview (v1, user-directed) ------------------
+# The earliest day an idea could physically fit, not the revival_score-
+# weighted "best" day — and computed for every committed latent, not just
+# ones the proactive-suggestion eligibility gates would currently allow
+# texting about (this is a dashboard preview, not a send decision).
+
+
+def _day_computation(largest_start, largest_end, block_minutes) -> DayComputation:
+    return DayComputation(
+        booked=0,
+        snapshot=CapacitySnapshot(
+            date=A_DAY,
+            free_minutes=block_minutes,
+            largest_contiguous_block=block_minutes,
+            fragmentation_index=0.0,
+            load_delta=0.0,
+        ),
+        largest_interval=Interval(start=largest_start, end=largest_end),
+    )
+
+
+def test_next_fitting_slot_picks_earliest_day_that_physically_fits():
+    day1 = date(2026, 8, 27)  # too small a block — 60min, needs 120
+    day2 = date(2026, 8, 28)  # fits — 180min block
+    day3 = date(2026, 8, 29)  # also fits, but later — must not be picked
+    day_context = {
+        day1: _day_computation(time(9, 0), time(10, 0), 60),
+        day2: _day_computation(time(13, 0), time(16, 0), 180),
+        day3: _day_computation(time(9, 0), time(15, 0), 360),
+    }
+    result = _next_fitting_slot(day_context, TZ, effort_minutes=120, focus_depth="shallow")
+    assert result == datetime(2026, 8, 28, 13, 0, tzinfo=TZ)
+
+
+def test_next_fitting_slot_none_when_nothing_fits():
+    day_context = {A_DAY: _day_computation(time(9, 0), time(10, 0), 60)}
+    result = _next_fitting_slot(day_context, TZ, effort_minutes=120, focus_depth="deep")
+    assert result is None
+
+
+def test_next_fitting_slot_respects_deep_work_150_percent_margin():
+    # A 120min deep idea needs a 180min block (150%) — a 150min block
+    # isn't enough, even though it would be for shallow work.
+    day_context = {A_DAY: _day_computation(time(9, 0), time(11, 30), 150)}
+    assert _next_fitting_slot(day_context, TZ, 120, "deep") is None
+    assert _next_fitting_slot(day_context, TZ, 120, "shallow") is not None
+
+
+def test_update_next_fit_slots_writes_a_row_per_latent():
+    latents = [
+        LatentCandidate(
+            item_id="item-1", created_at=A_DAY, effort_minutes=60, focus_depth="shallow",
+            dismissal_count=0, dormant_until=None, last_surfaced_at=None,
+            has_open_suggestion=False,
+        ),
+        LatentCandidate(
+            item_id="item-2", created_at=A_DAY, effort_minutes=999, focus_depth="deep",
+            dismissal_count=0, dormant_until=None, last_surfaced_at=None,
+            has_open_suggestion=False,
+        ),
+    ]
+    day_context = {A_DAY: _day_computation(time(9, 0), time(10, 0), 60)}
+    conn = MagicMock()
+    _update_next_fit_slots(conn, latents, day_context, TZ)
+
+    assert conn.execute.call_count == 2
+    calls = {c.args[1][1]: c.args[1][0] for c in conn.execute.call_args_list}
+    assert calls["item-1"] == datetime(2026, 8, 27, 9, 0, tzinfo=TZ)  # fits
+    assert calls["item-2"] is None  # 999min never fits anywhere
 
 
 def test_eligible_latents_maps_rows_to_local_dates():
