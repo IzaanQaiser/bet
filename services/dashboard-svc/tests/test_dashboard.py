@@ -162,7 +162,7 @@ def test_me_items_groups_by_state(client):
     now = datetime.now(UTC)
     mock_conn = _mock_connection()
 
-    committed_row = (item_b, "Committed thing", "summary", now, "cal-evt-1", 60)
+    committed_row = (item_b, "Committed thing", "summary", now, "cal-evt-1", 60, "obligation")
     cancelled_row = (item_c, "Cancelled thing", "CANCELLED", now)
     in_progress_row = (item_a, "In progress thing", "summary", "CLARIFYING", now)
 
@@ -210,8 +210,8 @@ def test_me_items_committed_includes_ideas_alongside_obligations(client):
     # Simulates the real UNION ALL: obligations contribute a real due_at/
     # calendar_event_id, latents contribute NULLs for both.
     committed_rows = [
-        (item_obligation, "Pay rent", "summary", now, "cal-evt-1", 15),
-        (item_idea, "Make an AI nerf gun turret", "someday idea", None, None, 240),
+        (item_obligation, "Pay rent", "summary", now, "cal-evt-1", 15, "obligation"),
+        (item_idea, "Make an AI nerf gun turret", "someday idea", None, None, 240, "latent"),
     ]
 
     def side_effect(sql, params=None):
@@ -233,6 +233,9 @@ def test_me_items_committed_includes_ideas_alongside_obligations(client):
     assert idea_row["due_at"] is None
     assert idea_row["calendar_event_id"] is None
     assert idea_row["effort_minutes"] == 240
+    assert idea_row["type"] == "latent"
+    obligation_row = next(r for r in body["committed"] if r["title"] == "Pay rent")
+    assert obligation_row["type"] == "obligation"
 
 
 # ---- /me/messages ----

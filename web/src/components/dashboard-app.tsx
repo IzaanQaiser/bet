@@ -16,6 +16,11 @@ interface ItemRow {
   updated_at?: string;
   due_at?: string | null;
   calendar_event_id?: string | null;
+  // "obligation" | "latent" — only ever present on a committed row.
+  // Distinguishes a real scheduled thing from a "someday" idea; not
+  // inferred from a null due_at, since an email-action obligation can
+  // legitimately have one too.
+  type?: string;
   pending_fields?: string[] | null;
   last_message_at?: string | null;
 }
