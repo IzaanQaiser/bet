@@ -207,7 +207,15 @@ def test_calendar_branch_skips_a_reminder_slot_already_overdue_at_commit(client)
     doesn't hold a past schedule_time — it fires immediately, so the
     "heads up" text landed at the same instant as confirmation, right next
     to the real on-time "starting now" reminder a minute later. Only the
-    still-future slot should ever get enqueued."""
+    still-future slot should ever get enqueued.
+
+    Second real bug, found live right after: skipping the enqueue alone
+    left reminder_1_sent_at NULL forever, so /dispatch/reminders' own
+    fallback poll (unable to tell "genuinely missed" apart from
+    "deliberately never scheduled") fired the stale "heads up" late —
+    AFTER the event's own "starting now" reminder had already gone out.
+    The skipped slot must be marked sent at insert time so the fallback's
+    own IS NULL idempotency check leaves it alone."""
     from datetime import UTC, timedelta
 
     now = datetime.now(UTC)
@@ -233,6 +241,12 @@ def test_calendar_branch_skips_a_reminder_slot_already_overdue_at_commit(client)
     assert resp.status_code == 200
     mock_enqueue.assert_called_once()
     assert mock_enqueue.call_args.args[1] == 2  # only the still-future slot 2 enqueued
+
+    insert_sql, insert_params = conn.execute.call_args_list[2][0]
+    assert "reminder_1_sent_at" in insert_sql
+    assert "reminder_2_sent_at" in insert_sql
+    assert insert_params[6] is not None  # slot 1: skipped, so marked closed out immediately
+    assert insert_params[7] is None  # slot 2: still ahead, real Cloud Task owns marking it sent
 
 
 def test_calendar_branch_no_reminder_task_when_times_absent(client):
