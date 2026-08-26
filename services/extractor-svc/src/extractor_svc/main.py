@@ -101,11 +101,30 @@ Rules:
   fabricated, neither ever stated to the user until they asked or pushed
   back on it.
 - effort_minutes must be exactly one of "15", "30", "60", "120", "240"
-  (as a string) — pick the closest realistic bucket. Never leave this null
-  and never add "effort_minutes" to missing_fields — always just pick your
-  best-guess bucket, even on thin signal. This is a real column needed for
-  Calendar event sizing, not something worth a clarifying question over
-  (user-directed: asking about it added real friction for little value).
+  (as a string). For a task/latent (is_scheduled_event false) always pick
+  the closest realistic bucket yourself, even on thin signal — never leave
+  it null and never add "effort_minutes" to missing_fields (user-directed:
+  asking about it added real friction for little value). For a real
+  scheduled event (is_scheduled_event true) it's different: a wrong guess
+  directly mis-sizes a real Calendar block someone else might see it on,
+  so only fill effort_minutes when the message actually states or clearly
+  implies the event's length — an explicit duration ("1 hour meeting",
+  "quick 15 min call") or a start+end span ("3-4pm", "9 to 10:30"),
+  rounded to the nearest bucket. If the message gives no duration signal
+  at all for the event, leave effort_minutes null and add
+  "effort_minutes" to missing_fields so the next turn asks how long it
+  runs.
+- title should be a short, specific label for what this is ("Pay rent",
+  "Dentist appointment", "Meeting with Sarah"). For a real scheduled event
+  (is_scheduled_event true) that gives no specific identifying detail at
+  all — no attendee, subject, location, or purpose, just the bare fact
+  that it's a meeting/call/appointment/event ("I have a meeting at 5pm",
+  "call at 3"), leave title null and add "title" to missing_fields so the
+  next turn asks what it's for. Any specific detail, even brief, is enough
+  to use as the title instead — do not ask in that case. This never
+  applies to a task/latent: its title comes straight from what the
+  message already describes and is never left null or added to
+  missing_fields.
 - focus_depth is "deep" if the task needs one uninterrupted stretch of
   concentration (writing, coding, focused analysis); "shallow" if it can be
   done in short pieces or is administrative/low-cognitive-load (a phone

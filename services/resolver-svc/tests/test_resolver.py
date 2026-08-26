@@ -992,6 +992,142 @@ def test_affirm_publishes_reminder_times_on_confirmed_item(client):
     assert confirmed.reminder_2_at == datetime(2026, 9, 4, 18, 0)
 
 
+# --- event title/duration clarification (event-only) ----------------------
+# title and effort_minutes rejoin due_at/email_recipient's "ask, don't
+# guess" family, but only ever for a scheduled event with no identifying
+# detail or stated length — a task's title/effort_minutes are always
+# already filled by extractor-svc and never revisited here.
+
+
+def test_merge_effort_minutes_uses_filled_value():
+    from resolver_svc.main import _merge_effort_minutes
+
+    result = ConversationTurnResult(effort_minutes_filled=True, effort_minutes=60, reply_text="x")
+    assert _merge_effort_minutes(None, result) == 60
+
+
+def test_merge_effort_minutes_noop_when_not_filled():
+    from resolver_svc.main import _merge_effort_minutes
+
+    result = ConversationTurnResult(effort_minutes_filled=False, reply_text="x")
+    assert _merge_effort_minutes(30, result) == 30
+
+
+def test_persist_effort_minutes_fill_writes_items_row():
+    from resolver_svc.main import _persist_effort_minutes_fill
+
+    conn = MagicMock()
+    result = ConversationTurnResult(effort_minutes_filled=True, effort_minutes=60, reply_text="x")
+    _persist_effort_minutes_fill(conn, "item-1", result)
+    conn.execute.assert_called_once()
+    sql, params = conn.execute.call_args[0]
+    assert "UPDATE items SET effort_minutes" in sql
+    assert params == (60, "item-1")
+
+
+def test_persist_effort_minutes_fill_noop_when_not_filled():
+    from resolver_svc.main import _persist_effort_minutes_fill
+
+    conn = MagicMock()
+    result = ConversationTurnResult(effort_minutes_filled=False, reply_text="x")
+    _persist_effort_minutes_fill(conn, "item-1", result)
+    conn.execute.assert_not_called()
+
+
+def test_merge_title_uses_filled_value():
+    from resolver_svc.main import _merge_title
+
+    result = ConversationTurnResult(title_filled=True, title="Meeting with Sarah", reply_text="x")
+    assert _merge_title(None, result) == "Meeting with Sarah"
+
+
+def test_merge_title_noop_when_not_filled():
+    from resolver_svc.main import _merge_title
+
+    result = ConversationTurnResult(title_filled=False, reply_text="x")
+    assert _merge_title("Meeting", result) == "Meeting"
+
+
+def test_persist_title_fill_writes_items_row():
+    from resolver_svc.main import _persist_title_fill
+
+    conn = MagicMock()
+    result = ConversationTurnResult(title_filled=True, title="Call with landlord", reply_text="x")
+    _persist_title_fill(conn, "item-1", result)
+    conn.execute.assert_called_once()
+    sql, params = conn.execute.call_args[0]
+    assert "UPDATE items SET title" in sql
+    assert params == ("Call with landlord", "item-1")
+
+
+def test_event_missing_title_and_duration_starts_clarification(client):
+    """A bare 'I have a meeting at 5pm' — extractor-svc leaves both title
+    and effort_minutes null and flags both missing (event-only rule)."""
+    extracted = _extracted_message(
+        title=None,
+        due_at=datetime(2026, 9, 4, 17, 0),
+        effort_minutes=None,
+        is_scheduled_event=True,
+        missing_fields=["title", "effort_minutes"],
+    )
+    conn = _mock_connection()
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.converse") as mock_converse,
+        patch("resolver_svc.main._send_sms"),
+        _no_duplicate(),
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            still_missing=["title", "effort_minutes"],
+            reply_text="what's it for, and how long do you think it'll run?",
+        )
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "clarifying", "item_id": str(extracted.item_id)}
+
+
+def test_event_title_and_duration_reply_persists_and_completes(client):
+    """The reply that fills both missing pieces in one shot resolves the
+    item to AWAITING_CONFIRMATION and writes both back to the items row —
+    they have no conversations.resolved_fields scratchpad slot, unlike
+    due_at/email_recipient, so the items table is the only place they can
+    live pre-commit."""
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", None, "A meeting.", None, True, "CLARIFYING"),
+        conversation_row=(
+            ["title", "effort_minutes"],
+            {"due_at": "2026-09-04T17:00:00", "action_type": "calendar"},
+            0,
+        ),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main._send_sms"),
+        patch("resolver_svc.main.converse") as mock_converse,
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            title_filled=True,
+            title="Meeting with Sarah",
+            effort_minutes_filled=True,
+            effort_minutes=60,
+            still_missing=[],
+            reply_text="got it — meeting with Sarah, locked in for 5pm, confirm?",
+        )
+        resp = client.post(
+            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "with Sarah, an hour"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "awaiting_confirmation", "item_id": item_id}
+    update_calls = [c for c in conn.execute.call_args_list if "UPDATE items SET" in c.args[0]]
+    title_calls = [c for c in update_calls if "title" in c.args[0]]
+    effort_calls = [c for c in update_calls if "effort_minutes" in c.args[0]]
+    assert title_calls and title_calls[0].args[1] == ("Meeting with Sarah", item_id)
+    assert effort_calls and effort_calls[0].args[1] == (60, item_id)
+
+
 def test_health(client):
     resp = client.get("/health")
     assert resp.status_code == 200

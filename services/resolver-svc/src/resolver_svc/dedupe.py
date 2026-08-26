@@ -28,17 +28,22 @@ _client = genai.Client(
 )
 
 
-def compute_dedupe_hash(title: str, summary: str) -> str:
-    """sha256(lower(trim(title)) || '|' || lower(trim(summary))) — data-model.md §2's DDL."""
-    normalized = f"{title.strip().lower()}|{summary.strip().lower()}"
+def compute_dedupe_hash(title: str | None, summary: str) -> str:
+    """sha256(lower(trim(title)) || '|' || lower(trim(summary))) — data-model.md §2's DDL.
+    title is None for a scheduled event still missing an identifying detail
+    (extractor-svc's title/missing_fields rule) — normalized to "" rather
+    than crashing on .strip(), same as embed() below."""
+    normalized = f"{(title or '').strip().lower()}|{summary.strip().lower()}"
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
-def embed(title: str, summary: str) -> list[float]:
+def embed(title: str | None, summary: str) -> list[float]:
     """Embed `title + summary` per state-machine.md §1.1 point 1 — newline-joined,
-    the doc doesn't specify an exact concatenation format."""
+    the doc doesn't specify an exact concatenation format. title is None for
+    a scheduled event still missing an identifying detail — embeds off
+    summary alone in that case rather than crashing."""
     response = _client.models.embed_content(
-        model=EMBEDDING_MODEL, contents=[f"{title}\n{summary}"]
+        model=EMBEDDING_MODEL, contents=[f"{title or ''}\n{summary}"]
     )
     return response.embeddings[0].values
 

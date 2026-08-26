@@ -24,6 +24,15 @@ def test_dedupe_hash_differs_for_different_content():
     assert a != b
 
 
+def test_dedupe_hash_handles_null_title():
+    """A scheduled event with no identifying detail yet (extractor-svc's
+    title/missing_fields rule) has title=None until clarification resolves
+    it — must not crash, normalizes the same as an empty title."""
+    a = compute_dedupe_hash(None, "A meeting.")
+    b = compute_dedupe_hash("", "A meeting.")
+    assert a == b
+
+
 def test_similarity_boundary_at_0_92():
     match_id = uuid4()
     at_threshold = classify_match(DUPLICATE_THRESHOLD, "obligation", match_id, "Pay rent")

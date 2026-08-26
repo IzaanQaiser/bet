@@ -128,16 +128,26 @@ Do, in order:
    finding, not theoretical: a live conversation silently assumed times
    like this on two separate real obligations, never stated to the user
    until they asked or pushed back on it. Same rule for email_recipient
-   (a literal address only, never guessed from a name). Only touch fields
-   actually listed as missing, or explicitly updated during a correction.
-   still_missing MUST be a subset of the given missing fields — the only
-   two field names that can ever appear are "due_at" and "email_recipient"
-   (effort is never asked about — user-directed: it added real friction
-   for little value, always just a silent best-guess bucket upstream).
-   Never add any other field name (e.g. "title") to still_missing, even if
-   the title/summary itself still seems vague — the title is fixed by an
-   earlier stage and isn't something this turn resolves; if it genuinely
-   reads as unclear, just work with it as given rather than asking about it.
+   (a literal address only, never guessed from a name). If "title" is
+   listed as missing (only ever happens for a scheduled event with no
+   identifying detail yet) and the latest reply gives one — a name,
+   subject, location, or purpose — set title_filled true, put a short
+   specific label in title. If it's still vague, leave title_filled false.
+   If "effort_minutes" is listed as missing (only ever happens for a
+   scheduled event with no stated duration yet) and the latest reply gives
+   a duration/scope signal ("an hour", "30 min", "quick one"), resolve it
+   to the nearest of 15/30/60/120/240 minutes — round up on a tie
+   (underestimating is the worse failure mode) — set effort_minutes_filled
+   true, put the value in effort_minutes. If still vague, leave
+   effort_minutes_filled false.
+   Only touch fields actually listed as missing, or explicitly updated
+   during a correction. still_missing MUST be a subset of the given
+   missing fields — the only four field names that can ever appear are
+   "due_at", "email_recipient", "title", and "effort_minutes". title and
+   effort_minutes are only ever listed missing for a scheduled event —
+   never invent asking about either for a task/latent, even if the
+   title/summary reads vague or effort is unstated; just work with what's
+   given for those.
 
 2. Intent (ONLY set this if awaiting_confirmation OR awaiting_dedupe_reply
    is true — a question was already sent and this reply is responding to
@@ -253,6 +263,17 @@ class ConversationTurnResult(BaseModel):
     due_at: str | None = None
     email_recipient_filled: bool = False
     email_recipient: str | None = None
+    title_filled: bool = False
+    title: str | None = None
+    effort_minutes_filled: bool = False
+    # Plain int, not a Literal enum: Vertex AI structured output rejects an
+    # integer Literal outright (extractor-svc's _ExtractionResult hit this
+    # exact gap first, agent-contracts.md §2) but an unconstrained numeric
+    # field works fine (confidence: float already proves this). The prompt
+    # instructs the model to pick a bucket value directly; _round_to_bucket
+    # below re-buckets defensively regardless, rather than trusting the
+    # model's raw number to already be exactly one of the five.
+    effort_minutes: int | None = None
     still_missing: list[str] = []
     intent: Literal["AFFIRM", "DENY", "CORRECTION", "ATTACH", "OTHER"] | None = None
     reply_text: str
@@ -279,12 +300,21 @@ _agent = LlmAgent(
 )
 _session_service = InMemorySessionService()
 
+_EFFORT_BUCKETS = (15, 30, 60, 120, 240)
+
+
+def _round_to_bucket(minutes: int) -> int:
+    """Nearest of _EFFORT_BUCKETS, rounding up on an exact tie —
+    underestimating available work time is the worse failure mode (same
+    reasoning extractor-svc's own bucket-guessing already uses)."""
+    return min(_EFFORT_BUCKETS, key=lambda b: (abs(b - minutes), -b))
+
 
 async def converse(
     session_id: str,
     now_local: datetime,
     tz_name: str,
-    title: str,
+    title: str | None,
     item_type: str,
     summary: str,
     effort_minutes: int | None,
@@ -311,9 +341,10 @@ async def converse(
     hist_block = "\n".join(history) if history else "(none yet)"
     other_items_block = "\n".join(other_items) if other_items else "(none)"
     effort_line = f"{effort_minutes} min" if effort_minutes is not None else "unknown"
+    title_display = title if title else "(untitled — not yet known, ask what it's for)"
     message_text = (
         f"Current date/time: {now_local.isoformat()}, timezone: {tz_name}\n"
-        f"Item: {title} (type={item_type})\n"
+        f"Item: {title_display} (type={item_type})\n"
         f"Summary: {summary}\n"
         f"is_scheduled_event: {is_scheduled_event}\n"
         f"Effort: {effort_line}\n"
@@ -352,14 +383,23 @@ async def converse(
     # Defensive, not just prompted: still_missing is an unconstrained
     # list[str] at the schema level (Vertex AI structured output doesn't
     # support a Literal-list here — untested combination, not worth risking
-    # given the two field names are already known statically). A real run
-    # once returned "title" alongside "due_at" despite the prompt's
-    # instruction — the pipeline has no merge logic for anything but
-    # due_at/email_recipient, so an unrecognized name would silently
-    # strand the item asking about a field it can never resolve. Filtered
-    # here, the one choke point every caller goes through, rather than
-    # trusting the prompt alone.
-    result.still_missing = [f for f in result.still_missing if f in ("due_at", "email_recipient")]
+    # given the four field names are already known statically). A real run
+    # once returned "title" alongside "due_at" despite the prompt's own
+    # instruction at the time (title wasn't yet a mergeable field) — the
+    # pipeline has no merge logic for anything outside this set, so an
+    # unrecognized name would silently strand the item asking about a
+    # field it can never resolve. Filtered here, the one choke point every
+    # caller goes through, rather than trusting the prompt alone.
+    result.still_missing = [
+        f for f in result.still_missing
+        if f in ("due_at", "email_recipient", "title", "effort_minutes")
+    ]
+
+    # Defensive re-bucketing, same reasoning as still_missing above: don't
+    # trust the model's raw number to already be exactly one of the five
+    # canonical buckets, even though the prompt asks for that directly.
+    if result.effort_minutes_filled and result.effort_minutes is not None:
+        result.effort_minutes = _round_to_bucket(result.effort_minutes)
 
     # Defensive, same reasoning as above: relates_to_item is only ever
     # meaningful when there's an actual reply to judge. Forcing it true on
