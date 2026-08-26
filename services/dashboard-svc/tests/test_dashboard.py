@@ -196,6 +196,45 @@ def test_me_items_groups_by_state(client):
     assert body["other"][0]["state"] == "CANCELLED"
 
 
+def test_me_items_committed_includes_ideas_alongside_obligations(client):
+    """Real bug, found live: a committed idea (type='latent') never gets
+    an obligations row — it lives in latents instead — so the old inner
+    JOIN obligations silently excluded every "someday" idea from this
+    list even after the user was told "i've got that down for you". The
+    committed query now UNIONs both sources into one result set."""
+    user_id = uuid4()
+    item_obligation, item_idea = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    mock_conn = _mock_connection()
+
+    # Simulates the real UNION ALL: obligations contribute a real due_at/
+    # calendar_event_id, latents contribute NULLs for both.
+    committed_rows = [
+        (item_obligation, "Pay rent", "summary", now, "cal-evt-1", 15),
+        (item_idea, "Make an AI nerf gun turret", "someday idea", None, None, 240),
+    ]
+
+    def side_effect(sql, params=None):
+        result = MagicMock()
+        if "obligations" in sql:
+            result.fetchall.return_value = committed_rows
+        else:
+            result.fetchall.return_value = []
+        return result
+
+    mock_conn.execute.side_effect = side_effect
+    with patch("dashboard_svc.main.get_connection", return_value=mock_conn):
+        resp = client.get("/me/items", headers=_auth_header(user_id))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["committed"]) == 2
+    idea_row = next(r for r in body["committed"] if r["title"] == "Make an AI nerf gun turret")
+    assert idea_row["due_at"] is None
+    assert idea_row["calendar_event_id"] is None
+    assert idea_row["effort_minutes"] == 240
+
+
 # ---- /me/messages ----
 
 

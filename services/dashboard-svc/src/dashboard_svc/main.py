@@ -157,14 +157,27 @@ async def me_items(user_id: UUID = Depends(current_user_id)):
             str(r[0]): {"pending_fields": r[1], "last_message_at": r[2]} for r in conversation_rows
         }
 
+        # A committed idea (type='latent') never gets an obligations row —
+        # it lives in latents instead, keyed the same way by item_id — so
+        # an inner JOIN obligations alone silently excludes every "someday"
+        # idea from this list. Real bug, found live: an idea the user was
+        # just told "i've got that down for you" for was nowhere to be
+        # found here. UNION ALL in the latent side with due_at/
+        # calendar_event_id as NULL — the frontend already renders a null
+        # due_at as "committed" (memory-list.tsx's formatCommittedTime),
+        # so no frontend change needed for it to show up correctly.
         committed_rows = conn.execute(
             """
             SELECT i.id, i.title, i.summary, o.due_at, o.calendar_event_id, i.effort_minutes
             FROM items i JOIN obligations o ON o.item_id = i.id
             WHERE i.user_id = %s AND i.state = 'COMMITTED'
-            ORDER BY o.due_at DESC NULLS LAST
+            UNION ALL
+            SELECT i.id, i.title, i.summary, NULL::timestamptz, NULL::text, i.effort_minutes
+            FROM items i JOIN latents l ON l.item_id = i.id
+            WHERE i.user_id = %s AND i.state = 'COMMITTED'
+            ORDER BY 4 DESC NULLS LAST
             """,
-            (str(user_id),),
+            (str(user_id), str(user_id)),
         ).fetchall()
 
         other_rows = conn.execute(
