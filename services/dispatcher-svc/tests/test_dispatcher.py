@@ -212,33 +212,25 @@ def test_next_fitting_slot_picks_earliest_day_that_physically_fits():
         day2: _day_computation(time(13, 0), time(16, 0), 180),
         day3: _day_computation(time(9, 0), time(15, 0), 360),
     }
-    result = _next_fitting_slot(day_context, TZ, effort_minutes=120, focus_depth="shallow")
+    result = _next_fitting_slot(day_context, TZ, effort_minutes=120)
     assert result == datetime(2026, 8, 28, 13, 0, tzinfo=TZ)
 
 
 def test_next_fitting_slot_none_when_nothing_fits():
     day_context = {A_DAY: _day_computation(time(9, 0), time(10, 0), 60)}
-    result = _next_fitting_slot(day_context, TZ, effort_minutes=120, focus_depth="deep")
+    result = _next_fitting_slot(day_context, TZ, effort_minutes=120)
     assert result is None
-
-
-def test_next_fitting_slot_respects_deep_work_150_percent_margin():
-    # A 120min deep idea needs a 180min block (150%) — a 150min block
-    # isn't enough, even though it would be for shallow work.
-    day_context = {A_DAY: _day_computation(time(9, 0), time(11, 30), 150)}
-    assert _next_fitting_slot(day_context, TZ, 120, "deep") is None
-    assert _next_fitting_slot(day_context, TZ, 120, "shallow") is not None
 
 
 def test_update_next_fit_slots_writes_a_row_per_latent():
     latents = [
         LatentCandidate(
-            item_id="item-1", created_at=A_DAY, effort_minutes=60, focus_depth="shallow",
+            item_id="item-1", created_at=A_DAY, effort_minutes=60,
             dismissal_count=0, dormant_until=None, last_surfaced_at=None,
             has_open_suggestion=False,
         ),
         LatentCandidate(
-            item_id="item-2", created_at=A_DAY, effort_minutes=999, focus_depth="deep",
+            item_id="item-2", created_at=A_DAY, effort_minutes=999,
             dismissal_count=0, dormant_until=None, last_surfaced_at=None,
             has_open_suggestion=False,
         ),
@@ -283,7 +275,6 @@ def test_send_suggestion_returns_false_when_no_candidate_clears_threshold():
         item_id="x",
         created_at=A_DAY,  # captured today — fails the days_since_capture >= 3 gate
         effort_minutes=120,
-        focus_depth="deep",
         dismissal_count=0,
         dormant_until=None,
         last_surfaced_at=None,
@@ -321,7 +312,6 @@ def test_send_suggestion_sends_exactly_one_and_writes_rows():
         item_id="rust-item",
         created_at=date(2026, 8, 9),  # 18 days old — matches capacity-engine.md §6
         effort_minutes=120,
-        focus_depth="deep",
         dismissal_count=0,
         dormant_until=None,
         last_surfaced_at=None,

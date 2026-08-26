@@ -46,7 +46,6 @@ class ExtractedItemMessage(BaseModel):
     summary: str
     due_at: datetime | None
     effort_minutes: Literal[15, 30, 60, 120, 240]
-    focus_depth: Literal["shallow", "deep"]
     confidence: float                 # 0.0-1.0
     missing_fields: list[str]
     reasoning: str                    # log-only, never shown to the user
@@ -101,10 +100,6 @@ Rules:
   guess a specific date.
 - effort_minutes must be exactly one of 15, 30, 60, 120, 240 — pick the
   closest realistic bucket. Never output any other number.
-- focus_depth is "deep" if the task needs one uninterrupted stretch of
-  concentration (writing, coding, focused analysis); "shallow" if it can be
-  done in short pieces or is administrative/low-cognitive-load (a phone
-  call, filling a form, paying a bill).
 - confidence reflects your overall certainty about the classification and
   fields, not any single field in isolation.
 - reasoning is one sentence explaining the classification, for logs only —
@@ -172,7 +167,7 @@ Before this step, every message was forced into `type="obligation"` or `type="la
 ```python
 is_actionable: bool = True
 chat_reply: str | None = None   # set only when is_actionable is False
-# type/title/summary/due_at/effort_minutes/focus_depth/confidence are now
+# type/title/summary/due_at/effort_minutes/confidence are now
 # Optional — null when is_actionable is False, since there's nothing to
 # extract; missing_fields defaults to an empty list.
 ```
@@ -255,7 +250,7 @@ Output must conform exactly to the provided schema. No text outside it.
 
 **Resolved gap, found in step 10: what happens when `missing_fields` is empty but `confidence < 0.75`?** state-machine.md §1.2's rule ("`missing_fields` non-empty **or** `confidence < 0.75` → `CLARIFYING`") doesn't say what a clarifying question would even ask about when nothing is structurally missing. Decided: nothing — low confidence alone, with no missing fields, goes straight to `AWAITING_CONFIRMATION` like a fully complete item. The confirmation card's own "or send a correction" affordance is the safety net for it; manufacturing a clarifying question with no `missing_fields` content to batch would be degenerate, not more careful. `resolver-svc`'s real gate is `if extracted.missing_fields: clarify() else: confirm()` — confidence isn't consulted at all in practice.
 
-**Where `filled_fields` actually go:** `title`/`summary`/`effort_minutes`/`focus_depth`/`confidence` are columns on `items` — `resolver-svc` writes those straight there. `due_at` has no `items` column (`data-model.md` §2.4) — it's written into `conversations.resolved_fields` instead. `resolver-svc` creates the `conversations` row the moment it consumes `items.extracted`, *unconditionally* — even on the path where extraction was already complete and confident and goes straight to `AWAITING_CONFIRMATION` with no clarifying question ever sent — specifically so a `due_at` the extractor already produced has somewhere to be staged before commit. `conversations.pending_fields` is set to `still_missing` either way, and `resolver-svc` either sends `question` (incrementing `exchange_count`, per `state-machine.md` §1.2) or transitions to `AWAITING_CONFIRMATION` if `still_missing` is empty. At the moment a `Y` is parsed, `resolver-svc` builds `ConfirmedItemMessage` by reading the `items` row plus `conversations.resolved_fields` and merging them — this is the one and only place those two sources come together.
+**Where `filled_fields` actually go:** `title`/`summary`/`effort_minutes`/`confidence` are columns on `items` — `resolver-svc` writes those straight there. `due_at` has no `items` column (`data-model.md` §2.4) — it's written into `conversations.resolved_fields` instead. `resolver-svc` creates the `conversations` row the moment it consumes `items.extracted`, *unconditionally* — even on the path where extraction was already complete and confident and goes straight to `AWAITING_CONFIRMATION` with no clarifying question ever sent — specifically so a `due_at` the extractor already produced has somewhere to be staged before commit. `conversations.pending_fields` is set to `still_missing` either way, and `resolver-svc` either sends `question` (incrementing `exchange_count`, per `state-machine.md` §1.2) or transitions to `AWAITING_CONFIRMATION` if `still_missing` is empty. At the moment a `Y` is parsed, `resolver-svc` builds `ConfirmedItemMessage` by reading the `items` row plus `conversations.resolved_fields` and merging them — this is the one and only place those two sources come together.
 
 **Step 15 addition, same pattern:** `action_type`, `email_draft`, and a resolved `email_recipient` all stage into `conversations.resolved_fields` right alongside `due_at`, for the same reason — none of them have an `items` column, and (for `email_recipient` specifically) resolving it can take a full clarification exchange, so it needs to survive across turns exactly like `due_at` does. `email_recipient` never gets a **durable `obligations` column** — `committer-svc` only needs it transiently, to address the one Gmail send, and the durable record of what was actually sent is `email_draft` + `email_sent_at` (`state-machine.md` §1.5) — but it does need to travel from `resolved_fields` onto `ConfirmedItemMessage` at `Y`-time just like `due_at` does, so `ConfirmedItemMessage` gains a matching `email_recipient: str | None = None` field (§1's schema, updated) purely to carry it that one hop to `committer-svc`.
 

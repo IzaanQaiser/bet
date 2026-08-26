@@ -57,7 +57,6 @@ CREATE TABLE items (
     title          text,
     summary        text,
     effort_minutes int CHECK (effort_minutes IN (15, 30, 60, 120, 240)),
-    focus_depth    text CHECK (focus_depth IN ('shallow', 'deep')),
     confidence     numeric(3,2) CHECK (confidence BETWEEN 0 AND 1),
 
     dedupe_hash    text,                     -- sha256(lower(trim(title)) || '|' || lower(trim(summary))); see §2.1
@@ -167,7 +166,7 @@ The PRD sketch names this column `payload_ref`, implying a pointer (e.g. to GCS)
 
 Fixed here: `resolved_fields` holds obligation-specific values resolved during the pipeline but not yet committed — `due_at`, and as of step 15, `action_type`/`email_draft` too (`agent-contracts.md` §2.1/§3.2 — the email-action stretch's drafting mechanism, resolved rather than left open). **`resolver-svc` creates the `conversations` row unconditionally the moment it consumes an `items.extracted` message** — not only when clarification is actually needed — and immediately stages any `due_at` the extractor already produced into `resolved_fields`. This means the zero-clarification-needed path (straight to `AWAITING_CONFIRMATION`) still has somewhere for `due_at` to live, not just the multi-exchange path. One `conversations` row per item, used as `resolver-svc`'s scratchpad from `EXTRACTED` through to `CONFIRMED`/`CANCELLED`/`NEEDS_REVIEW`/`MERGED`.
 
-`title`/`summary`/`effort_minutes`/`focus_depth`/`confidence` don't have this problem — they're already columns on `items`, and `resolver-svc` has `UPDATE` on `items` (`infrastructure.md` §2.2), so those get written straight there as they're resolved.
+`title`/`summary`/`effort_minutes`/`confidence` don't have this problem — they're already columns on `items`, and `resolver-svc` has `UPDATE` on `items` (`infrastructure.md` §2.2), so those get written straight there as they're resolved.
 
 ### 2.6 `items.type` — made nullable (migration 0002)
 

@@ -37,7 +37,6 @@ async def test_extract_parses_final_event_text():
         "summary": "Pay rent by Friday.",
         "due_at": None,
         "effort_minutes": 15,
-        "focus_depth": "shallow",
         "confidence": 0.95,
         "missing_fields": ["due_at"],
         "reasoning": "Deadline implied but ambiguous.",

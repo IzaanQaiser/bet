@@ -173,7 +173,7 @@ def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
             """
             UPDATE items
             SET type = %s, title = %s, summary = %s, effort_minutes = %s,
-                focus_depth = %s, is_scheduled_event = %s, confidence = %s,
+                is_scheduled_event = %s, confidence = %s,
                 dedupe_hash = %s, state = %s, updated_at = now()
             WHERE id = %s
             """,
@@ -182,7 +182,6 @@ def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
                 extracted.title,
                 extracted.summary,
                 extracted.effort_minutes,
-                extracted.focus_depth,
                 extracted.is_scheduled_event,
                 extracted.confidence,
                 dedupe_hash,

@@ -10,10 +10,9 @@ interface MemoryListItem {
   // "obligation" | "latent" — only ever present on a committed row.
   type?: string;
   effort_minutes?: number | null;
-  // Idea-only: "deep" | "shallow", and the earliest upcoming slot the
-  // idea could physically fit into given the user's real Calendar —
-  // recomputed by dispatcher-svc on every /dispatch run.
-  focus_depth?: string | null;
+  // Idea-only: the earliest upcoming slot the idea could physically fit
+  // into given the user's real Calendar — recomputed by dispatcher-svc
+  // on every /dispatch run.
   next_fit_start?: string | null;
 }
 
@@ -167,7 +166,6 @@ export function MemoryList({ inProgress, committed, timeZone, onDelete }: Memory
             meta={(row) => {
               const parts = [
                 formatDuration(row.effort_minutes),
-                row.focus_depth === "deep" ? "deep" : row.focus_depth === "shallow" ? "shallow" : null,
                 row.next_fit_start ? formatDateTime(row.next_fit_start, timeZone) : "someday",
               ];
               return parts.filter(Boolean).join(" · ");

@@ -77,8 +77,8 @@ def _seed_existing_item(user_id, title, summary, item_type, embedding):
         row = conn.execute(
             """
             INSERT INTO items (user_id, raw_channel, ingested_at, state, type, title, summary,
-                                effort_minutes, focus_depth, confidence, dedupe_hash)
-            VALUES (%s, 'sms', now(), 'AWAITING_CONFIRMATION', %s, %s, %s, 15, 'shallow', 0.9, %s)
+                                effort_minutes, confidence, dedupe_hash)
+            VALUES (%s, 'sms', now(), 'CONFIRMED', %s, %s, %s, 15, 0.9, %s)
             RETURNING id
             """,
             (str(user_id), item_type, title, summary, compute_dedupe_hash(title, summary)),
@@ -123,7 +123,6 @@ def test_exact_hash_match_skips_embedding_call(client, test_user):
         summary="  PAY RENT BY FRIDAY.  ",
         due_at=None,
         effort_minutes=15,
-        focus_depth="shallow",
         confidence=0.95,
         missing_fields=[],
         reasoning="Duplicate resend, exact hash match after normalization.",
@@ -167,7 +166,6 @@ def test_near_duplicate_caught(client, test_user):
         summary="rent is due this friday, $1450",
         due_at=None,
         effort_minutes=15,
-        focus_depth="shallow",
         confidence=0.9,
         missing_fields=[],
         reasoning="Different wording, same underlying fact.",
@@ -203,7 +201,6 @@ def test_dissimilar_item_not_caught(client, test_user):
         summary="Someday, no rush.",
         due_at=None,
         effort_minutes=120,
-        focus_depth="deep",
         confidence=0.9,
         missing_fields=[],
         reasoning="Unrelated idea.",
@@ -216,6 +213,7 @@ def test_dissimilar_item_not_caught(client, test_user):
         patch("resolver_svc.main._send_sms") as mock_sms,
         patch("resolver_svc.main.embed", return_value=unrelated),
         patch("resolver_svc.main.converse") as mock_converse,
+        patch("resolver_svc.main.publish") as mock_publish,
     ):
         from resolver_svc.conversation import ConversationTurnResult
 
@@ -224,11 +222,12 @@ def test_dissimilar_item_not_caught(client, test_user):
         )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
 
-    assert resp.json()["status"] == "awaiting_confirmation"
+    assert resp.json()["status"] == "confirmed"
     mock_sms.assert_called_once()
+    mock_publish.assert_called_once()  # dedupe check itself doesn't need a live Pub/Sub emulator
 
     with get_connection() as conn:
         state = conn.execute(
             "SELECT state FROM items WHERE id = %s", (str(new_item_id),)
         ).fetchone()[0]
-    assert state == "AWAITING_CONFIRMATION"
+    assert state == "CONFIRMED"

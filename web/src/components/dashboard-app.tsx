@@ -22,11 +22,10 @@ interface ItemRow {
   // inferred from a null due_at, since an email-action obligation can
   // legitimately have one too.
   type?: string;
-  // Idea-only (null for an obligation): "deep" | "shallow", and the
-  // earliest upcoming slot the idea could physically fit into given the
-  // user's real Calendar — recomputed by dispatcher-svc on every
-  // /dispatch run, null if nothing in the current 7-day window fits.
-  focus_depth?: string | null;
+  // Idea-only (null for an obligation): the earliest upcoming slot the
+  // idea could physically fit into given the user's real Calendar —
+  // recomputed by dispatcher-svc on every /dispatch run, null if nothing
+  // in the current 7-day window fits.
   next_fit_start?: string | null;
   pending_fields?: string[] | null;
   last_message_at?: string | null;

@@ -1,10 +1,14 @@
 """Integration tests against the real dev Postgres (via the Cloud SQL Auth
-Proxy) + the real Pub/Sub emulator (for the AFFIRM-reply publish only) —
-docs/engineering/test-plan.md steps 9 (confirmation) and 10
-(clarification), now driven by Phase G step D's unified converse() call.
-Twilio and the conversation Gemini call are both mocked (a real SMS
-confirm/cancel round trip and a real multi-turn exchange are the required
-manual verifications, per the test plan).
+Proxy) + the real Pub/Sub emulator (for the auto-confirm publish) —
+docs/engineering/test-plan.md steps 9/10, now driven by Phase G step D's
+unified converse() call and the v1 "no confirmation step" change (main.py's
+own module docstring has the full note): the moment still_missing empties
+out, the item auto-commits straight to CONFIRMED and publishes to
+items.confirmed — no separate AWAITING_CONFIRMATION state, no affirmative
+reply required, so there's no Y/N round trip left to test here. Twilio and
+the conversation Gemini call are both mocked (a real SMS exchange and a
+real multi-turn conversation are the required manual verifications, per
+the test plan).
 
 Requires PUBSUB_EMULATOR_HOST, GCP_PROJECT_ID, DB_USER, DB_HOST, DB_PORT.
 Skipped automatically otherwise.
@@ -71,8 +75,11 @@ def _push_envelope(message) -> dict:
     return {"message": {"data": base64.b64encode(message.model_dump_json().encode()).decode()}}
 
 
-def test_conversations_row_created_on_zero_clarification_path(client, test_user):
+def test_zero_clarification_path_auto_confirms_and_publishes(
+    client, test_user, confirmed_subscription
+):
     user_id, _phone = test_user
+    subscriber, sub_path = confirmed_subscription
     with get_connection() as conn:
         row = conn.execute(
             "INSERT INTO items (user_id, raw_channel, ingested_at, state) "
@@ -90,7 +97,6 @@ def test_conversations_row_created_on_zero_clarification_path(client, test_user)
         summary="Someday, no rush.",
         due_at=None,
         effort_minutes=120,
-        focus_depth="deep",
         confidence=0.95,
         missing_fields=[],
         reasoning="Clear latent, no deadline.",
@@ -101,7 +107,7 @@ def test_conversations_row_created_on_zero_clarification_path(client, test_user)
         _no_duplicate,
     ):
         mock_converse.return_value = ConversationTurnResult(
-            still_missing=[], reply_text="learn pottery, someday — sound good?"
+            still_missing=[], reply_text="learn pottery, locked in for someday."
         )
         resp = client.post("/pubsub/push", json=_push_envelope(extracted))
     assert resp.status_code == 200
@@ -112,31 +118,14 @@ def test_conversations_row_created_on_zero_clarification_path(client, test_user)
         convo = conn.execute(
             "SELECT resolved_fields FROM conversations WHERE item_id = %s", (str(item_id),)
         ).fetchone()
-    assert state == "AWAITING_CONFIRMATION"
+    assert state == "CONFIRMED"
     assert convo is not None
 
-
-@pytest.fixture
-def awaiting_confirmation_item(test_user):
-    user_id, phone = test_user
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            INSERT INTO items (user_id, raw_channel, ingested_at, state, type, title, summary,
-                                effort_minutes, focus_depth, confidence)
-            VALUES (%s, 'sms', now(), 'AWAITING_CONFIRMATION', 'obligation', 'Pay rent',
-                    'Pay rent by Friday.', 15, 'shallow', 0.95)
-            RETURNING id
-            """,
-            (str(user_id),),
-        ).fetchone()
-        item_id = row[0]
-        conn.execute(
-            "INSERT INTO conversations (user_id, item_id, resolved_fields) VALUES (%s, %s, %s)",
-            (str(user_id), str(item_id), '{"due_at": "2026-09-04T14:00:00"}'),
-        )
-        conn.commit()
-    return item_id, user_id, phone
+    pulled = subscriber.pull(subscription=sub_path, max_messages=1, timeout=10)
+    assert len(pulled.received_messages) == 1
+    subscriber.acknowledge(
+        subscription=sub_path, ack_ids=[m.ack_id for m in pulled.received_messages]
+    )
 
 
 @pytest.fixture
@@ -151,56 +140,6 @@ def confirmed_subscription():
     subscriber.create_subscription(name=sub_path, topic=topic_path)
     yield subscriber, sub_path
     subscriber.delete_subscription(subscription=sub_path)
-
-
-def test_y_reply_publishes_confirmed(client, awaiting_confirmation_item, confirmed_subscription):
-    item_id, user_id, _phone = awaiting_confirmation_item
-    subscriber, sub_path = confirmed_subscription
-
-    with (
-        patch("resolver_svc.main.converse") as mock_converse,
-        patch("resolver_svc.main._send_sms"),
-    ):
-        mock_converse.return_value = ConversationTurnResult(
-            intent="AFFIRM", reply_text="bet, locked it in"
-        )
-        resp = client.post(
-            "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "yes"}
-        )
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "confirmed", "item_id": str(item_id)}
-
-    with get_connection() as conn:
-        state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
-    assert state == "CONFIRMED"
-
-    pulled = subscriber.pull(subscription=sub_path, max_messages=1, timeout=10)
-    assert len(pulled.received_messages) == 1
-    subscriber.acknowledge(
-        subscription=sub_path, ack_ids=[m.ack_id for m in pulled.received_messages]
-    )
-
-
-def test_n_reply_cancels_no_publish(client, awaiting_confirmation_item):
-    item_id, user_id, phone = awaiting_confirmation_item
-
-    with (
-        patch("resolver_svc.main.converse") as mock_converse,
-        patch("resolver_svc.main._send_sms") as mock_sms,
-    ):
-        mock_converse.return_value = ConversationTurnResult(
-            intent="DENY", reply_text="no worries, scrapped it"
-        )
-        resp = client.post(
-            "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "n"}
-        )
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "cancelled", "item_id": str(item_id)}
-    mock_sms.assert_called_once_with(user_id, phone, "no worries, scrapped it")
-
-    with get_connection() as conn:
-        state = conn.execute("SELECT state FROM items WHERE id = %s", (str(item_id),)).fetchone()[0]
-    assert state == "CANCELLED"
 
 
 @pytest.fixture
@@ -226,15 +165,17 @@ def _extracted_missing_due_at(item_id, user_id):
         summary="Pay rent, deadline unclear.",
         due_at=None,
         effort_minutes=15,
-        focus_depth="shallow",
         confidence=0.95,
         missing_fields=["due_at"],
         reasoning="Deadline missing.",
     )
 
 
-def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item):
+def test_single_exchange_resolves_and_auto_confirms(
+    client, received_item, confirmed_subscription
+):
     item_id, user_id, phone = received_item
+    subscriber, sub_path = confirmed_subscription
     extracted = _extracted_missing_due_at(item_id, user_id)
 
     with (
@@ -251,13 +192,13 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item
 
         mock_converse.return_value = ConversationTurnResult(
             due_at_filled=True, due_at="2026-08-28T14:00:00", still_missing=[],
-            reply_text="pay rent friday 2pm — sound good?",
+            reply_text="bet, pay rent locked in for friday 2pm.",
         )
         resp = client.post(
             "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "friday"}
         )
 
-    assert resp.json()["status"] == "awaiting_confirmation"
+    assert resp.json()["status"] == "confirmed"
     assert mock_sms.call_count == 2  # one question, one confirmation message
 
     with get_connection() as conn:
@@ -266,9 +207,15 @@ def test_single_exchange_resolves_to_awaiting_confirmation(client, received_item
             "SELECT resolved_fields, exchange_count FROM conversations WHERE item_id = %s",
             (str(item_id),),
         ).fetchone()
-    assert state == "AWAITING_CONFIRMATION"
+    assert state == "CONFIRMED"
     assert resolved_fields["due_at"] == "2026-08-28T14:00:00"
     assert exchange_count == 1  # the resolving reply itself never increments it
+
+    pulled = subscriber.pull(subscription=sub_path, max_messages=1, timeout=10)
+    assert len(pulled.received_messages) == 1
+    subscriber.acknowledge(
+        subscription=sub_path, ack_ids=[m.ack_id for m in pulled.received_messages]
+    )
 
 
 def test_three_exchange_exhaustion_reaches_needs_review(client, received_item):

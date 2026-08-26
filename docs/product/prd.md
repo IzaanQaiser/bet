@@ -110,7 +110,6 @@ Output:
   "summary": "string",
   "due_at": "ISO8601 | null",
   "effort_minutes": 15 | 30 | 60 | 120 | 240,
-  "focus_depth": "shallow" | "deep",
   "confidence": 0.0-1.0,
   "missing_fields": ["due_at", ...],
   "reasoning": "string"
@@ -120,7 +119,8 @@ Output:
 Rules:
 - Never invent a `due_at`. If a date is implied but ambiguous ("next week"), put it in `missing_fields`.
 - `effort_minutes` is a bucket, not a free number — keeps matching tractable.
-- `focus_depth: deep` means the task needs a contiguous block; `shallow` can fit in gaps.
+
+**Removed, v1, user-directed:** `focus_depth` (shallow/deep classification) and everything derived from it — judged too verbose for v1. See `capacity-engine.md` §4 for the resulting single-rule `block_fit`.
 
 ### 5.2 Resolver
 **Role:** owns the human loop. Turns a low-confidence or incomplete extraction into a confirmed record.
@@ -189,10 +189,9 @@ Computed per candidate day over the user's configured working hours:
 
 ### 6.2 Fit
 ```
-fit_score = block_fit × depth_fit × load_fit
+fit_score = block_fit × load_fit
 ```
-- `block_fit` — for `focus_depth: deep`, requires `largest_contiguous_block ≥ effort_minutes × 1.25`; returns 0 below that. For `shallow`, requires `free_minutes ≥ effort_minutes`.
-- `depth_fit` — deep items are penalised on days with `fragmentation_index > 0.5`; shallow items are *rewarded* on fragmented days (they fill gaps).
+- `block_fit` — requires `largest_contiguous_block ≥ effort_minutes`; returns 0 below that. One universal rule, v1 (see `capacity-engine.md` §4 for the removed deep/shallow distinction).
 - `load_fit` — scales with how far below the rolling mean the day sits. A day at the mean scores ~0.5; a day 40% below scores ~1.0.
 
 ### 6.3 Revival score
@@ -264,7 +263,7 @@ items(
   type,                    -- obligation | latent
   state,                   -- see §7
   title, summary,
-  effort_minutes, focus_depth, confidence,
+  effort_minutes, confidence,
   dedupe_hash,             -- cheap exact-match prefilter
   parent_item_id,          -- thread attachment
   created_at, updated_at
@@ -428,7 +427,7 @@ Strict. Do not work ahead. Each step below is scoped to one service, one well-is
 
 ### Phase C — The differentiator
 
-7. **Capacity engine, pure functions only.** `free_intervals`, snapshot metrics, `block_fit`/`depth_fit`/`load_fit`, `revival_score` — exactly as specified, no service, no deploy. *Reads:* `capacity-engine.md` (self-contained). *Done when:* unit tests reproduce the worked example's exact numbers (`fit_score = 0.875`, `revival_score ≈ 0.633`).
+7. **Capacity engine, pure functions only.** `free_intervals`, snapshot metrics, `block_fit`/`load_fit`, `revival_score` — exactly as specified, no service, no deploy. *Reads:* `capacity-engine.md` (self-contained). *Done when:* unit tests reproduce the worked example's exact numbers (`fit_score = 0.875`, `revival_score ≈ 0.633`).
 8. **`dispatcher-svc`.** Cloud Scheduler jobs, Calendar read (7-day forward + 14-day trailing), wire step 7's functions to real data, write `capacity_snapshots`, send reminders + at most one suggestion (templates from `agent-contracts.md` §4), manual trigger endpoint. *Reads:* `agent-contracts.md` §4; `overview.md` (dispatcher row); `infrastructure.md` (`sa-dispatcher`, §5). *Done when:* manually triggering `/dispatch` against a real calendar produces a correctly-worded SMS.
 
 ### Phase D — Trust and quality features

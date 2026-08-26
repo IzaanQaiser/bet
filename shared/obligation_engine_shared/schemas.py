@@ -47,9 +47,8 @@ class ExtractedItemMessage(BaseModel):
     Phase G step B (agent-contracts.md §2.2): is_actionable is the leading
     triage field. When false, the message is pure chat (banter/greeting/
     reaction/question) with nothing to capture — type/title/summary/due_at/
-    effort_minutes/focus_depth/confidence are all null, missing_fields is
-    empty. When true, every other field is filled exactly as before this
-    step.
+    effort_minutes/confidence are all null, missing_fields is empty. When
+    true, every other field is filled exactly as before this step.
 
     raw_text is a plain passthrough of RawItemMessage.text, not a model
     output — carried through so resolver-svc's chat handler has the
@@ -74,7 +73,6 @@ class ExtractedItemMessage(BaseModel):
     # (migrations/0016 — a real, visible bug found live: "1.5 hours"
     # rounding to a 2-hour Calendar event). Sanity-bounded, not enum-bound.
     effort_minutes: int | None = Field(default=None, gt=0, le=1440)
-    focus_depth: Literal["shallow", "deep"] | None = None
     # A task with a completion deadline ("assignment due at 6pm" — remind
     # strictly before it, never at it) vs. a scheduled event you attend at
     # a specific time ("meeting at 8:39pm" — the reminder that matters

@@ -63,7 +63,6 @@ class _ExtractionResult(BaseModel):
     summary: str | None = None
     due_at: str | None = None
     effort_minutes: int | None = None
-    focus_depth: Literal["shallow", "deep"] | None = None
     is_scheduled_event: bool = False
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     missing_fields: list[str] = Field(default_factory=list)
@@ -82,8 +81,8 @@ First decide is_actionable:
 - false if the message is pure chat with nothing to remember or schedule —
   a greeting, banter, a reaction, a question about the system itself, "you
   there?", etc. In this case leave type/title/summary/due_at/effort_minutes/
-  focus_depth/confidence null and missing_fields empty. Never invent an
-  obligation or idea out of plain chat.
+  confidence null and missing_fields empty. Never invent an obligation or
+  idea out of plain chat.
 - true if the message describes a real obligation or idea worth capturing.
   In this case fill every field below normally.
 
@@ -133,10 +132,6 @@ Rules:
   applies to a task/latent: its title comes straight from what the
   message already describes and is never left null or added to
   missing_fields.
-- focus_depth is "deep" if the task needs one uninterrupted stretch of
-  concentration (writing, coding, focused analysis); "shallow" if it can be
-  done in short pieces or is administrative/low-cognitive-load (a phone
-  call, filling a form, paying a bill).
 - is_scheduled_event is true ONLY for a real "attend this at a specific
   time" obligation — a meeting, a party, a call, an appointment, "go to
   X" — where due_at is when it STARTS, not a deadline you work toward.
@@ -266,7 +261,6 @@ async def pubsub_push(request: Request):
         summary=result.summary,
         due_at=result.due_at,
         effort_minutes=result.effort_minutes,
-        focus_depth=result.focus_depth,
         is_scheduled_event=result.is_scheduled_event,
         confidence=result.confidence,
         missing_fields=result.missing_fields,

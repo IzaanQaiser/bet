@@ -129,7 +129,7 @@ Test files live in each service's `tests/` directory, or `shared/tests/` for any
 The cleanest step to test — no I/O, and `capacity-engine.md` §6 already hands you exact expected numbers.
 
 **Acceptance criteria**
-- `free_intervals`, `block_fit`, `depth_fit`, `load_fit`, `revival_score` implemented exactly per `capacity-engine.md`'s formulas.
+- `free_intervals`, `block_fit`, `load_fit`, `revival_score` implemented exactly per `capacity-engine.md`'s formulas.
 - The worked example (§6) reproduces exactly: `fit_score = 0.875`, `revival_score ≈ 0.633` (assert to 3 decimal places).
 - The contrast example (§6, insufficient block) reproduces `fit_score = 0`.
 
@@ -137,10 +137,7 @@ The cleanest step to test — no I/O, and `capacity-engine.md` §6 already hands
 - `test_free_intervals_merges_back_to_back_events`
 - `test_free_intervals_all_day_event_blocks_whole_day`
 - `test_free_intervals_excludes_declined_and_transparent`
-- `test_block_fit_deep_requires_125_percent_margin`
-- `test_block_fit_shallow_no_margin_required`
-- `test_depth_fit_deep_flat_below_threshold` / `test_depth_fit_deep_falls_off_above_threshold` (floor 0.3)
-- `test_depth_fit_shallow_rewards_fragmentation` (cap 1.2)
+- `test_block_fit_one_universal_rule_no_margin`
 - `test_load_fit_at_mean_is_half` (`load_delta=0` → `0.5`) / `test_load_fit_40_percent_below_is_one` (`load_delta=-0.4` → `1.0`)
 - `test_load_fit_clips_at_bounds` / `test_load_fit_cold_start_is_neutral` (`None` → `0.5`)
 - `test_load_delta_cold_start_below_3_days`
