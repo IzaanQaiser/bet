@@ -279,6 +279,45 @@ def _initial_resolved_fields(extracted: ExtractedItemMessage) -> dict:
     return fields
 
 
+def _merge_effort_minutes(effort_minutes: int | None, result) -> int | None:
+    """effort_minutes lives on the items table itself, not the
+    conversations.resolved_fields scratchpad due_at/email_recipient use
+    (data-model.md §2.4) — merged into the in-memory value here;
+    _persist_effort_minutes_fill writes it back once a DB connection is
+    open. Only ever missing (and so only ever filled here) for a scheduled
+    event with no stated duration — a task's effort_minutes is always
+    already guessed by extractor-svc, so this is a no-op for every other
+    item."""
+    if result.effort_minutes_filled and result.effort_minutes is not None:
+        return result.effort_minutes
+    return effort_minutes
+
+
+def _persist_effort_minutes_fill(conn, item_id, result) -> None:
+    if result.effort_minutes_filled and result.effort_minutes is not None:
+        conn.execute(
+            "UPDATE items SET effort_minutes = %s, updated_at = now() WHERE id = %s",
+            (result.effort_minutes, str(item_id)),
+        )
+
+
+def _merge_title(title: str | None, result) -> str | None:
+    """Same items-column pattern as effort_minutes above — only ever
+    missing (and so only ever filled here) for a scheduled event with no
+    identifying detail yet."""
+    if result.title_filled and result.title:
+        return result.title
+    return title
+
+
+def _persist_title_fill(conn, item_id, result) -> None:
+    if result.title_filled and result.title:
+        conn.execute(
+            "UPDATE items SET title = %s, updated_at = now() WHERE id = %s",
+            (result.title, str(item_id)),
+        )
+
+
 _REMINDER_LEAD = timedelta(minutes=30)
 
 
@@ -518,6 +557,7 @@ async def _start_clarification(
 
     resolved_fields = _initial_resolved_fields(extracted)
     effort_minutes = extracted.effort_minutes
+    title = extracted.title
     is_scheduled_event = extracted.is_scheduled_event
     thread_attach_title = thread_attach[1] if thread_attach else None
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
@@ -528,7 +568,7 @@ async def _start_clarification(
         session_id=f"{extracted.item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
         tz_name=tz_name,
-        title=extracted.title,
+        title=title,
         item_type=extracted.type,
         summary=extracted.summary,
         effort_minutes=effort_minutes,
@@ -550,11 +590,15 @@ async def _start_clarification(
     if thread_attach:
         resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
         resolved_fields["_thread_attach_title"] = thread_attach[1]
+    effort_minutes = _merge_effort_minutes(effort_minutes, result)
+    title = _merge_title(title, result)
     reply_text = _ensure_reminder_mention(
         result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
     )
 
     with get_connection() as conn:
+        _persist_effort_minutes_fill(conn, extracted.item_id, result)
+        _persist_title_fill(conn, extracted.item_id, result)
         conn.execute(
             """
             INSERT INTO conversations
@@ -719,6 +763,10 @@ async def _handle_clarification_reply(
         resolved_fields = {**resolved_fields, "due_at": result.due_at}
     if result.email_recipient_filled and result.email_recipient:
         resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
+    effort_minutes = _merge_effort_minutes(effort_minutes, result)
+    _persist_effort_minutes_fill(conn, item_id, result)
+    title = _merge_title(title, result)
+    _persist_title_fill(conn, item_id, result)
 
     if result.still_missing:
         if exchange_count < MAX_EXCHANGES:
@@ -878,6 +926,10 @@ async def _handle_duplicate_reply(
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
         if result.email_recipient_filled and result.email_recipient:
             resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
+        effort_minutes = _merge_effort_minutes(effort_minutes, result)
+        _persist_effort_minutes_fill(conn, item_id, result)
+        title = _merge_title(title, result)
+        _persist_title_fill(conn, item_id, result)
 
         if result.still_missing:
             conn.execute(
@@ -1025,6 +1077,8 @@ async def _handle_confirmation_reply(
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
         if result.email_recipient_filled and result.email_recipient:
             resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
+        _persist_effort_minutes_fill(conn, item_id, result)
+        _persist_title_fill(conn, item_id, result)
         conn.execute(
             "UPDATE conversations SET resolved_fields = %s, last_message_at = now() "
             "WHERE item_id = %s",
