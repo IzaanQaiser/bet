@@ -336,7 +336,12 @@ export function DashboardApp() {
           status: shortDate(row.due_at, timeZone),
           visible: true,
           glow: false,
-          retrieved: true,
+          // "retrieved" (struck through) means the deadline has actually
+          // passed, not merely that the item is confirmed/scheduled — an
+          // absolute-instant comparison, so no timezone conversion needed
+          // here the way display formatting requires. An item with no
+          // due_at (a latent, an email action) has nothing to wait out.
+          retrieved: row.due_at ? new Date(row.due_at) <= new Date() : true,
         })),
       ]
     : [];

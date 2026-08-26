@@ -352,14 +352,21 @@ Verified against real Vertex AI before wiring in: 7/7 scenarios correct — the 
 
 ## 4. Dispatcher contract — all deterministic templates
 
-### 4.1 Deadline reminder
-```
-⏰ {title} is due {relative_due_description}.
-{formatted_due_at}
-```
-`{relative_due_description}` is `"today"`, `"tomorrow"`, or `"in {N} days"` — computed from `obligations.due_at` and `obligations.reminder_window_hours`, not from the LLM.
+### 4.1 Deadline reminders — two stages, effort-derived
 
-**Resolved gap, found in step 8: when does a reminder actually fire?** The column existing doesn't say. Decided: a reminder fires the first `/dispatch` run where `now + reminder_window_hours >= due_at` and `reminder_sent_at IS NULL` — i.e. the moment the obligation enters its reminder window, checked on whatever cadence the dispatcher runs (twice daily, `infrastructure.md` §5). `{relative_due_description}` is a separate, purely calendar-day calculation (`due_at`'s local date minus today's local date) — an obligation can be firmly "in the window" by the hour-based rule while still rendering as `"tomorrow"`, and that's correct, not a bug: the two computations answer different questions (should a reminder fire at all vs. how to describe the date in it).
+```
+⏰ heads up — {title} is due {relative_due_description}, {formatted_due_at}.
+Block off ~{effort} for it soon.
+```
+```
+⏰ last call — {title} is due {relative_due_description}, {formatted_due_at}.
+About {effort} left if you start now.
+```
+`{relative_due_description}` is `"today"`, `"tomorrow"`, or `"in {N} days"`, computed from `obligations.due_at`, not the LLM. `{effort}` is `obligations`' linked `items.effort_minutes`, formatted as hours/minutes.
+
+**Superseded gap, originally found in step 8, redesigned in the effort-aware clarification pass:** the single fixed `reminder_window_hours`/`reminder_sent_at` columns (a blanket 24h-before-due window, never varying per obligation) are gone (migrations/0013). Two reminders are computed instead by resolver-svc at confirm time, once both `due_at` and `effort_minutes` are known: `reminder_1_at = due_at - 2*effort_minutes` (early heads-up) and `reminder_2_at = due_at - effort_minutes` (start-by, last call) — persisted on `obligations.reminder_1_at`/`reminder_2_at`, fired independently by dispatcher-svc against `reminder_1_sent_at`/`reminder_2_sent_at IS NULL`, same idempotency shape as before but per-slot. `{relative_due_description}` stays a separate, purely calendar-day calculation, same as before — an obligation can already be past a reminder threshold while still rendering as `"tomorrow"`, and that's correct, not a bug.
+
+This is also what makes `effort_minutes` conversationally askable now, not just silently guessed: extractor-svc only guesses a bucket when the message gives real signal; when it doesn't, `"effort_minutes"` joins `missing_fields` alongside `due_at`/`email_recipient` and resolver-svc's `converse()` asks for it directly (conversation.py §3.2/§3.3's field-merge step), since the two reminder times can't be computed without it.
 
 ### 4.2 Suggestion — exact rendering, ties to `capacity-engine.md` §6
 

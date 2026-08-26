@@ -516,6 +516,36 @@ def test_reply_unexpected_state_does_not_crash(client):
 # --- /pubsub/push, dedupe path (step 12) ---------------------------------
 
 
+def test_check_duplicate_excludes_dead_states_from_both_queries():
+    """Regression guard for a real bug, found live: a user-deleted
+    (CANCELLED) item stayed a permanently eligible dedupe match forever,
+    since neither the exact dedupe_hash query nor the vector-similarity
+    query filtered on state at all — confirming a "duplicate" against a
+    dead item resurrected it via the merge path instead of leaving it
+    deleted."""
+    from resolver_svc.main import _check_duplicate
+
+    extracted = _extracted_message()
+    conn = MagicMock()
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    conn.execute.return_value.fetchone.return_value = None
+
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.embed", return_value=[0.1, 0.2, 0.3]),
+    ):
+        _check_duplicate(extracted)
+
+    hash_call, vector_call = conn.execute.call_args_list[0], conn.execute.call_args_list[1]
+    hash_sql, hash_params = hash_call.args
+    vector_sql, vector_params = vector_call.args
+    assert "state != ALL" in hash_sql
+    assert "CANCELLED" in hash_params[-1] and "MERGED" in hash_params[-1]
+    assert "state != ALL" in vector_sql
+    assert "CANCELLED" in vector_params[-2] and "MERGED" in vector_params[-2]
+
+
 def test_duplicate_found_routes_to_duplicate_suspected_not_clarification(client):
     """A duplicate match short-circuits before the completeness check ever
     runs (state-machine.md §1.1) — even an item with missing_fields set
@@ -558,12 +588,16 @@ def test_duplicate_found_routes_to_duplicate_suspected_not_clarification(client)
 
 
 def test_duplicate_y_reply_merges_no_publish(client):
+    # Regression guard for a real bug, found live: this update used to
+    # write state='MERGED' without ever setting parent_item_id, silently
+    # dropping the link its own log line already claimed to record.
     item_id, user_id = str(uuid4()), str(uuid4())
+    match_item_id = str(uuid4())
     conn = _mock_connection(
         item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
         conversation_row=(
             None,
-            {"_dedupe_match_item_id": str(uuid4()), "_dedupe_match_title": "Pay rent"},
+            {"_dedupe_match_item_id": match_item_id, "_dedupe_match_title": "Pay rent"},
         ),
     )
     with (
@@ -588,7 +622,10 @@ def test_duplicate_y_reply_merges_no_publish(client):
         UUID(user_id), "+15551234567", "sounds good, merging it with pay rent."
     )
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
-    assert "MERGED" in update_calls[0].args[0]
+    sql, params = update_calls[0].args
+    assert "MERGED" in sql
+    assert "parent_item_id" in sql
+    assert params == (match_item_id, item_id)
 
 
 def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):
@@ -783,6 +820,152 @@ def test_attach_reply_with_no_candidate_is_unhandled(client):
     mock_sms.assert_called_once_with(
         UUID(user_id), "+15551234567", "hmm, nothing to attach that to — yes or no on the task?"
     )
+
+
+# --- effort-aware clarification + two-stage reminders --------------------
+
+
+def test_compute_reminder_times_derives_early_and_final_from_effort():
+    from resolver_svc.main import _compute_reminder_times
+
+    times = _compute_reminder_times("2026-09-04T18:00:00", 120)
+    assert times == (datetime(2026, 9, 4, 14, 0), datetime(2026, 9, 4, 16, 0))
+
+
+def test_compute_reminder_times_none_when_either_input_missing():
+    from resolver_svc.main import _compute_reminder_times
+
+    assert _compute_reminder_times(None, 60) is None
+    assert _compute_reminder_times("2026-09-04T18:00:00", None) is None
+
+
+def test_ensure_reminder_mention_noop_when_already_passed():
+    from resolver_svc.main import _ensure_reminder_mention
+
+    # reminder_1_at_passed non-None means converse() already had the
+    # chance to mention it naturally — no deterministic append here.
+    text = _ensure_reminder_mention("bet, locked in", "2:00 PM", "2026-09-04T18:00:00", 120)
+    assert text == "bet, locked in"
+
+
+def test_ensure_reminder_mention_appends_when_newly_computable():
+    from resolver_svc.main import _ensure_reminder_mention
+
+    text = _ensure_reminder_mention(
+        "alright, sounds good — confirm?", None, "2026-09-04T18:00:00", 120
+    )
+    assert text == (
+        "alright, sounds good — confirm? I'll remind you at 2:00 PM and 4:00 PM."
+    )
+
+
+def test_ensure_reminder_mention_noop_when_still_not_computable():
+    from resolver_svc.main import _ensure_reminder_mention
+
+    text = _ensure_reminder_mention("what's the deadline?", None, None, None)
+    assert text == "what's the deadline?"
+
+
+def test_effort_minutes_missing_starts_clarification(client):
+    """effort_minutes now joins due_at/email_recipient in the "ask, don't
+    guess" family — an extraction that flagged it missing gets a real
+    clarifying question, same as any other missing field."""
+    extracted = _extracted_message(missing_fields=["effort_minutes"], effort_minutes=None)
+    conn = _mock_connection()
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.converse") as mock_converse,
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        _no_duplicate(),
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            effort_minutes_filled=False,
+            still_missing=["effort_minutes"],
+            reply_text="how long do you think it'll take?",
+        )
+        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "clarifying", "item_id": str(extracted.item_id)}
+    mock_sms.assert_called_once_with(
+        extracted.user_id, "+15551234567", "how long do you think it'll take?"
+    )
+
+
+def test_effort_minutes_reply_persists_and_states_reminder_times(client):
+    """The user's own example, end to end at the mechanism level: due_at
+    was already known, effort_minutes was the only thing missing. The
+    reply that fills it ("2 hours") also completes the item on the same
+    turn — reminder_1_at/reminder_2_at can't have been passed into that
+    specific converse() call (nothing could compute them before it), so
+    the deterministic append in _ensure_reminder_mention is what states
+    them, not the LLM."""
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", None, "CLARIFYING"),
+        conversation_row=(
+            ["effort_minutes"],
+            {"due_at": "2026-09-04T18:00:00", "action_type": "calendar"},
+            0,
+        ),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main._send_sms") as mock_sms,
+        patch("resolver_svc.main.converse") as mock_converse,
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            effort_minutes_filled=True,
+            effort_minutes=120,
+            still_missing=[],
+            reply_text="alright, sounds good — confirm?",
+        )
+        resp = client.post(
+            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "2 hours"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "awaiting_confirmation", "item_id": item_id}
+
+    effort_updates = [
+        c
+        for c in conn.execute.call_args_list
+        if "UPDATE items" in c.args[0] and "effort_minutes" in c.args[0]
+    ]
+    assert len(effort_updates) == 1
+    assert effort_updates[0].args[1] == (120, item_id)
+
+    mock_sms.assert_called_once_with(
+        UUID(user_id),
+        "+15551234567",
+        "alright, sounds good — confirm? I'll remind you at 2:00 PM and 4:00 PM.",
+    )
+
+
+def test_affirm_publishes_reminder_times_on_confirmed_item(client):
+    item_id, user_id = str(uuid4()), str(uuid4())
+    conn = _mock_connection(
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 120, "AWAITING_CONFIRMATION"),
+        conversation_row=(
+            {"due_at": "2026-09-04T18:00:00", "action_type": "calendar"},
+        ),
+    )
+    with (
+        patch("resolver_svc.main.get_connection", return_value=conn),
+        patch("resolver_svc.main.publish") as mock_publish,
+        patch("resolver_svc.main.converse") as mock_converse,
+        patch("resolver_svc.main._send_sms"),
+    ):
+        mock_converse.return_value = ConversationTurnResult(
+            intent="AFFIRM", reply_text="bet, locked it in — I'll remind you at 2 and 4pm"
+        )
+        resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "y"})
+
+    assert resp.status_code == 200
+    mock_publish.assert_called_once()
+    _topic, confirmed = mock_publish.call_args[0]
+    assert confirmed.reminder_1_at == datetime(2026, 9, 4, 14, 0)
+    assert confirmed.reminder_2_at == datetime(2026, 9, 4, 16, 0)
 
 
 def test_health(client):

@@ -272,7 +272,8 @@ items(
 
 obligations(
   item_id PK FK, due_at, calendar_event_id,
-  reminder_sent_at, reminder_window_hours,
+  reminder_1_at, reminder_1_sent_at,     -- early heads-up: due_at - 2*effort
+  reminder_2_at, reminder_2_sent_at,     -- start-by, last call: due_at - effort
   action_type,              -- calendar | email
   email_draft, email_sent_at
 )

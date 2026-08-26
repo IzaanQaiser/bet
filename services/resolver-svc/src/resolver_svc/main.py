@@ -82,7 +82,7 @@ actually finishes), so its existence is the one true completion signal.
 import logging
 import os
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -249,6 +249,70 @@ def _initial_resolved_fields(extracted: ExtractedItemMessage) -> dict:
     return fields
 
 
+def _merge_effort_minutes(effort_minutes: int | None, result) -> int | None:
+    """effort_minutes lives on the items table itself, not the
+    conversations.resolved_fields scratchpad due_at/email_recipient use
+    (data-model.md §2.4) — merged into the in-memory value here;
+    _persist_effort_minutes_fill writes it back once a DB connection is
+    open."""
+    if result.effort_minutes_filled and result.effort_minutes is not None:
+        return result.effort_minutes
+    return effort_minutes
+
+
+def _persist_effort_minutes_fill(conn, item_id, result) -> None:
+    if result.effort_minutes_filled and result.effort_minutes is not None:
+        conn.execute(
+            "UPDATE items SET effort_minutes = %s, updated_at = now() WHERE id = %s",
+            (result.effort_minutes, str(item_id)),
+        )
+
+
+def _compute_reminder_times(
+    due_at_iso: str | None, effort_minutes: int | None
+) -> tuple[datetime, datetime] | None:
+    """due_at - 2x effort (early heads-up) and due_at - effort (start-by,
+    last call) — both naive local, same "naive means local" convention
+    due_at itself already carries through this whole pipeline (committer-svc
+    attaches the real timezone at commit time). None whenever either input
+    isn't known yet — a latent, or an obligation still missing a piece."""
+    if not due_at_iso or effort_minutes is None:
+        return None
+    due_at = datetime.fromisoformat(due_at_iso)
+    delta = timedelta(minutes=effort_minutes)
+    return due_at - 2 * delta, due_at - delta
+
+
+def _format_reminder_time(dt: datetime) -> str:
+    return dt.strftime("%-I:%M %p")
+
+
+def _ensure_reminder_mention(
+    reply_text: str,
+    reminder_1_at_passed: str | None,
+    due_at_iso: str | None,
+    effort_minutes: int | None,
+) -> str:
+    """converse() is already asked to state reminder_1_at/reminder_2_at
+    naturally whenever they're given as known context going into that
+    call. But the one reply that resolves the LAST missing piece needed to
+    compute them (say, effort_minutes on the very turn still_missing
+    empties out) can't have had them passed in — nothing could compute
+    them before a call that is itself what fills them. This deterministic
+    append covers exactly that one gap (reminder_1_at_passed was None
+    going in, but both due_at/effort are known after merging this turn's
+    result); every other case already got a natural, in-voice mention from
+    converse() itself and this is a no-op."""
+    if reminder_1_at_passed is not None:
+        return reply_text
+    times = _compute_reminder_times(due_at_iso, effort_minutes)
+    if times is None:
+        return reply_text
+    r1, r2 = times
+    r1_str, r2_str = _format_reminder_time(r1), _format_reminder_time(r2)
+    return f"{reply_text} I'll remind you at {r1_str} and {r2_str}."
+
+
 async def _handle_chat(extracted: ExtractedItemMessage) -> None:
     """Phase G step B: a pure-chat message never reaches dedupe/clarification/
     confirmation — extractor-svc already generated the reply, this just sends
@@ -273,28 +337,44 @@ async def _handle_chat(extracted: ExtractedItemMessage) -> None:
     logger.info("CHATTED item_id=%s", extracted.item_id)
 
 
+_DEDUPE_INELIGIBLE_STATES = ("CANCELLED", "MERGED", "FAILED")
+
+
 def _check_duplicate(extracted: ExtractedItemMessage) -> DedupeResult:
     dedupe_hash = compute_dedupe_hash(extracted.title, extracted.summary)
 
     with get_connection() as conn:
         exact = conn.execute(
             "SELECT id, title FROM items "
-            "WHERE user_id = %s AND dedupe_hash = %s AND id != %s LIMIT 1",
-            (str(extracted.user_id), dedupe_hash, str(extracted.item_id)),
+            "WHERE user_id = %s AND dedupe_hash = %s AND id != %s AND state != ALL(%s) LIMIT 1",
+            (
+                str(extracted.user_id),
+                dedupe_hash,
+                str(extracted.item_id),
+                list(_DEDUPE_INELIGIBLE_STATES),
+            ),
         ).fetchone()
         if exact is not None:
             return DedupeResult(duplicate_item_id=exact[0], duplicate_title=exact[1])
 
         vector = vector_literal(embed(extracted.title, extracted.summary))
+        # A cancelled/merged/failed item is dead — the user deleted it, or
+        # it already got absorbed into something else, or it never
+        # completed. None of those are "the same live thing" a fresh
+        # message could be a duplicate of, so they're excluded from ever
+        # being offered as a dedupe match — real finding: without this, a
+        # deleted item stayed a permanently eligible "duplicate" forever,
+        # and confirming the match resurrected it via the merge path
+        # below instead of actually clearing it.
         match = conn.execute(
             """
             SELECT i.id, i.title, i.type, 1 - (e.embedding <=> %s::vector) AS similarity
             FROM item_embeddings e JOIN items i ON i.id = e.item_id
-            WHERE i.user_id = %s
+            WHERE i.user_id = %s AND i.state != ALL(%s)
             ORDER BY e.embedding <=> %s::vector
             LIMIT 1
             """,
-            (vector, str(extracted.user_id), vector),
+            (vector, str(extracted.user_id), list(_DEDUPE_INELIGIBLE_STATES), vector),
         ).fetchone()
         conn.execute(
             "INSERT INTO item_embeddings (item_id, embedding) VALUES (%s, %s::vector)",
@@ -383,8 +463,12 @@ async def _start_clarification(
         history = _recent_history(conn, extracted.user_id)
 
     resolved_fields = _initial_resolved_fields(extracted)
+    effort_minutes = extracted.effort_minutes
     thread_attach_title = thread_attach[1] if thread_attach else None
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+    reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
+    reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
         session_id=f"{extracted.item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -392,13 +476,15 @@ async def _start_clarification(
         title=extracted.title,
         item_type=extracted.type,
         summary=extracted.summary,
-        effort_minutes=extracted.effort_minutes,
+        effort_minutes=effort_minutes,
         known_fields=resolved_fields,
         missing_fields=extracted.missing_fields,
         awaiting_confirmation=False,
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=None,
+        reminder_1_at=reminder_1_at,
+        reminder_2_at=reminder_2_at,
     )
     if result.due_at_filled and result.due_at:
         resolved_fields["due_at"] = result.due_at
@@ -407,8 +493,13 @@ async def _start_clarification(
     if thread_attach:
         resolved_fields["_thread_attach_item_id"] = str(thread_attach[0])
         resolved_fields["_thread_attach_title"] = thread_attach[1]
+    effort_minutes = _merge_effort_minutes(effort_minutes, result)
+    reply_text = _ensure_reminder_mention(
+        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), effort_minutes
+    )
 
     with get_connection() as conn:
+        _persist_effort_minutes_fill(conn, extracted.item_id, result)
         conn.execute(
             """
             INSERT INTO conversations
@@ -436,7 +527,7 @@ async def _start_clarification(
             (str(extracted.item_id),),
         )
         conn.commit()
-    _send_sms(extracted.user_id, phone, result.reply_text)
+    _send_sms(extracted.user_id, phone, reply_text)
     logger.info("AWAITING_CONFIRMATION item_id=%s (resolved on first pass)", extracted.item_id)
     return "awaiting_confirmation"
 
@@ -531,6 +622,9 @@ async def _handle_clarification_reply(
     history = _recent_history(conn, user_id)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+    reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
+    reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
         session_id=f"{item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -545,6 +639,8 @@ async def _handle_clarification_reply(
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=latest_reply,
+        reminder_1_at=reminder_1_at,
+        reminder_2_at=reminder_2_at,
     )
     if not result.relates_to_item:
         return _route_as_new_item(
@@ -555,6 +651,8 @@ async def _handle_clarification_reply(
         resolved_fields = {**resolved_fields, "due_at": result.due_at}
     if result.email_recipient_filled and result.email_recipient:
         resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
+    effort_minutes = _merge_effort_minutes(effort_minutes, result)
+    _persist_effort_minutes_fill(conn, item_id, result)
 
     if result.still_missing:
         if exchange_count < MAX_EXCHANGES:
@@ -589,6 +687,9 @@ async def _handle_clarification_reply(
         logger.info("NEEDS_REVIEW item_id=%s (exhausted %d exchanges)", item_id, MAX_EXCHANGES)
         return {"status": "needs_review", "item_id": str(item_id)}
 
+    reply_text = _ensure_reminder_mention(
+        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), effort_minutes
+    )
     conn.execute(
         "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
         (str(item_id),),
@@ -599,7 +700,7 @@ async def _handle_clarification_reply(
         (Json(resolved_fields), [], str(item_id)),
     )
     conn.commit()
-    _send_sms(user_id, phone, result.reply_text)
+    _send_sms(user_id, phone, reply_text)
     logger.info("AWAITING_CONFIRMATION item_id=%s (clarification resolved)", item_id)
     return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
@@ -647,9 +748,14 @@ async def _handle_duplicate_reply(
         )
 
     if dedupe_result.intent == "AFFIRM":
+        # Real bug, found live: this used to write state='MERGED' without
+        # ever setting parent_item_id, despite the log line below already
+        # claiming "into=<match>" — the link it named was never actually
+        # written anywhere.
         conn.execute(
-            "UPDATE items SET state = 'MERGED', updated_at = now() WHERE id = %s",
-            (str(item_id),),
+            "UPDATE items SET state = 'MERGED', parent_item_id = %s, updated_at = now() "
+            "WHERE id = %s",
+            (resolved_fields.get("_dedupe_match_item_id"), str(item_id)),
         )
         conn.commit()
         _send_sms(user_id, phone, dedupe_result.reply_text)
@@ -667,6 +773,9 @@ async def _handle_duplicate_reply(
         # its one job — classifying the dedupe question — dedupe_result's
         # own reply_text was just the "keeping separate" acknowledgment,
         # not a real attempt at resolving missing fields).
+        reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+        reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
+        reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
         result = await converse(
             session_id=f"{item_id}-{uuid4().hex[:8]}",
             now_local=now_local,
@@ -681,11 +790,15 @@ async def _handle_duplicate_reply(
             thread_attach_title=thread_attach_title,
             history=history,
             latest_reply=None,
+            reminder_1_at=reminder_1_at,
+            reminder_2_at=reminder_2_at,
         )
         if result.due_at_filled and result.due_at:
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
         if result.email_recipient_filled and result.email_recipient:
             resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
+        effort_minutes = _merge_effort_minutes(effort_minutes, result)
+        _persist_effort_minutes_fill(conn, item_id, result)
 
         if result.still_missing:
             conn.execute(
@@ -704,6 +817,9 @@ async def _handle_duplicate_reply(
             )
             return {"status": "clarifying", "item_id": str(item_id)}
 
+        reply_text = _ensure_reminder_mention(
+            result.reply_text, reminder_1_at, resolved_fields.get("due_at"), effort_minutes
+        )
         conn.execute(
             "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
             (str(item_id),),
@@ -714,7 +830,7 @@ async def _handle_duplicate_reply(
             ([], Json(resolved_fields), str(item_id)),
         )
         conn.commit()
-        _send_sms(user_id, phone, result.reply_text)
+        _send_sms(user_id, phone, reply_text)
         logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
         return {"status": "awaiting_confirmation", "item_id": str(item_id)}
 
@@ -742,6 +858,9 @@ async def _handle_confirmation_reply(
     history = _recent_history(conn, user_id)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
+    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+    reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
+    reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
         session_id=f"{item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -756,6 +875,8 @@ async def _handle_confirmation_reply(
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=latest_reply,
+        reminder_1_at=reminder_1_at,
+        reminder_2_at=reminder_2_at,
     )
     if not result.relates_to_item:
         return _route_as_new_item(
@@ -764,6 +885,7 @@ async def _handle_confirmation_reply(
         )
 
     if result.intent == "AFFIRM":
+        reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
         confirmed = ConfirmedItemMessage(
             item_id=item_id,
             user_id=user_id,
@@ -775,6 +897,8 @@ async def _handle_confirmation_reply(
             action_type=resolved_fields.get("action_type"),
             email_recipient=resolved_fields.get("email_recipient"),
             email_draft=resolved_fields.get("email_draft"),
+            reminder_1_at=reminder_times[0] if reminder_times else None,
+            reminder_2_at=reminder_times[1] if reminder_times else None,
         )
         publish("items-confirmed", confirmed)
         conn.execute(
@@ -801,6 +925,7 @@ async def _handle_confirmation_reply(
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
         if result.email_recipient_filled and result.email_recipient:
             resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
+        _persist_effort_minutes_fill(conn, item_id, result)
         conn.execute(
             "UPDATE conversations SET resolved_fields = %s, last_message_at = now() "
             "WHERE item_id = %s",

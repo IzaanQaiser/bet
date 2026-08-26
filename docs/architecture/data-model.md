@@ -73,8 +73,14 @@ CREATE TABLE obligations (
     item_id            uuid PRIMARY KEY REFERENCES items(id),
     due_at             timestamptz,
     calendar_event_id  text,
-    reminder_sent_at   timestamptz,
-    reminder_window_hours int NOT NULL DEFAULT 24,
+    -- migrations/0013: replaced the single fixed-window reminder_sent_at/
+    -- reminder_window_hours with two independently-scheduled reminders,
+    -- computed by resolver-svc from due_at/effort_minutes at confirm time
+    -- (due_at - 2*effort, due_at - effort) — see agent-contracts.md §4.1.
+    reminder_1_at      timestamptz,
+    reminder_1_sent_at timestamptz,
+    reminder_2_at      timestamptz,
+    reminder_2_sent_at timestamptz,
     action_type        text NOT NULL DEFAULT 'calendar' CHECK (action_type IN ('calendar', 'email')),
     email_draft        text,
     email_sent_at      timestamptz

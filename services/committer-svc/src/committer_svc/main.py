@@ -164,14 +164,17 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
         with get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO obligations (item_id, due_at, calendar_event_id, action_type)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO obligations
+                    (item_id, due_at, calendar_event_id, action_type, reminder_1_at, reminder_2_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     str(confirmed.item_id),
                     confirmed.due_at,
                     calendar_event_id,
                     confirmed.action_type,
+                    confirmed.reminder_1_at,
+                    confirmed.reminder_2_at,
                 ),
             )
             conn.execute(

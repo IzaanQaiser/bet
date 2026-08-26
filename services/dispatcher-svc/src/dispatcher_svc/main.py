@@ -49,7 +49,8 @@ from dispatcher_svc.capacity_engine import (
 from dispatcher_svc.templates import (
     render_accepted,
     render_dismissed,
-    render_reminder,
+    render_reminder_early,
+    render_reminder_final,
     render_snoozed,
     render_suggestion,
 )
@@ -142,24 +143,54 @@ def _persist_snapshot(conn, user_id, computation: DayComputation) -> str:
 
 
 def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
-    rows = conn.execute(
+    """Two independent fire conditions, not one (state-machine.md §4.1's
+    old single reminder_window_hours/reminder_sent_at replaced by
+    per-obligation reminder_1_at/reminder_2_at — resolver-svc computes both
+    from due_at/effort_minutes at confirm time). Each obligation can fire
+    both in the same /dispatch run if both thresholds already passed —
+    same forgiving "better late than never" semantics the old single
+    reminder always had."""
+    today_local = now_utc.astimezone(tz).date()
+    sent = 0
+
+    early_rows = conn.execute(
         """
-        SELECT o.item_id, i.title, o.due_at
+        SELECT o.item_id, i.title, o.due_at, i.effort_minutes
         FROM obligations o JOIN items i ON i.id = o.item_id
-        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_sent_at IS NULL
-          AND o.due_at <= %s + make_interval(hours => o.reminder_window_hours)
+        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_1_sent_at IS NULL
+          AND o.reminder_1_at IS NOT NULL AND o.reminder_1_at <= %s
         """,
         (str(user_id), now_utc),
     ).fetchall()
-    sent = 0
-    today_local = now_utc.astimezone(tz).date()
-    for item_id, title, due_at in rows:
+    for item_id, title, due_at, effort_minutes in early_rows:
         local_due = due_at.astimezone(tz)
-        _send_sms(user_id, to=phone, body=render_reminder(title, local_due, today_local))
+        body = render_reminder_early(title, local_due, effort_minutes, today_local)
+        _send_sms(user_id, to=phone, body=body)
         conn.execute(
-            "UPDATE obligations SET reminder_sent_at = now() WHERE item_id = %s", (str(item_id),)
+            "UPDATE obligations SET reminder_1_sent_at = now() WHERE item_id = %s",
+            (str(item_id),),
         )
         sent += 1
+
+    final_rows = conn.execute(
+        """
+        SELECT o.item_id, i.title, o.due_at, i.effort_minutes
+        FROM obligations o JOIN items i ON i.id = o.item_id
+        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_2_sent_at IS NULL
+          AND o.reminder_2_at IS NOT NULL AND o.reminder_2_at <= %s
+        """,
+        (str(user_id), now_utc),
+    ).fetchall()
+    for item_id, title, due_at, effort_minutes in final_rows:
+        local_due = due_at.astimezone(tz)
+        body = render_reminder_final(title, local_due, effort_minutes, today_local)
+        _send_sms(user_id, to=phone, body=body)
+        conn.execute(
+            "UPDATE obligations SET reminder_2_sent_at = now() WHERE item_id = %s",
+            (str(item_id),),
+        )
+        sent += 1
+
     if sent:
         conn.commit()
     return sent

@@ -21,18 +21,30 @@ def relative_due_description(due_at: date, today: date) -> str:
     return f"in {days} days"
 
 
-def render_reminder(title: str, due_at: datetime, today: date) -> str:
-    return (
-        f"⏰ {title} is due {relative_due_description(due_at.date(), today)}.\n"
-        f"{format_due_at(due_at)}"
-    )
-
-
 def _format_block_hours(minutes: int) -> str:
     hours, mins = divmod(minutes, 60)
     if mins == 0:
         return f"{hours}h"
     return f"{hours}h {mins}min"
+
+
+def render_reminder_early(title: str, due_at: datetime, effort_minutes: int, today: date) -> str:
+    """Fires at due_at - 2*effort — the early heads-up, not yet urgent."""
+    return (
+        f"⏰ heads up — {title} is due {relative_due_description(due_at.date(), today)}, "
+        f"{format_due_at(due_at)}.\n"
+        f"Block off ~{_format_block_hours(effort_minutes)} for it soon."
+    )
+
+
+def render_reminder_final(title: str, due_at: datetime, effort_minutes: int, today: date) -> str:
+    """Fires at due_at - effort — the start-by, last-call reminder: about
+    exactly enough time left to do the work, no more."""
+    return (
+        f"⏰ last call — {title} is due {relative_due_description(due_at.date(), today)}, "
+        f"{format_due_at(due_at)}.\n"
+        f"About {_format_block_hours(effort_minutes)} left if you start now."
+    )
 
 
 def _time_of_day_phrase(block_start_hour: int) -> str:

@@ -6,7 +6,8 @@ from datetime import date, datetime
 from dispatcher_svc.templates import (
     evidence_line,
     relative_due_description,
-    render_reminder,
+    render_reminder_early,
+    render_reminder_final,
     render_suggestion,
 )
 
@@ -19,10 +20,22 @@ def test_relative_due_description_today_tomorrow_and_n_days():
     assert relative_due_description(date(2026, 8, 30), today) == "in 3 days"
 
 
-def test_render_reminder_exact_format():
+def test_render_reminder_early_exact_format():
     due = datetime(2026, 9, 4, 14, 0)  # a real Friday
-    body = render_reminder("Pay rent", due, today=date(2026, 9, 3))
-    assert body == "⏰ Pay rent is due tomorrow.\nFri 4 Sep, 2:00 PM"
+    body = render_reminder_early("Pay rent", due, 120, today=date(2026, 9, 3))
+    assert body == (
+        "⏰ heads up — Pay rent is due tomorrow, Fri 4 Sep, 2:00 PM.\n"
+        "Block off ~2h for it soon."
+    )
+
+
+def test_render_reminder_final_exact_format():
+    due = datetime(2026, 9, 4, 14, 0)
+    body = render_reminder_final("Pay rent", due, 90, today=date(2026, 9, 4))
+    assert body == (
+        "⏰ last call — Pay rent is due today, Fri 4 Sep, 2:00 PM.\n"
+        "About 1h 30min left if you start now."
+    )
 
 
 def test_suggestion_text_superlative_branch():
