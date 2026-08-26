@@ -163,16 +163,18 @@ async def me_items(user_id: UUID = Depends(current_user_id)):
         # idea from this list. Real bug, found live: an idea the user was
         # just told "i've got that down for you" for was nowhere to be
         # found here. UNION ALL in the latent side with due_at/
-        # calendar_event_id as NULL — the frontend already renders a null
-        # due_at as "committed" (memory-list.tsx's formatCommittedTime),
-        # so no frontend change needed for it to show up correctly.
+        # calendar_event_id as NULL. i.type is included (not inferred from
+        # a null due_at on the frontend — an email-action obligation can
+        # legitimately have a null due_at too, so that heuristic isn't
+        # reliable) so the frontend can group ideas separately from real
+        # committed obligations.
         committed_rows = conn.execute(
             """
-            SELECT i.id, i.title, i.summary, o.due_at, o.calendar_event_id, i.effort_minutes
+            SELECT i.id, i.title, i.summary, o.due_at, o.calendar_event_id, i.effort_minutes, i.type
             FROM items i JOIN obligations o ON o.item_id = i.id
             WHERE i.user_id = %s AND i.state = 'COMMITTED'
             UNION ALL
-            SELECT i.id, i.title, i.summary, NULL::timestamptz, NULL::text, i.effort_minutes
+            SELECT i.id, i.title, i.summary, NULL::timestamptz, NULL::text, i.effort_minutes, i.type
             FROM items i JOIN latents l ON l.item_id = i.id
             WHERE i.user_id = %s AND i.state = 'COMMITTED'
             ORDER BY 4 DESC NULLS LAST
@@ -216,6 +218,7 @@ async def me_items(user_id: UUID = Depends(current_user_id)):
                 "due_at": r[3].isoformat() if r[3] else None,
                 "calendar_event_id": r[4],
                 "effort_minutes": r[5],
+                "type": r[6],
             }
             for r in committed_rows
         ],
