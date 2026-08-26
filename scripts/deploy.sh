@@ -259,13 +259,26 @@ case "$SERVICE" in
     ;;
   committer-svc)
     echo "Deploying ${SERVICE}..."
+    # DISPATCHER_SVC_URL: committer-svc enqueues a Cloud Task per reminder
+    # slot targeting dispatcher-svc's /dispatch/reminders/fire directly at
+    # the exact reminder instant (real gap, found live — dispatcher-svc's
+    # own /dispatch only runs twice a day, too coarse for same-day
+    # reminders). The Cloud Tasks queue/IAM (sa-committer needs
+    # cloudtasks.enqueuer on the "reminders" queue plus
+    # iam.serviceAccountUser on sa-dispatcher, to mint the OIDC token the
+    # task authenticates with) are provisioned once by hand, not by this
+    # script — see docs/product/status.md.
+    DISPATCHER_SVC_URL=$(gcloud run services describe dispatcher-svc \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-committer@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}" \
+      --set-env-vars="DB_USER=sa-committer@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},DISPATCHER_SVC_URL=${DISPATCHER_SVC_URL}" \
       --set-secrets="GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest" \
       --min-instances=0 \
       --no-allow-unauthenticated \
@@ -323,23 +336,37 @@ case "$SERVICE" in
       --role="roles/run.invoker" \
       --account=waslyrideshare@gmail.com
 
-    for job in dispatch-daily:"0 7 * * *" dispatch-midday:"0 13 * * *"; do
+    # dispatch-daily/dispatch-midday hit the full /dispatch (real Calendar
+    # reads, capacity snapshots + suggestions) — twice a day is the right
+    # cadence there (infrastructure.md §4's quota assumption). Real gap,
+    # found live: that cadence meant a same-day reminder (e.g. 9pm) never
+    # got checked until the next day's 7am run, hours too late. The actual
+    # fix is committer-svc scheduling a precise Cloud Task per reminder
+    # (main.py's _enqueue_reminder_task, firing /dispatch/reminders/fire
+    # directly at the exact instant) — polling isn't the primary mechanism.
+    # dispatch-reminders hits the cheap /dispatch/reminders (no Calendar
+    # reads) on a deliberately infrequent cadence, purely as a fallback
+    # for whatever the precise path might miss.
+    for job in dispatch-daily:"0 7 * * *":/dispatch dispatch-midday:"0 13 * * *":/dispatch \
+      dispatch-reminders:"*/30 * * * *":/dispatch/reminders; do
       job_name="${job%%:*}"
-      job_cron="${job#*:}"
+      job_rest="${job#*:}"
+      job_cron="${job_rest%%:*}"
+      job_path="${job_rest#*:}"
       echo "Creating/updating ${job_name}..."
       if gcloud scheduler jobs describe "$job_name" \
         --project="$PROJECT_ID" --location="$REGION" --account=waslyrideshare@gmail.com >/dev/null 2>&1; then
         gcloud scheduler jobs update http "$job_name" \
           --project="$PROJECT_ID" --location="$REGION" \
           --schedule="$job_cron" --time-zone="America/Toronto" \
-          --uri="${SERVICE_URL}/dispatch" --http-method=POST \
+          --uri="${SERVICE_URL}${job_path}" --http-method=POST \
           --oidc-service-account-email="$SA" \
           --account=waslyrideshare@gmail.com
       else
         gcloud scheduler jobs create http "$job_name" \
           --project="$PROJECT_ID" --location="$REGION" \
           --schedule="$job_cron" --time-zone="America/Toronto" \
-          --uri="${SERVICE_URL}/dispatch" --http-method=POST \
+          --uri="${SERVICE_URL}${job_path}" --http-method=POST \
           --oidc-service-account-email="$SA" \
           --account=waslyrideshare@gmail.com
       fi

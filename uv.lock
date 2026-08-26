@@ -469,6 +469,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "google-auth" },
     { name = "google-cloud-secret-manager" },
+    { name = "google-cloud-tasks" },
     { name = "obligation-engine-shared" },
     { name = "requests" },
     { name = "uvicorn", extra = ["standard"] },
@@ -485,6 +486,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "google-auth", specifier = ">=2.35" },
     { name = "google-cloud-secret-manager", specifier = ">=2.20" },
+    { name = "google-cloud-tasks", specifier = ">=2.16" },
     { name = "obligation-engine-shared", editable = "shared" },
     { name = "requests", specifier = ">=2.32" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
@@ -913,6 +915,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ce/7e/73bb7512df1d1aad6ce3f9aed847cd40e0cd400ba4a85d86ab8eb412e9cc/google_cloud_storage-3.13.1.tar.gz", hash = "sha256:a80bf8cac2794808aa61c50c5f769ecbbe2d10331bacd0d69d30e59b14b346b2", size = 17341051, upload-time = "2026-08-06T06:24:42.229Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/06/6f/d69f0e185e08ddb58c323a0a935af2b492907b5de362bc08933b0a3b5644/google_cloud_storage-3.13.1-py3-none-any.whl", hash = "sha256:98208de6c21e85cecd3eb44551894efff33d98365500e178867d4305854a770a", size = 341486, upload-time = "2026-08-06T06:23:36.548Z" },
+]
+
+[[package]]
+name = "google-cloud-tasks"
+version = "2.24.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpc-google-iam-v1" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cf/b2/7cfe6f0108baaaf535a8e3ccb5876f79430c2eb85f6f433e43c763dbe326/google_cloud_tasks-2.24.0.tar.gz", hash = "sha256:aa4f8764e5b157cbab81af619cc4fd9f14ebece8b69e5394a657c328a8366228", size = 370764, upload-time = "2026-08-06T06:24:45.842Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/53/8e/dc52d38465cc227fd8f5358984b67cc55080ed24781b99f6f7ff9d2b5e1e/google_cloud_tasks-2.24.0-py3-none-any.whl", hash = "sha256:1c82007a252d47efb4006eae5a5a0d9f6d375f917ab1c5cd80ce4a6f0ea4690d", size = 310091, upload-time = "2026-08-06T06:23:39.897Z" },
 ]
 
 [[package]]
