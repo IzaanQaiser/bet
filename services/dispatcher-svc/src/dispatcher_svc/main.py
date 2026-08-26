@@ -49,6 +49,8 @@ from dispatcher_svc.capacity_engine import (
 from dispatcher_svc.templates import (
     render_accepted,
     render_dismissed,
+    render_event_reminder_early,
+    render_event_reminder_start,
     render_reminder_early,
     render_reminder_final,
     render_snoozed,
@@ -155,16 +157,20 @@ def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
 
     early_rows = conn.execute(
         """
-        SELECT o.item_id, i.title, o.due_at, i.effort_minutes
+        SELECT o.item_id, i.title, o.due_at, i.effort_minutes, i.is_scheduled_event
         FROM obligations o JOIN items i ON i.id = o.item_id
         WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_1_sent_at IS NULL
           AND o.reminder_1_at IS NOT NULL AND o.reminder_1_at <= %s
         """,
         (str(user_id), now_utc),
     ).fetchall()
-    for item_id, title, due_at, effort_minutes in early_rows:
+    for item_id, title, due_at, effort_minutes, is_scheduled_event in early_rows:
         local_due = due_at.astimezone(tz)
-        body = render_reminder_early(title, local_due, effort_minutes, today_local)
+        body = (
+            render_event_reminder_early(title, local_due, today_local)
+            if is_scheduled_event
+            else render_reminder_early(title, local_due, effort_minutes, today_local)
+        )
         _send_sms(user_id, to=phone, body=body)
         conn.execute(
             "UPDATE obligations SET reminder_1_sent_at = now() WHERE item_id = %s",
@@ -174,16 +180,20 @@ def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
 
     final_rows = conn.execute(
         """
-        SELECT o.item_id, i.title, o.due_at, i.effort_minutes
+        SELECT o.item_id, i.title, o.due_at, i.effort_minutes, i.is_scheduled_event
         FROM obligations o JOIN items i ON i.id = o.item_id
         WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_2_sent_at IS NULL
           AND o.reminder_2_at IS NOT NULL AND o.reminder_2_at <= %s
         """,
         (str(user_id), now_utc),
     ).fetchall()
-    for item_id, title, due_at, effort_minutes in final_rows:
+    for item_id, title, due_at, effort_minutes, is_scheduled_event in final_rows:
         local_due = due_at.astimezone(tz)
-        body = render_reminder_final(title, local_due, effort_minutes, today_local)
+        body = (
+            render_event_reminder_start(title, local_due, today_local)
+            if is_scheduled_event
+            else render_reminder_final(title, local_due, effort_minutes, today_local)
+        )
         _send_sms(user_id, to=phone, body=body)
         conn.execute(
             "UPDATE obligations SET reminder_2_sent_at = now() WHERE item_id = %s",

@@ -157,8 +157,8 @@ def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
             """
             UPDATE items
             SET type = %s, title = %s, summary = %s, effort_minutes = %s,
-                focus_depth = %s, confidence = %s, dedupe_hash = %s, state = %s,
-                updated_at = now()
+                focus_depth = %s, is_scheduled_event = %s, confidence = %s,
+                dedupe_hash = %s, state = %s, updated_at = now()
             WHERE id = %s
             """,
             (
@@ -167,6 +167,7 @@ def _write_item(extracted: ExtractedItemMessage, state: str) -> None:
                 extracted.summary,
                 extracted.effort_minutes,
                 extracted.focus_depth,
+                extracted.is_scheduled_event,
                 extracted.confidence,
                 dedupe_hash,
                 state,
@@ -298,17 +299,28 @@ def _persist_effort_minutes_fill(conn, item_id, result) -> None:
 
 
 def _compute_reminder_times(
-    due_at_iso: str | None, effort_minutes: int | None
+    due_at_iso: str | None, effort_minutes: int | None, is_scheduled_event: bool = False
 ) -> tuple[datetime, datetime] | None:
-    """due_at - 2x effort (early heads-up) and due_at - effort (start-by,
-    last call) — both naive local, same "naive means local" convention
-    due_at itself already carries through this whole pipeline (committer-svc
-    attaches the real timezone at commit time). None whenever either input
-    isn't known yet — a latent, or an obligation still missing a piece."""
+    """A task with a deadline (default) gets both reminders strictly
+    BEFORE due_at — due_at - 2x effort (early heads-up), due_at - effort
+    (start-by, last call) — never at the deadline itself, since there'd be
+    no time left. A scheduled event you attend (is_scheduled_event=True)
+    gets a heads-up before start (due_at - effort, effort doubling as a
+    reasonable "how much notice" proxy since it already means how long the
+    event lasts) AND a reminder AT the actual start time — the one thing
+    the task-shaped formula deliberately never produces, and exactly what
+    a meeting reminder needs. Real bug, found live: a meeting used the
+    task formula and never got reminded at its own start time.
+    Both naive local, same "naive means local" convention due_at itself
+    already carries through this whole pipeline (committer-svc attaches
+    the real timezone at commit time). None whenever either input isn't
+    known yet — a latent, or an obligation still missing a piece."""
     if not due_at_iso or effort_minutes is None:
         return None
     due_at = datetime.fromisoformat(due_at_iso)
     delta = timedelta(minutes=effort_minutes)
+    if is_scheduled_event:
+        return due_at - delta, due_at
     return due_at - 2 * delta, due_at - delta
 
 
@@ -321,6 +333,7 @@ def _ensure_reminder_mention(
     reminder_1_at_passed: str | None,
     due_at_iso: str | None,
     effort_minutes: int | None,
+    is_scheduled_event: bool = False,
 ) -> str:
     """converse() is already asked to state reminder_1_at/reminder_2_at
     naturally whenever they're given as known context going into that
@@ -334,7 +347,7 @@ def _ensure_reminder_mention(
     converse() itself and this is a no-op."""
     if reminder_1_at_passed is not None:
         return reply_text
-    times = _compute_reminder_times(due_at_iso, effort_minutes)
+    times = _compute_reminder_times(due_at_iso, effort_minutes, is_scheduled_event)
     if times is None:
         return reply_text
     r1, r2 = times
@@ -454,6 +467,7 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
         dedupe_candidate_title=dedupe.duplicate_title,
         awaiting_dedupe_reply=False,
         other_items=other_items,
+        is_scheduled_event=extracted.is_scheduled_event,
     )
 
     with get_connection() as conn:
@@ -496,9 +510,12 @@ async def _start_clarification(
 
     resolved_fields = _initial_resolved_fields(extracted)
     effort_minutes = extracted.effort_minutes
+    is_scheduled_event = extracted.is_scheduled_event
     thread_attach_title = thread_attach[1] if thread_attach else None
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+    reminder_times = _compute_reminder_times(
+        resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+    )
     reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
     reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
@@ -518,6 +535,7 @@ async def _start_clarification(
         reminder_1_at=reminder_1_at,
         reminder_2_at=reminder_2_at,
         other_items=other_items,
+        is_scheduled_event=is_scheduled_event,
     )
     if result.due_at_filled and result.due_at:
         resolved_fields["due_at"] = result.due_at
@@ -528,7 +546,11 @@ async def _start_clarification(
         resolved_fields["_thread_attach_title"] = thread_attach[1]
     effort_minutes = _merge_effort_minutes(effort_minutes, result)
     reply_text = _ensure_reminder_mention(
-        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), effort_minutes
+        result.reply_text,
+        reminder_1_at,
+        resolved_fields.get("due_at"),
+        effort_minutes,
+        is_scheduled_event,
     )
 
     with get_connection() as conn:
@@ -643,7 +665,17 @@ async def pubsub_push(request: Request):
 
 
 async def _handle_clarification_reply(
-    conn, user_id, item_id, phone, tz_name, title, item_type, summary, effort_minutes, latest_reply
+    conn,
+    user_id,
+    item_id,
+    phone,
+    tz_name,
+    title,
+    item_type,
+    summary,
+    effort_minutes,
+    is_scheduled_event,
+    latest_reply,
 ) -> dict:
     convo_row = conn.execute(
         "SELECT pending_fields, resolved_fields, exchange_count FROM conversations "
@@ -656,7 +688,9 @@ async def _handle_clarification_reply(
     other_items = _other_items_context(conn, user_id, item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+    reminder_times = _compute_reminder_times(
+        resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+    )
     reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
     reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
@@ -676,6 +710,7 @@ async def _handle_clarification_reply(
         reminder_1_at=reminder_1_at,
         reminder_2_at=reminder_2_at,
         other_items=other_items,
+        is_scheduled_event=is_scheduled_event,
     )
     if not result.relates_to_item:
         return _route_as_new_item(
@@ -723,7 +758,11 @@ async def _handle_clarification_reply(
         return {"status": "needs_review", "item_id": str(item_id)}
 
     reply_text = _ensure_reminder_mention(
-        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), effort_minutes
+        result.reply_text,
+        reminder_1_at,
+        resolved_fields.get("due_at"),
+        effort_minutes,
+        is_scheduled_event,
     )
     conn.execute(
         "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
@@ -741,7 +780,17 @@ async def _handle_clarification_reply(
 
 
 async def _handle_duplicate_reply(
-    conn, user_id, item_id, phone, tz_name, title, item_type, summary, effort_minutes, text
+    conn,
+    user_id,
+    item_id,
+    phone,
+    tz_name,
+    title,
+    item_type,
+    summary,
+    effort_minutes,
+    is_scheduled_event,
+    text,
 ) -> dict:
     """The dedupe reply, in voice (conversation.py's dedupe-question note):
     classify_reply()'s plain Y/N keyword matching is retired here too —
@@ -778,6 +827,7 @@ async def _handle_duplicate_reply(
         dedupe_candidate_title=match_title,
         awaiting_dedupe_reply=True,
         other_items=other_items,
+        is_scheduled_event=is_scheduled_event,
     )
     if not dedupe_result.relates_to_item:
         return _route_as_new_item(
@@ -810,7 +860,9 @@ async def _handle_duplicate_reply(
         # its one job — classifying the dedupe question — dedupe_result's
         # own reply_text was just the "keeping separate" acknowledgment,
         # not a real attempt at resolving missing fields).
-        reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+        reminder_times = _compute_reminder_times(
+            resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+        )
         reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
         reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
         result = await converse(
@@ -830,6 +882,7 @@ async def _handle_duplicate_reply(
             reminder_1_at=reminder_1_at,
             reminder_2_at=reminder_2_at,
             other_items=other_items,
+            is_scheduled_event=is_scheduled_event,
         )
         if result.due_at_filled and result.due_at:
             resolved_fields = {**resolved_fields, "due_at": result.due_at}
@@ -856,7 +909,11 @@ async def _handle_duplicate_reply(
             return {"status": "clarifying", "item_id": str(item_id)}
 
         reply_text = _ensure_reminder_mention(
-            result.reply_text, reminder_1_at, resolved_fields.get("due_at"), effort_minutes
+            result.reply_text,
+            reminder_1_at,
+            resolved_fields.get("due_at"),
+            effort_minutes,
+            is_scheduled_event,
         )
         conn.execute(
             "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
@@ -884,7 +941,17 @@ async def _handle_duplicate_reply(
 
 
 async def _handle_confirmation_reply(
-    conn, user_id, item_id, phone, tz_name, title, item_type, summary, effort_minutes, latest_reply
+    conn,
+    user_id,
+    item_id,
+    phone,
+    tz_name,
+    title,
+    item_type,
+    summary,
+    effort_minutes,
+    is_scheduled_event,
+    latest_reply,
 ) -> dict:
     convo_row = conn.execute(
         "SELECT resolved_fields FROM conversations WHERE item_id = %s "
@@ -897,7 +964,9 @@ async def _handle_confirmation_reply(
     other_items = _other_items_context(conn, user_id, item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+    reminder_times = _compute_reminder_times(
+        resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+    )
     reminder_1_at = _format_reminder_time(reminder_times[0]) if reminder_times else None
     reminder_2_at = _format_reminder_time(reminder_times[1]) if reminder_times else None
     result = await converse(
@@ -917,6 +986,7 @@ async def _handle_confirmation_reply(
         reminder_1_at=reminder_1_at,
         reminder_2_at=reminder_2_at,
         other_items=other_items,
+        is_scheduled_event=is_scheduled_event,
     )
     if not result.relates_to_item:
         return _route_as_new_item(
@@ -925,7 +995,9 @@ async def _handle_confirmation_reply(
         )
 
     if result.intent == "AFFIRM":
-        reminder_times = _compute_reminder_times(resolved_fields.get("due_at"), effort_minutes)
+        reminder_times = _compute_reminder_times(
+            resolved_fields.get("due_at"), effort_minutes, is_scheduled_event
+        )
         confirmed = ConfirmedItemMessage(
             item_id=item_id,
             user_id=user_id,
@@ -1011,18 +1083,19 @@ async def reply(payload: RoutedReplyMessage):
             _req_t1 = time.monotonic()
             logger.info("TIMING /reply: get_connection=%.2fs", _req_t1 - _req_t0)
             item_row = conn.execute(
-                "SELECT type, title, summary, effort_minutes, state FROM items WHERE id = %s",
+                "SELECT type, title, summary, effort_minutes, is_scheduled_event, state "
+                "FROM items WHERE id = %s",
                 (str(payload.item_id),),
             ).fetchone()
             if item_row is None:
                 raise HTTPException(status_code=404, detail="unknown item_id")
-            item_type, title, summary, effort_minutes, state = item_row
+            item_type, title, summary, effort_minutes, is_scheduled_event, state = item_row
             phone, tz_name = _user_phone_and_timezone(conn, payload.user_id)
 
             if state == "DUPLICATE_SUSPECTED":
                 return await _handle_duplicate_reply(
                     conn, payload.user_id, payload.item_id, phone, tz_name, title, item_type,
-                    summary, effort_minutes, payload.text,
+                    summary, effort_minutes, is_scheduled_event, payload.text,
                 )
 
             if state == "CLARIFYING":
@@ -1036,6 +1109,7 @@ async def reply(payload: RoutedReplyMessage):
                     item_type,
                     summary,
                     effort_minutes,
+                    is_scheduled_event,
                     payload.text,
                 )
 
@@ -1050,6 +1124,7 @@ async def reply(payload: RoutedReplyMessage):
                     item_type,
                     summary,
                     effort_minutes,
+                    is_scheduled_event,
                     payload.text,
                 )
 
