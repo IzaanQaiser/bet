@@ -10,7 +10,7 @@ const DAYS = ["S", "M", "T", "W", "T", "F", "S"] as const;
 // to your calendar" legible instead of just claimed in a text bubble. The
 // icon's own brand colors are a deliberate exception to the zero-accent
 // rule (§8) — a real third-party mark, not a decorative accent.
-function GoogleCalendarIcon() {
+export function GoogleCalendarIcon() {
   return (
     <svg width="15" height="15" viewBox="0 0 36 36" aria-hidden="true">
       <path d="M26 4h4a2 2 0 0 1 2 2v4h-6V4z" fill="#4285F4" />

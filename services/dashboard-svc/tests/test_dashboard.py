@@ -162,7 +162,7 @@ def test_me_items_groups_by_state(client):
     now = datetime.now(UTC)
     mock_conn = _mock_connection()
 
-    committed_row = (item_b, "Committed thing", "summary", now, "cal-evt-1")
+    committed_row = (item_b, "Committed thing", "summary", now, "cal-evt-1", 60)
     cancelled_row = (item_c, "Cancelled thing", "CANCELLED", now)
     in_progress_row = (item_a, "In progress thing", "summary", "CLARIFYING", now)
 
@@ -191,6 +191,7 @@ def test_me_items_groups_by_state(client):
     assert body["in_progress"][0]["title"] == "In progress thing"
     assert len(body["committed"]) == 1
     assert body["committed"][0]["calendar_event_id"] == "cal-evt-1"
+    assert body["committed"][0]["effort_minutes"] == 60
     assert len(body["other"]) == 1
     assert body["other"][0]["state"] == "CANCELLED"
 

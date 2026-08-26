@@ -159,7 +159,7 @@ async def me_items(user_id: UUID = Depends(current_user_id)):
 
         committed_rows = conn.execute(
             """
-            SELECT i.id, i.title, i.summary, o.due_at, o.calendar_event_id
+            SELECT i.id, i.title, i.summary, o.due_at, o.calendar_event_id, i.effort_minutes
             FROM items i JOIN obligations o ON o.item_id = i.id
             WHERE i.user_id = %s AND i.state = 'COMMITTED'
             ORDER BY o.due_at DESC NULLS LAST
@@ -202,6 +202,7 @@ async def me_items(user_id: UUID = Depends(current_user_id)):
                 "summary": r[2],
                 "due_at": r[3].isoformat() if r[3] else None,
                 "calendar_event_id": r[4],
+                "effort_minutes": r[5],
             }
             for r in committed_rows
         ],
