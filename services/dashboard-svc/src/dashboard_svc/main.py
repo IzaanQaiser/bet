@@ -10,6 +10,7 @@ the per-caller row scoping below is the software half of that invariant,
 same as every other service in this project.
 """
 
+import logging
 import os
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -17,12 +18,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport.requests import AuthorizedSession
-from google.cloud import secretmanager
+from google.cloud import secretmanager, tasks_v2
 from google.oauth2.credentials import Credentials
 from obligation_engine_shared.db import get_connection
 from obligation_engine_shared.tokens import InvalidToken, mint_signed_token, verify_signed_token
 from pydantic import BaseModel
 from twilio.rest import Client as TwilioClient
+
+logger = logging.getLogger("dashboard_svc")
 
 app = FastAPI()
 
@@ -34,6 +37,13 @@ SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
 MESSAGES_DEFAULT_LIMIT = 50
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+
+# Same Cloud Tasks queue/OIDC-as-sa-dispatcher pattern committer-svc
+# already uses for reminders and per-idea next-fit — see capacity-
+# engine.md §6.1 for why a direct Cloud Task, not Pub/Sub, is the
+# deliberate exception here.
+TASKS_LOCATION = "us-central1"
+TASKS_QUEUE = "reminders"
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -305,6 +315,40 @@ class ProfileUpdateRequest(BaseModel):
     working_hours_end: str | None = None
 
 
+def _enqueue_next_fit_recompute(user_id: UUID) -> None:
+    """User-directed real bug fix: changing working hours previously left
+    every already-committed idea's next_fit_start stale until the next
+    twice-daily /dispatch sweep — a user who just widened their working
+    hours to fit an idea in today saw no change at all. Fires an
+    immediate (no schedule_time) Cloud Task at dispatcher-svc's
+    POST /users/{user_id}/next-fit, same reminders-queue/OIDC-as-
+    sa-dispatcher pattern committer-svc already uses. Best-effort, not
+    fatal to the profile save: a failed enqueue just means the stale
+    slots persist until the next sweep instead of updating within
+    seconds."""
+    try:
+        project_id = os.environ["GCP_PROJECT_ID"]
+        dispatcher_url = os.environ["DISPATCHER_SVC_URL"]
+        url = f"{dispatcher_url}/users/{user_id}/next-fit"
+        dispatcher_sa = f"sa-dispatcher@{project_id}.iam.gserviceaccount.com"
+        client = tasks_v2.CloudTasksClient()
+        parent = client.queue_path(project_id, TASKS_LOCATION, TASKS_QUEUE)
+        client.create_task(
+            parent=parent,
+            task={
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": url,
+                    "oidc_token": {"service_account_email": dispatcher_sa, "audience": url},
+                },
+            },
+        )
+    except Exception:
+        logger.exception(
+            "failed to enqueue next-fit recompute user_id=%s (stale until next sweep)", user_id
+        )
+
+
 @app.patch("/me/profile")
 async def me_profile_patch(
     payload: ProfileUpdateRequest, user_id: UUID = Depends(current_user_id)
@@ -332,6 +376,9 @@ async def me_profile_patch(
             (*fields.values(), str(user_id)),
         )
         conn.commit()
+
+    if "working_hours_start" in fields or "working_hours_end" in fields:
+        _enqueue_next_fit_recompute(user_id)
     return {"status": "ok"}
 
 

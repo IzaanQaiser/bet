@@ -327,3 +327,83 @@ def test_next_fit_unknown_item_returns_404(client):
     with patch("dispatcher_svc.main.get_connection", return_value=conn):
         resp = client.post(f"/latents/{uuid4()}/next-fit")
     assert resp.status_code == 404
+
+
+# --- POST /users/{user_id}/next-fit -------------------------------------
+# User-directed real bug fix: changing working hours on the dashboard
+# didn't recompute any already-committed idea's next_fit_start until the
+# next twice-daily sweep.
+
+
+def _mock_user_next_fit_connection(*, user_row, latent_rows, next_fit_updates):
+    def execute_side_effect(sql, params=None):
+        result = MagicMock()
+        if "FROM users WHERE id" in sql:
+            result.fetchone.return_value = user_row
+        elif "FROM latents l" in sql:
+            result.fetchall.return_value = latent_rows
+        elif "UPDATE latents SET next_fit_start" in sql:
+            next_fit_updates.append(params)
+        return result
+
+    conn = MagicMock()
+    conn.execute.side_effect = execute_side_effect
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    return conn
+
+
+def test_next_fit_for_user_recomputes_every_committed_latent(client):
+    user_id = uuid4()
+    user_row = (
+        "America/Toronto",
+        time(9, 0),
+        time(23, 0),
+        "projects/p/secrets/user-refresh-token-x/versions/latest",
+    )
+    latent_rows = [
+        (uuid4(), datetime(2026, 8, 1), 120, 0, None, None, False),
+        (uuid4(), datetime(2026, 8, 10), 240, 0, None, None, False),
+    ]
+    next_fit_updates = []
+    conn = _mock_user_next_fit_connection(
+        user_row=user_row, latent_rows=latent_rows, next_fit_updates=next_fit_updates
+    )
+    events_by_day = {date(2026, 8, 27): [], date(2026, 8, 28): []}
+
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main.user_credentials"),
+        patch("dispatcher_svc.main.AuthorizedSession"),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+    ):
+        resp = client.post(f"/users/{user_id}/next-fit")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["latents_updated"] == 2
+    assert len(next_fit_updates) == 2
+
+
+def test_next_fit_for_user_skips_with_no_linked_google_account(client):
+    user_id = uuid4()
+    user_row = ("America/Toronto", time(9, 0), time(18, 0), None)
+    conn = _mock_user_next_fit_connection(user_row=user_row, latent_rows=[], next_fit_updates=[])
+
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main.fetch_events_for_range") as mock_fetch,
+    ):
+        resp = client.post(f"/users/{user_id}/next-fit")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "skipped_no_google_account"
+    mock_fetch.assert_not_called()
+
+
+def test_next_fit_for_user_unknown_user_returns_404(client):
+    conn = _mock_user_next_fit_connection(user_row=None, latent_rows=[], next_fit_updates=[])
+    with patch("dispatcher_svc.main.get_connection", return_value=conn):
+        resp = client.post(f"/users/{uuid4()}/next-fit")
+    assert resp.status_code == 404

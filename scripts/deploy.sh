@@ -422,13 +422,24 @@ case "$SERVICE" in
     # refresh that token today. Only the original bootstrap-script demo
     # user exists right now, so this isn't hit in practice yet — revisit
     # once a real Phase-4-registered user needs this endpoint.
+    # DISPATCHER_SVC_URL: PATCH /me/profile enqueues a Cloud Task at
+    # dispatcher-svc's POST /users/{user_id}/next-fit whenever working
+    # hours change (real gap, found live — a stale next_fit_start
+    # otherwise persisted until the next twice-daily sweep). Same
+    # committer-svc-pattern Cloud Tasks queue/IAM (sa-dashboard needs
+    # cloudtasks.enqueuer on "reminders" plus iam.serviceAccountUser on
+    # sa-dispatcher), provisioned once by hand — see docs/product/status.md.
+    DISPATCHER_SVC_URL=$(gcloud run services describe dispatcher-svc \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
     gcloud run deploy "$SERVICE" \
       --project="$PROJECT_ID" \
       --region="$REGION" \
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-dashboard@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}" \
+      --set-env-vars="DB_USER=sa-dashboard@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=${WEB_ORIGIN},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},DISPATCHER_SVC_URL=${DISPATCHER_SVC_URL}" \
       --set-secrets="TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest,TWILIO_VERIFY_SERVICE_SID=twilio-verify-service-sid:latest,WEB_SESSION_SIGNING_KEY=web-session-signing-key:latest,GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest" \
       --min-instances=0 \
       --allow-unauthenticated \

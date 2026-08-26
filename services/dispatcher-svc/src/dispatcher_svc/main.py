@@ -493,6 +493,59 @@ async def compute_next_fit(item_id: UUID):
     }
 
 
+@app.post("/users/{user_id}/next-fit")
+async def compute_next_fit_for_user(user_id: UUID):
+    """User-directed real bug fix (follow-up to the single-idea version
+    above): changing working hours on the dashboard didn't recompute any
+    existing committed idea's next_fit_start — a stale slot from before
+    the change stuck around until the next twice-daily sweep. dashboard-
+    svc's PATCH /me/profile now enqueues an immediate Cloud Task at this
+    endpoint whenever working_hours_start/working_hours_end actually
+    changes, same reminders-queue/OIDC-as-sa-dispatcher pattern as
+    everything else here. Recomputes every committed latent for this one
+    user in a single Calendar read (_eligible_latents already returns
+    every committed latent unfiltered, same as the /dispatch sweep uses)
+    — same no-snapshot-write scoping as /latents/{item_id}/next-fit, for
+    the same NOT-NULL-load_delta reason."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT timezone, working_hours_start, working_hours_end, google_refresh_token_ref "
+            "FROM users WHERE id = %s",
+            (str(user_id),),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown user_id")
+    tz_name, wh_start, wh_end, refresh_ref = row
+
+    if refresh_ref is None:
+        logger.info(
+            "user_id=%s has no linked Google account, skipping next-fit recompute", user_id
+        )
+        return {"status": "skipped_no_google_account", "user_id": str(user_id)}
+
+    tz = ZoneInfo(tz_name)
+    now_utc = datetime.now(UTC)
+    today = now_utc.astimezone(tz).date()
+    now_local = now_utc.astimezone(tz)
+    forward_end = today + timedelta(days=FORWARD_DAYS - 1)
+
+    session = AuthorizedSession(user_credentials(refresh_ref))
+    forward_events = fetch_events_for_range(session, today, forward_end, tz_name)
+
+    day_context = {}
+    for d in sorted(forward_events):
+        day_wh_start = _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+        day_context[d] = _compute_day(forward_events[d], d, day_wh_start, wh_end, None)
+
+    with get_connection() as conn:
+        latents = _eligible_latents(conn, user_id, tz)
+        _update_next_fit_slots(conn, latents, day_context, tz)
+        conn.commit()
+
+    logger.info("recomputed next_fit_start for %d latent(s) user_id=%s", len(latents), user_id)
+    return {"status": "ok", "user_id": str(user_id), "latents_updated": len(latents)}
+
+
 @app.post("/dispatch/reminders")
 async def dispatch_reminders():
     """SAFETY-NET FALLBACK, not the primary reminder mechanism — see
