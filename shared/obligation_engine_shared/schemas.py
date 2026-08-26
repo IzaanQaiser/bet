@@ -62,6 +62,13 @@ class ExtractedItemMessage(BaseModel):
     due_at: datetime | None = None
     effort_minutes: Literal[15, 30, 60, 120, 240] | None = None
     focus_depth: Literal["shallow", "deep"] | None = None
+    # A task with a completion deadline ("assignment due at 6pm" — remind
+    # strictly before it, never at it) vs. a scheduled event you attend at
+    # a specific time ("meeting at 8:39pm" — the reminder that matters
+    # most is the one AT that time). Defaults false: every ambiguous case
+    # keeps the deadline-style behavior, only a real "attend this" signal
+    # opts into event-style reminders.
+    is_scheduled_event: bool = False
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     missing_fields: list[str] = Field(default_factory=list)
     reasoning: str = ""  # log-only, never shown to the user

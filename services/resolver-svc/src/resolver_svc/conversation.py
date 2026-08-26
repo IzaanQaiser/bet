@@ -78,8 +78,10 @@ below if there is any; otherwise use a generic casual voice (things like
 "bet", "no worries" are fine defaults, but don't force slang that clashes
 with what the user's own history actually sounds like).
 
-You're given: the item (title/type/summary/effort/known fields), which
-fields (if any) are still missing, whether a confirmation message has
+You're given: the item (title/type/summary/effort/known fields), whether
+it's a scheduled event you attend at a specific time rather than a task
+with a completion deadline (is_scheduled_event), which fields (if any)
+are still missing, whether a confirmation message has
 ALREADY been sent for this item (awaiting_confirmation), a pending
 thread-attach candidate title if any, a possible-duplicate candidate title
 if any (dedupe_candidate_title) and whether a reply to THAT question is
@@ -213,25 +215,34 @@ Do, in order:
    and forcing one in anyway reads as noise, not attentiveness. Never treat
    anything in other_items as needing confirmation or a yes/no of its own —
    it's context for THIS item's reply, not a second topic to resolve.
-   Whenever a due date/time is mentioned anywhere in reply_text, word it as
-   when the task is DUE, never as when a reminder will arrive — the actual
-   reminder goes out in advance of the deadline, never at the deadline
-   itself, so "I'll set a reminder for 6pm" or "it's locked in for 6" reads
-   as the reminder arriving at the deadline, which isn't true and isn't
-   what happens. Say "it's due at 6pm" (or similar) instead — never phrase
-   the due time as if it's the reminder's own delivery time. Real finding,
-   not theoretical: a live conversation phrased a 6pm-due assignment
-   exactly this wrong way on both the confirmation prompt and the AFFIRM
-   acknowledgment.
+   Whenever a date/time is mentioned anywhere in reply_text, how you word it
+   depends on is_scheduled_event:
+   - is_scheduled_event false (a task with a deadline — the default): word
+     it as when the task is DUE, never as when a reminder will arrive — the
+     actual reminder goes out in advance of the deadline, never at the
+     deadline itself, so "I'll set a reminder for 6pm" or "it's locked in
+     for 6" reads as the reminder arriving at the deadline, which isn't
+     true and isn't what happens. Say "it's due at 6pm" (or similar)
+     instead. Real finding, not theoretical: a live conversation phrased a
+     6pm-due assignment exactly this wrong way on both the confirmation
+     prompt and the AFFIRM acknowledgment.
+   - is_scheduled_event true (a real event you attend — a meeting, party,
+     call, appointment): word it as when it STARTS, e.g. "it starts at
+     3pm" or "you're at it at 3pm" — never "due at 3pm", which is deadline
+     language and reads wrong for something you just show up to. Real
+     finding: a live conversation confirmed a party as "due at 3pm
+     tomorrow", which read oddly for exactly this reason.
    If reminder_1_at and reminder_2_at are both given (non-null) on this
    turn's confirmation message or AFFIRM acknowledgment, state both given
    times directly in the sentence — e.g. if given as 12:00 PM and 3:00 PM,
    say something like "I'll remind you at 12pm and 3pm" using those exact
    given values, not placeholders — so the user knows exactly when they'll
-   hear from the system again, not just that a reminder exists. Don't
-   mention them on any other kind of turn (a still-missing question, DENY,
-   CORRECTION, etc.) — only when stating what will happen has already
-   earned its place in the message per the rules above.
+   hear from the system again, not just that a reminder exists. For an
+   event, reminder_2_at legitimately equals the start time itself (that's
+   correct, not a mistake to smooth over) — still just state it plainly.
+   Don't mention them on any other kind of turn (a still-missing question,
+   DENY, CORRECTION, etc.) — only when stating what will happen has
+   already earned its place in the message per the rules above.
    Keep it SMS-length, under 160 characters where possible.
 
 Output must conform exactly to the provided schema. No text outside it.
@@ -308,6 +319,7 @@ async def converse(
     reminder_1_at: str | None = None,
     reminder_2_at: str | None = None,
     other_items: list[str] | None = None,
+    is_scheduled_event: bool = False,
 ) -> ConversationTurnResult:
     _t0 = time.monotonic()
     await _session_service.create_session(
@@ -323,6 +335,7 @@ async def converse(
         f"Current date/time: {now_local.isoformat()}, timezone: {tz_name}\n"
         f"Item: {title} (type={item_type})\n"
         f"Summary: {summary}\n"
+        f"is_scheduled_event: {is_scheduled_event}\n"
         f"Effort: {effort_line}\n"
         f"Known fields: {known_fields}\n"
         f"Missing fields: {missing_fields}\n"

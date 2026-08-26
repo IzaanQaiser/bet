@@ -115,15 +115,27 @@ def _user_credentials(user_id, scope: str) -> tuple[Credentials, str]:
     return creds, timezone
 
 
+def _localize(dt, timezone: str):
+    """Gemini may reason in local terms with no UTC offset attached — a
+    naive datetime is the user's local time, not UTC (agent-contracts.md
+    §1's "Resolved gap" note). Attach the zone, don't convert into it.
+    Real bug, found live: this attachment only ever happened for the
+    Calendar API payload — the DB INSERT below used the still-naive
+    original value straight into a `timestamptz` column, which Postgres
+    then silently interpreted using the connection's own session timezone
+    (UTC), storing "21:00 local" as if it meant "21:00 UTC" — a real
+    committed item's stored due_at, reminder_1_at, and reminder_2_at were
+    all off by the user's UTC offset (4 hours, reported live as a 9pm
+    meeting showing as 5pm on the dashboard). The real Calendar event
+    itself was never affected — only this DB-side gap."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=ZoneInfo(timezone))
+    return dt
+
+
 def _write_calendar_event(
-    confirmed: ConfirmedItemMessage, timezone: str, creds: Credentials
+    confirmed: ConfirmedItemMessage, timezone: str, creds: Credentials, due_at
 ) -> str:
-    due_at = confirmed.due_at
-    if due_at.tzinfo is None:
-        # Gemini may reason in local terms with no UTC offset attached — a
-        # naive due_at is the user's local time, not UTC (agent-contracts.md
-        # §1's "Resolved gap" note). Attach the zone, don't convert into it.
-        due_at = due_at.replace(tzinfo=ZoneInfo(timezone))
     end_at = due_at + timedelta(minutes=confirmed.effort_minutes)
 
     session = AuthorizedSession(creds)
@@ -159,7 +171,10 @@ def _send_email(confirmed: ConfirmedItemMessage, creds: Credentials) -> None:
 def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
     if confirmed.action_type == "calendar":
         creds, timezone = _user_credentials(confirmed.user_id, CALENDAR_SCOPE)
-        calendar_event_id = _write_calendar_event(confirmed, timezone, creds)
+        due_at = _localize(confirmed.due_at, timezone)
+        reminder_1_at = _localize(confirmed.reminder_1_at, timezone)
+        reminder_2_at = _localize(confirmed.reminder_2_at, timezone)
+        calendar_event_id = _write_calendar_event(confirmed, timezone, creds, due_at)
 
         with get_connection() as conn:
             conn.execute(
@@ -170,11 +185,11 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
                 """,
                 (
                     str(confirmed.item_id),
-                    confirmed.due_at,
+                    due_at,
                     calendar_event_id,
                     confirmed.action_type,
-                    confirmed.reminder_1_at,
-                    confirmed.reminder_2_at,
+                    reminder_1_at,
+                    reminder_2_at,
                 ),
             )
             conn.execute(
@@ -193,8 +208,9 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
             raise RuntimeError(
                 f"action_type=email missing email_recipient/email_draft item_id={confirmed.item_id}"
             )
-        creds, _timezone = _user_credentials(confirmed.user_id, GMAIL_SCOPE)
+        creds, timezone = _user_credentials(confirmed.user_id, GMAIL_SCOPE)
         _send_email(confirmed, creds)
+        due_at = _localize(confirmed.due_at, timezone)
 
         with get_connection() as conn:
             conn.execute(
@@ -204,7 +220,7 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
                 """,
                 (
                     str(confirmed.item_id),
-                    confirmed.due_at,
+                    due_at,
                     confirmed.action_type,
                     confirmed.email_draft,
                 ),

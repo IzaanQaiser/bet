@@ -226,7 +226,7 @@ def test_unrelated_reply_during_clarification_routes_as_new_item(client):
     like a first-contact message."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent, deadline unclear.", 15, "CLARIFYING"),
+        item_row=("obligation", "Pay rent", "Pay rent, deadline unclear.", 15, False, "CLARIFYING"),
         conversation_row=(["due_at"], {}, 0),
     )
     with (
@@ -269,7 +269,9 @@ def test_unrelated_reply_during_confirmation_routes_as_new_item(client):
     classification (and, critically, must never be misread as an AFFIRM)."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "AWAITING_CONFIRMATION"
+        ),
         conversation_row=({"due_at": "2026-09-04T14:00:00"},),
     )
     with (
@@ -373,7 +375,9 @@ def test_stuck_state_with_no_conversation_is_not_swallowed(client):
 def test_y_reply_publishes_confirmed_and_marks_confirmed(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "AWAITING_CONFIRMATION"
+        ),
         conversation_row=({"due_at": "2026-09-04T14:00:00", "action_type": "calendar"},),
     )
     with (
@@ -404,7 +408,7 @@ def test_y_reply_publishes_confirmed_and_marks_confirmed(client):
 def test_n_reply_cancels_no_publish(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("latent", "Learn pottery", "Someday.", 120, "AWAITING_CONFIRMATION")
+        item_row=("latent", "Learn pottery", "Someday.", 120, False, "AWAITING_CONFIRMATION")
     )
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
@@ -433,7 +437,9 @@ def test_other_reply_during_confirmation_gets_a_natural_clarifying_reply(client)
     "what do you mean" reply; still no write, no state change."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION")
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "AWAITING_CONFIRMATION"
+        )
     )
     with (
         patch("resolver_svc.main.get_connection", return_value=conn),
@@ -465,7 +471,9 @@ def test_correction_reply_never_auto_publishes(client):
     turn is ever allowed to publish to items.confirmed (ADR 0003)."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "AWAITING_CONFIRMATION"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "AWAITING_CONFIRMATION"
+        ),
         conversation_row=({"due_at": "2026-09-04T14:00:00", "action_type": "calendar"},),
     )
     with (
@@ -512,7 +520,7 @@ def test_reply_unknown_item_returns_404(client):
 def test_reply_unexpected_state_does_not_crash(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "COMMITTED")
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, False, "COMMITTED")
     )
     with patch("resolver_svc.main.get_connection", return_value=conn):
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "y"})
@@ -632,7 +640,9 @@ def test_duplicate_y_reply_merges_no_publish(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     match_item_id = str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "DUPLICATE_SUSPECTED"
+        ),
         conversation_row=(
             None,
             {"_dedupe_match_item_id": match_item_id, "_dedupe_match_title": "Pay rent"},
@@ -669,7 +679,9 @@ def test_duplicate_y_reply_merges_no_publish(client):
 def test_duplicate_n_reply_no_missing_fields_awaits_confirmation(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "DUPLICATE_SUSPECTED"
+        ),
         conversation_row=(
             [],
             {"due_at": "2026-09-04T14:00:00", "_dedupe_match_item_id": str(uuid4())},
@@ -706,7 +718,9 @@ def test_duplicate_reply_unrelated_routes_as_new_item(client):
     leaves the pending dedupe question alone and becomes its own new item."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "DUPLICATE_SUSPECTED"
+        ),
         conversation_row=(
             [],
             {"_dedupe_match_item_id": str(uuid4()), "_dedupe_match_title": "Pay rent"},
@@ -744,7 +758,9 @@ def test_duplicate_reply_ambiguous_gets_natural_clarifying_reply(client):
     guess at Y/N."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "DUPLICATE_SUSPECTED"
+        ),
         conversation_row=(
             [],
             {"_dedupe_match_item_id": str(uuid4()), "_dedupe_match_title": "Pay rent"},
@@ -776,7 +792,9 @@ def test_duplicate_reply_ambiguous_gets_natural_clarifying_reply(client):
 def test_duplicate_n_reply_with_missing_fields_resumes_clarification(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 15, "DUPLICATE_SUSPECTED"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "DUPLICATE_SUSPECTED"
+        ),
         conversation_row=(["due_at"], {"_dedupe_match_item_id": str(uuid4())}),
     )
     with (
@@ -809,7 +827,7 @@ def test_attach_reply_sets_parent_item_id(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     target_id = str(uuid4())
     conn = _mock_connection(
-        item_row=("latent", "Learn pottery", "Someday.", 120, "AWAITING_CONFIRMATION"),
+        item_row=("latent", "Learn pottery", "Someday.", 120, False, "AWAITING_CONFIRMATION"),
         conversation_row=(
             {"_thread_attach_item_id": target_id, "_thread_attach_title": "Take a ceramics class"},
         ),
@@ -840,7 +858,7 @@ def test_attach_reply_with_no_candidate_is_unhandled(client):
     than staying silent."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("latent", "Learn pottery", "Someday.", 120, "AWAITING_CONFIRMATION"),
+        item_row=("latent", "Learn pottery", "Someday.", 120, False, "AWAITING_CONFIRMATION"),
         conversation_row=({},),
     )
     with (
@@ -875,6 +893,28 @@ def test_compute_reminder_times_none_when_either_input_missing():
 
     assert _compute_reminder_times(None, 60) is None
     assert _compute_reminder_times("2026-09-04T18:00:00", None) is None
+
+
+def test_compute_reminder_times_event_reminds_at_start_not_before():
+    """Real bug, found live: a meeting used the task-shaped formula and
+    never got reminded at its own start time. An event gets a heads-up
+    before start AND a reminder AT the actual start — the second value
+    equals due_at itself, on purpose."""
+    from resolver_svc.main import _compute_reminder_times
+
+    times = _compute_reminder_times("2026-08-25T20:39:00", 30, is_scheduled_event=True)
+    assert times == (datetime(2026, 8, 25, 20, 9), datetime(2026, 8, 25, 20, 39))
+
+
+def test_compute_reminder_times_task_never_reminds_at_due_at():
+    """Regression guard for the earlier, opposite complaint: a task must
+    never get reminded at its own deadline — both reminders strictly
+    precede due_at."""
+    from resolver_svc.main import _compute_reminder_times
+
+    times = _compute_reminder_times("2026-08-25T20:39:00", 30, is_scheduled_event=False)
+    assert times[0] < datetime(2026, 8, 25, 20, 39)
+    assert times[1] < datetime(2026, 8, 25, 20, 39)
 
 
 def test_ensure_reminder_mention_noop_when_already_passed():
@@ -940,7 +980,7 @@ def test_effort_minutes_reply_persists_and_states_reminder_times(client):
     them, not the LLM."""
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", None, "CLARIFYING"),
+        item_row=("obligation", "Pay rent", "Pay rent by Friday.", None, False, "CLARIFYING"),
         conversation_row=(
             ["effort_minutes"],
             {"due_at": "2026-09-04T18:00:00", "action_type": "calendar"},
@@ -983,7 +1023,9 @@ def test_effort_minutes_reply_persists_and_states_reminder_times(client):
 def test_affirm_publishes_reminder_times_on_confirmed_item(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", 120, "AWAITING_CONFIRMATION"),
+        item_row=(
+            "obligation", "Pay rent", "Pay rent by Friday.", 120, False, "AWAITING_CONFIRMATION"
+        ),
         conversation_row=(
             {"due_at": "2026-09-04T18:00:00", "action_type": "calendar"},
         ),

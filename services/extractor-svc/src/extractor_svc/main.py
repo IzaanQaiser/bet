@@ -57,6 +57,7 @@ class _ExtractionResult(BaseModel):
     due_at: str | None = None
     effort_minutes: Literal["15", "30", "60", "120", "240"] | None = None
     focus_depth: Literal["shallow", "deep"] | None = None
+    is_scheduled_event: bool = False
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     missing_fields: list[str] = Field(default_factory=list)
     reasoning: str = ""
@@ -114,6 +115,17 @@ Rules:
   concentration (writing, coding, focused analysis); "shallow" if it can be
   done in short pieces or is administrative/low-cognitive-load (a phone
   call, filling a form, paying a bill).
+- is_scheduled_event is true ONLY for a real "attend this at a specific
+  time" obligation — a meeting, a party, a call, an appointment, "go to
+  X" — where due_at is when it STARTS, not a deadline you work toward.
+  Default false for everything else, including any task with a real
+  completion deadline (an assignment, a submission, a payment, "finish
+  X by Y") — false is the safe default whenever it's ambiguous which kind
+  of thing this is. This distinction matters downstream: a deadline gets
+  reminded before it, never at it (there'd be no time left); an event
+  gets reminded before AND at its start time (that's the whole point of a
+  meeting reminder). Getting this wrong in either direction produces a
+  reminder at exactly the wrong moment.
 - confidence reflects your overall certainty about the classification and
   fields, not any single field in isolation.
 - reasoning is one sentence explaining the classification, for logs only —
@@ -233,6 +245,7 @@ async def pubsub_push(request: Request):
         due_at=result.due_at,
         effort_minutes=int(result.effort_minutes) if result.effort_minutes else None,
         focus_depth=result.focus_depth,
+        is_scheduled_event=result.is_scheduled_event,
         confidence=result.confidence,
         missing_fields=result.missing_fields,
         reasoning=result.reasoning,

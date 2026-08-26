@@ -47,6 +47,22 @@ def render_reminder_final(title: str, due_at: datetime, effort_minutes: int, tod
     )
 
 
+def render_event_reminder_early(title: str, due_at: datetime, today: date) -> str:
+    """Fires at due_at - effort — a heads-up before a scheduled event
+    (meeting/party/call/appointment) starts. No "block off time"
+    framing — that's task language, wrong for something you just attend."""
+    return (
+        f"⏰ heads up — {title} starts {relative_due_description(due_at.date(), today)}, "
+        f"{format_due_at(due_at)}."
+    )
+
+
+def render_event_reminder_start(title: str, due_at: datetime, today: date) -> str:
+    """Fires AT due_at — the reminder a task deliberately never gets, and
+    a scheduled event deliberately does: it's happening right now."""
+    return f"⏰ {title} is starting now — {format_due_at(due_at)}."
+
+
 def _time_of_day_phrase(block_start_hour: int) -> str:
     if block_start_hour < 12:
         return "in the morning"

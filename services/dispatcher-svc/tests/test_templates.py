@@ -6,6 +6,8 @@ from datetime import date, datetime
 from dispatcher_svc.templates import (
     evidence_line,
     relative_due_description,
+    render_event_reminder_early,
+    render_event_reminder_start,
     render_reminder_early,
     render_reminder_final,
     render_suggestion,
@@ -36,6 +38,18 @@ def test_render_reminder_final_exact_format():
         "⏰ last call — Pay rent is due today, Fri 4 Sep, 2:00 PM.\n"
         "About 1h 30min left if you start now."
     )
+
+
+def test_render_event_reminder_early_exact_format():
+    due = datetime(2026, 8, 25, 20, 39)
+    body = render_event_reminder_early("Meeting", due, today=date(2026, 8, 25))
+    assert body == "⏰ heads up — Meeting starts today, Tue 25 Aug, 8:39 PM."
+
+
+def test_render_event_reminder_start_exact_format():
+    due = datetime(2026, 8, 25, 20, 39)
+    body = render_event_reminder_start("Meeting", due, today=date(2026, 8, 25))
+    assert body == "⏰ Meeting is starting now — Tue 25 Aug, 8:39 PM."
 
 
 def test_suggestion_text_superlative_branch():

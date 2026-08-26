@@ -5,6 +5,7 @@ import base64
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -106,6 +107,36 @@ def test_obligation_branch_calls_calendar_write(client):
     assert update_params == (confirmed.type, str(confirmed.item_id))
 
 
+def test_calendar_branch_localizes_due_at_before_insert(client):
+    """Real bug, found live: a naive due_at (Gemini reasons in local terms,
+    no UTC offset attached, per agent-contracts.md §1) used to go straight
+    into the obligations INSERT unchanged — Postgres then silently
+    interpreted it as UTC on the timestamptz column, storing "9pm local"
+    as if it meant "9pm UTC". A real committed 9pm meeting showed as 5pm
+    on the dashboard (America/Toronto is UTC-4 in August) even though the
+    real Calendar event — a separate write, already correctly localized —
+    was fine. due_at must carry the user's real timezone before the INSERT,
+    same as it already did for the Calendar API payload."""
+    confirmed = _confirmed_message(due_at=datetime(2026, 8, 28, 14, 0))
+    conn = _mock_connection(
+        user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
+    )
+    calendar_response = MagicMock()
+    calendar_response.json.return_value = {"id": "gcal-event-123"}
+
+    with (
+        patch("committer_svc.main.get_connection", return_value=conn),
+        patch("committer_svc.main._secret_client", return_value=_mock_secret_client()),
+        patch("committer_svc.main.AuthorizedSession") as mock_session_cls,
+    ):
+        mock_session_cls.return_value.post.return_value = calendar_response
+        resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
+
+    assert resp.status_code == 200
+    _insert_sql, insert_params = conn.execute.call_args_list[2][0]
+    assert insert_params[1] == datetime(2026, 8, 28, 14, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+
 def test_calendar_branch_persists_reminder_times(client):
     confirmed = _confirmed_message(
         reminder_1_at=datetime(2026, 8, 28, 10, 0),
@@ -129,8 +160,13 @@ def test_calendar_branch_persists_reminder_times(client):
     insert_sql, insert_params = conn.execute.call_args_list[2][0]
     assert "reminder_1_at" in insert_sql
     assert "reminder_2_at" in insert_sql
-    assert insert_params[4] == datetime(2026, 8, 28, 10, 0)
-    assert insert_params[5] == datetime(2026, 8, 28, 12, 0)
+    # Real bug, found live: these used to be inserted still-naive, which
+    # Postgres then silently interpreted as UTC on a timestamptz column —
+    # a real committed item's reminder times (and due_at) landed hours off
+    # from what the user actually said. Must be tz-aware before the INSERT.
+    tz = ZoneInfo("America/Los_Angeles")
+    assert insert_params[4] == datetime(2026, 8, 28, 10, 0, tzinfo=tz)
+    assert insert_params[5] == datetime(2026, 8, 28, 12, 0, tzinfo=tz)
 
 
 def test_latent_branch_does_not_call_calendar(client):

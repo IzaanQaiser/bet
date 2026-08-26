@@ -64,7 +64,7 @@ def test_reminder_not_resent_if_already_sent():
 
 def test_early_reminder_sent_marks_reminder_1_sent_at():
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_reminder_connection(early_rows=[("item-1", "Pay rent", due_at, 120)])
+    conn = _mock_reminder_connection(early_rows=[("item-1", "Pay rent", due_at, 120, False)])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 1
@@ -82,7 +82,7 @@ def test_early_reminder_sent_marks_reminder_1_sent_at():
 
 def test_final_reminder_sent_marks_reminder_2_sent_at():
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_reminder_connection(final_rows=[("item-1", "Pay rent", due_at, 120)])
+    conn = _mock_reminder_connection(final_rows=[("item-1", "Pay rent", due_at, 120, False)])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 1
@@ -96,14 +96,33 @@ def test_final_reminder_sent_marks_reminder_2_sent_at():
     assert update_calls[0].args[1] == ("item-1",)
 
 
+def test_scheduled_event_gets_event_templates_not_task_templates():
+    """Real bug, found live: a meeting used the task-shaped templates
+    ("last call... start now") and never got reminded at its own start
+    time. is_scheduled_event routes both reminder slots to the event
+    templates instead."""
+    due_at = datetime(2026, 8, 25, 20, 39, tzinfo=UTC)
+    conn = _mock_reminder_connection(
+        early_rows=[("item-1", "Meeting", due_at, 30, True)],
+        final_rows=[("item-1", "Meeting", due_at, 30, True)],
+    )
+    with patch("dispatcher_svc.main._send_sms") as mock_sms:
+        sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
+    assert sent == 2
+    bodies = [c.kwargs["body"] for c in mock_sms.call_args_list]
+    assert any("starts" in b for b in bodies)
+    assert any("starting now" in b for b in bodies)
+    assert not any("last call" in b or "Block off" in b for b in bodies)
+
+
 def test_both_reminders_can_fire_in_the_same_run():
     """An obligation due soon enough can have both thresholds already
     passed by the time a /dispatch run finds it — same forgiving "better
     late than never" semantics the old single reminder always had."""
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
     conn = _mock_reminder_connection(
-        early_rows=[("item-1", "Pay rent", due_at, 120)],
-        final_rows=[("item-1", "Pay rent", due_at, 120)],
+        early_rows=[("item-1", "Pay rent", due_at, 120, False)],
+        final_rows=[("item-1", "Pay rent", due_at, 120, False)],
     )
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
