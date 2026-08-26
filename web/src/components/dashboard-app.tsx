@@ -306,25 +306,26 @@ export function DashboardApp() {
           status: shortDate(row.due_at, timeZone),
           visible: true,
           glow: false,
-          // "retrieved" (struck through) means the deadline has actually
-          // passed, not merely that the item is confirmed/scheduled — an
-          // absolute-instant comparison, so no timezone conversion needed
-          // here the way display formatting requires. An item with no
-          // due_at (a latent, an email action) has nothing to wait out.
-          retrieved: row.due_at ? new Date(row.due_at) <= new Date() : true,
+          // Deliberately never struck through here: "past due" depends on
+          // comparing against due_at, and a real committer-svc bug (naive
+          // local times landing in the DB uninterpreted, silently off by
+          // the user's UTC offset) means stored due_at can't be trusted
+          // for this comparison yet. Off until that's actually fixed and
+          // deployed, rather than showing a confidently wrong strikethrough.
+          retrieved: false,
         })),
       ]
     : [];
 
   return (
     <>
-      <div className="mb-8 flex items-baseline justify-between">
+      <div className="mb-8 flex items-baseline justify-between gap-6">
         <h1 className="font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
           What bet&apos;s tracking.
         </h1>
         <button
           onClick={logout}
-          className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground hover:text-foreground"
+          className="shrink-0 font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground hover:text-foreground"
         >
           Log out
         </button>
