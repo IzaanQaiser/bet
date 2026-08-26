@@ -93,7 +93,7 @@ def block_fit(largest_contiguous_block: int, effort_minutes: int) -> int:
 
 Every committed, non-dormant latent gets a real, tagged `[idea] {title}` event written to the user's **main** Google Calendar at its own `next_fit_start` — the earliest day/time in the next 7 whose `largest_contiguous_block` clears `block_fit` for that item's `effort_minutes`. At the exact instant that slot arrives, the user is texted; **Y** promotes the same placeholder event in place (tag removed, real event); **N**/**Later** clears it and reschedules to the next available slot. There is no scoring, no threshold, no "at most one per run" — every eligible idea gets its own slot and its own text, independently.
 
-### 5.1 `_next_fitting_slot` — per-item, self-excluding
+### 5.1 `_next_fitting_slot` — per-item, self-excluding, earliest-fitting
 
 ```python
 def _next_fitting_slot(forward_events, tz, wh_start, wh_end, now_local, today,
@@ -101,13 +101,15 @@ def _next_fitting_slot(forward_events, tz, wh_start, wh_end, now_local, today,
     for d in sorted(forward_events):
         day_wh_start = buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
         intervals = free_intervals(d, forward_events[d], day_wh_start, wh_end, exclude_event_id)
-        largest = max(intervals, key=duration, default=None)
-        if largest is not None and block_fit(largest_duration, effort_minutes):
-            return datetime.combine(d, largest.start, tzinfo=tz)
+        for interval in intervals:  # already chronological — first fit wins
+            if block_fit(interval_duration, effort_minutes):
+                return datetime.combine(d, interval.start, tzinfo=tz)
     return None
 ```
 
 `exclude_event_id` is the self-exclusion fix: an item's own existing placeholder is a real Calendar event, so without excluding it by id, recomputing that same item's slot would see its own placeholder as busy and needlessly evict itself every time it's recomputed. Every *other* item's placeholder is deliberately left in `forward_events` and still counts as busy — this is the entire mechanism behind a declined idea landing after every already-scheduled one (§5.3), with no cross-item cascade or reflow bookkeeping required.
+
+**Real bug, found live, days after this shipped:** the first version picked the day's *largest* free interval (`max(intervals, key=duration)`), not its *earliest fitting* one. A user's real 2-hour idea got scheduled into a 3-hour gap at 8pm instead of the 2h36m gap at 5pm that already comfortably fit it, purely because 8pm's gap happened to be bigger. `free_intervals` already returns intervals in chronological order (built by walking busy time forward), so "earliest fitting" is just "first interval in the list whose duration clears `block_fit`" — no re-sort needed, and no reason it should ever have picked anything else. `_accept_suggestion` (§5.4) had the identical bug on the Y-path, which was worse: it could silently commit the real obligation to a different time than what the fire-time text actually said, if some other part of the day had a bigger gap than the one just accepted. Fixed there too — try the earliest interval that fits the *original* `effort_minutes` first; only fall back to "whatever's biggest, capped down" (the pre-existing, still-correct "never refuse an explicit Y" behavior) when nothing on the day fully fits.
 
 ### 5.2 The write-boundary problem, and how it's resolved
 

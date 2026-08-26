@@ -299,22 +299,29 @@ def _next_fitting_slot(
     forward_events: dict, tz, wh_start, wh_end, now_local, today, effort_minutes: int,
     exclude_event_id: str | None,
 ) -> datetime | None:
-    """The earliest day in the given window whose largest free block
-    physically fits this item, excluding this same item's own current
-    placeholder from what counts as busy (capacity-engine.md §5's
-    self-exclusion note — every *other* item's placeholder is left in,
-    which is what makes a declined idea naturally land after every
-    already-scheduled one). None when nothing in the window fits."""
+    """The earliest day in the given window, and the earliest free
+    interval *within* that day, whose duration physically fits this item
+    — not the day's largest free interval, which can start much later
+    than an earlier, smaller-but-still-sufficient one (real bug, found
+    live: a 2h idea got scheduled into a 3h gap at 8pm instead of the
+    2h36m gap at 5pm that already comfortably fit it, because the old
+    version picked whichever interval was biggest, not whichever was
+    soonest). `free_intervals` already returns intervals in chronological
+    order (built by walking busy time forward), so within a day this is
+    just "first one that fits," no extra sort needed. Excludes this same
+    item's own current placeholder from what counts as busy
+    (capacity-engine.md §5's self-exclusion note — every *other* item's
+    placeholder is left in, which is what makes a declined idea naturally
+    land after every already-scheduled one). None when nothing in the
+    window fits."""
     for d in sorted(forward_events):
         day_wh_start = _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
         intervals = free_intervals(
             d, forward_events[d], day_wh_start, wh_end, exclude_event_id=exclude_event_id
         )
-        largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
-        if largest is None:
-            continue
-        if block_fit(largest_contiguous_block(intervals), effort_minutes):
-            return datetime.combine(d, largest.start, tzinfo=tz)
+        for interval in intervals:
+            if block_fit(interval.duration_minutes, effort_minutes):
+                return datetime.combine(d, interval.start, tzinfo=tz)
     return None
 
 
@@ -857,7 +864,18 @@ def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
         snapshot_date, events_by_day[snapshot_date], effective_wh_start, wh_end,
         exclude_event_id=placeholder_event_id,
     )
-    largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
+    # Earliest interval that fully fits the original effort_minutes first
+    # — real bug, found live: picking the day's *largest* interval here
+    # could silently commit the obligation to a completely different time
+    # than what was actually texted (scheduled_for), if some other part
+    # of the day happened to have a bigger gap. Only fall back to
+    # "whatever's biggest, capped down" (the pre-existing behavior) when
+    # nothing fits the full request — same "never refuse an explicit Y"
+    # principle _capped_effort_minutes already documents, just no longer
+    # the first choice.
+    largest = next((i for i in intervals if i.duration_minutes >= effort_minutes), None)
+    if largest is None:
+        largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
 
     if largest is None:
         # The day genuinely filled up between send and reply — a real

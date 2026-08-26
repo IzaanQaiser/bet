@@ -226,6 +226,65 @@ def test_y_reply_publishes_confirmed_and_sends_ack(client):
     assert "accepted" in suggestion_update.args[0]
 
 
+def test_y_reply_picks_earliest_fitting_gap_not_largest(client):
+    """Real bug, found live: accept picked the day's *largest* free
+    interval, which could commit the obligation to a completely
+    different time than what was actually texted (scheduled_for) — here,
+    a meeting splits the day into an earlier ~5h45m gap and a later ~7h
+    gap; the 120min item must land in the earlier one, not the bigger
+    later one."""
+    conn = _mock_connection(
+        fetchone_result=_suggestion_context(
+            effort_minutes=120, scheduled_for=datetime(2026, 8, 27, 9, 0)
+        )
+    )
+    events_by_day = {date(2026, 8, 27): [Event(start=time(14, 45), end=time(15, 0))]}
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main._send_sms"),
+        patch("dispatcher_svc.main.user_credentials"),
+        patch("dispatcher_svc.main.AuthorizedSession"),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main.publish") as mock_publish,
+    ):
+        resp = client.post("/reply", json=_reply_payload("y"))
+
+    assert resp.status_code == 200
+    _topic, confirmed = mock_publish.call_args[0]
+    assert confirmed.due_at == datetime(2026, 8, 27, 9, 0, tzinfo=confirmed.due_at.tzinfo)
+
+
+def test_y_reply_falls_back_to_largest_capped_when_nothing_fully_fits(client):
+    """Pre-existing behavior, preserved: an explicit Y is never refused
+    over a small overrun — if nothing fits the full request, fall back
+    to whatever's biggest and cap the effort down to it."""
+    conn = _mock_connection(
+        fetchone_result=_suggestion_context(
+            effort_minutes=120, scheduled_for=datetime(2026, 8, 27, 9, 0)
+        )
+    )
+    # Only a 60min gap exists anywhere in the day — smaller than the 120min ask.
+    events_by_day = {
+        date(2026, 8, 27): [
+            Event(start=time(10, 0), end=time(18, 0)),
+        ]
+    }
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main._send_sms"),
+        patch("dispatcher_svc.main.user_credentials"),
+        patch("dispatcher_svc.main.AuthorizedSession"),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main.publish") as mock_publish,
+    ):
+        resp = client.post("/reply", json=_reply_payload("y"))
+
+    assert resp.status_code == 200
+    _topic, confirmed = mock_publish.call_args[0]
+    assert confirmed.effort_minutes == 60  # capped down to the only available gap
+    assert confirmed.due_at == datetime(2026, 8, 27, 9, 0, tzinfo=confirmed.due_at.tzinfo)
+
+
 def test_y_reply_no_capacity_left_dismisses_instead(client):
     conn = _mock_connection(fetchone_result=_suggestion_context())
     # A full day of events covering the entire working window -> no free interval.
