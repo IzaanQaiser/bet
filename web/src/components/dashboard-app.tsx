@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
-import { Bubble } from "@/components/hero-thread";
+import { CalendarCard } from "@/components/calendar-card";
+import { HeroMemory, type MemoryRowData } from "@/components/hero-memory";
 import { Button } from "@/components/ui/button";
+import { digitsOnly, formatPhoneDisplay, toE164 } from "@/lib/phone";
 
 const SESSION_KEY = "bet_dashboard_session";
 const baseUrl = process.env.NEXT_PUBLIC_DASHBOARD_SVC_URL;
@@ -23,12 +25,6 @@ interface ItemsResponse {
   in_progress: ItemRow[];
   committed: ItemRow[];
   other: ItemRow[];
-}
-
-interface MessageRow {
-  direction: "in" | "out";
-  body: string;
-  created_at: string;
 }
 
 interface SuggestionRow {
@@ -53,33 +49,14 @@ async function authedFetch(path: string, token: string, init?: RequestInit) {
   });
 }
 
-function LedgerRow({ row, muted = false }: { row: ItemRow; muted?: boolean }) {
-  return (
-    <div className="flex flex-col gap-1 border-t border-dashed border-border py-3 first:border-t-0">
-      <div className="flex items-baseline justify-between gap-4">
-        <span className={`text-sm ${muted ? "text-muted-foreground" : "text-foreground"}`}>
-          {row.title}
-        </span>
-        {row.state && (
-          <span className="font-mono text-[0.6875rem] text-muted-foreground">{row.state}</span>
-        )}
-      </div>
-      {row.summary && !muted && (
-        <p className="text-xs leading-relaxed text-muted-foreground">{row.summary}</p>
-      )}
-      {row.pending_fields && row.pending_fields.length > 0 && (
-        <p className="font-mono text-[0.6875rem] text-muted-foreground">
-          waiting on: {row.pending_fields.join(", ")}
-        </p>
-      )}
-      {row.due_at && (
-        <p className="font-mono text-[0.6875rem] text-muted-foreground">
-          due {new Date(row.due_at).toLocaleString()}
-          {row.calendar_event_id ? " — on your calendar" : ""}
-        </p>
-      )}
-    </div>
-  );
+function humanizeState(state: string | undefined): string {
+  if (!state) return "";
+  return state.toLowerCase().replace(/_/g, " ");
+}
+
+function shortDate(iso: string | null | undefined): string {
+  if (!iso) return "committed";
+  return new Date(iso).toLocaleDateString(undefined, { weekday: "short" });
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -94,7 +71,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
-  const [phone, setPhone] = useState("");
+  const [phoneDigits, setPhoneDigits] = useState("");
   const [code, setCode] = useState("");
   const [stage, setStage] = useState<"phone" | "otp">("phone");
   const [error, setError] = useState<string | null>(null);
@@ -102,6 +79,11 @@ function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
 
   async function sendCode(e: FormEvent) {
     e.preventDefault();
+    const phoneE164 = toE164(phoneDigits);
+    if (!phoneE164) {
+      setError("Enter a 10-digit phone number");
+      return;
+    }
     if (!baseUrl) {
       setError("Dashboard isn't wired up yet, try again shortly.");
       return;
@@ -112,7 +94,7 @@ function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
       const res = await fetch(`${baseUrl}/auth/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone_e164: phone.trim() }),
+        body: JSON.stringify({ phone_e164: phoneE164 }),
       });
       if (res.status === 404) {
         setError("That number isn't registered yet — join the waitlist first.");
@@ -129,14 +111,15 @@ function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
 
   async function verifyCode(e: FormEvent) {
     e.preventDefault();
-    if (!baseUrl) return;
+    const phoneE164 = toE164(phoneDigits);
+    if (!baseUrl || !phoneE164) return;
     setSubmitting(true);
     setError(null);
     try {
       const res = await fetch(`${baseUrl}/auth/verify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ phone_e164: phone.trim(), code }),
+        body: JSON.stringify({ phone_e164: phoneE164, code }),
       });
       if (!res.ok) {
         setError("That code didn't work. Check it and try again.");
@@ -155,7 +138,7 @@ function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
     return (
       <form onSubmit={verifyCode} className="flex flex-col gap-4" noValidate>
         <p className="text-base leading-relaxed text-muted-foreground">
-          We texted a code to {phone.trim()}.
+          We texted a code to {formatPhoneDisplay(phoneDigits)}.
         </p>
         <input
           type="text"
@@ -179,11 +162,11 @@ function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
     <form onSubmit={sendCode} className="flex flex-col gap-4" noValidate>
       <input
         type="tel"
-        inputMode="tel"
+        inputMode="numeric"
         autoComplete="tel"
-        placeholder="+15551234567"
-        value={phone}
-        onChange={(e) => setPhone(e.target.value)}
+        placeholder="(555) 123-4567"
+        value={formatPhoneDisplay(phoneDigits)}
+        onChange={(e) => setPhoneDigits(digitsOnly(e.target.value))}
         required
         className="h-10 w-full max-w-[280px] rounded-[10px] border border-border bg-background px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
       />
@@ -262,12 +245,10 @@ function ProfilePanel({ token, profile }: { token: string; profile: ProfileData 
 }
 
 export function DashboardApp() {
-  // Lazy initializer, not an effect + setState: this runs once, during
-  // React's first client render (hydration), when window/localStorage
-  // actually exist — the build-time prerender (no window) and any
-  // stored-session client render can genuinely disagree, which is an
-  // accepted tradeoff for an auth-gated page that isn't indexed/SEO
-  // content anyway; React just re-renders once to the real client truth.
+  // Lazy initializer, not an effect + setState — same reasoning as
+  // register-flow.tsx: the build-time prerender and a real stored-session
+  // client render can genuinely disagree once, an accepted tradeoff for
+  // an auth-gated, non-indexed page.
   const [token, setToken] = useState<string | null>(() => {
     if (typeof window === "undefined") return null;
     try {
@@ -277,7 +258,6 @@ export function DashboardApp() {
     }
   });
   const [items, setItems] = useState<ItemsResponse | null>(null);
-  const [messages, setMessages] = useState<MessageRow[]>([]);
   const [suggestions, setSuggestions] = useState<SuggestionRow[]>([]);
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -288,9 +268,8 @@ export function DashboardApp() {
 
     async function load() {
       const t = token as string;
-      const [itemsRes, messagesRes, suggestionsRes, profileRes] = await Promise.all([
+      const [itemsRes, suggestionsRes, profileRes] = await Promise.all([
         authedFetch("/me/items", t),
-        authedFetch("/me/messages", t),
         authedFetch("/me/suggestions", t),
         authedFetch("/me/profile", t),
       ]);
@@ -305,19 +284,17 @@ export function DashboardApp() {
         }
         return;
       }
-      if (!itemsRes.ok || !messagesRes.ok || !suggestionsRes.ok || !profileRes.ok) {
+      if (!itemsRes.ok || !suggestionsRes.ok || !profileRes.ok) {
         if (!cancelled) setLoadError("Couldn't load your data. Try refreshing.");
         return;
       }
-      const [itemsBody, messagesBody, suggestionsBody, profileBody] = await Promise.all([
+      const [itemsBody, suggestionsBody, profileBody] = await Promise.all([
         itemsRes.json(),
-        messagesRes.json(),
         suggestionsRes.json(),
         profileRes.json(),
       ]);
       if (cancelled) return;
       setItems(itemsBody);
-      setMessages(messagesBody.messages);
       setSuggestions(suggestionsBody.suggestions);
       setProfile(profileBody);
     }
@@ -340,7 +317,6 @@ export function DashboardApp() {
   function logout() {
     setToken(null);
     setItems(null);
-    setMessages([]);
     setSuggestions([]);
     setProfile(null);
     try {
@@ -364,11 +340,34 @@ export function DashboardApp() {
     );
   }
 
+  const memoryRows: MemoryRowData[] = items
+    ? [
+        ...items.in_progress.map((row) => ({
+          key: row.id,
+          title: row.title,
+          status: humanizeState(row.state),
+          visible: true,
+          glow: false,
+          retrieved: false,
+        })),
+        ...items.committed.map((row) => ({
+          key: row.id,
+          title: row.title,
+          status: shortDate(row.due_at),
+          visible: true,
+          glow: false,
+          retrieved: true,
+        })),
+      ]
+    : [];
+
+  const committedWithDates = items ? items.committed.filter((row) => row.due_at) : [];
+
   return (
     <>
       <div className="mb-8 flex items-baseline justify-between">
         <h1 className="font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
-          Dashboard.
+          What bet&apos;s tracking.
         </h1>
         <button
           onClick={logout}
@@ -384,27 +383,39 @@ export function DashboardApp() {
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : (
         <>
-          <Section title="In progress">
-            {items.in_progress.length === 0 ? (
-              <p className="text-sm text-muted-foreground">Nothing in progress.</p>
-            ) : (
-              items.in_progress.map((row) => <LedgerRow key={row.id} row={row} />)
-            )}
-          </Section>
+          {memoryRows.length === 0 ? (
+            <div className="mb-10 rounded-[10px] border-[1.5px] border-dashed border-border px-[18px] py-4">
+              <p className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
+                agent memory
+              </p>
+              <p className="mt-1 text-sm text-muted-foreground">
+                Nothing yet — text bet something and it&apos;ll show up here.
+              </p>
+            </div>
+          ) : (
+            <HeroMemory rows={memoryRows} />
+          )}
 
-          <Section title="Committed">
-            {items.committed.length === 0 ? (
-              <p className="text-sm text-muted-foreground">Nothing committed yet.</p>
-            ) : (
-              items.committed.map((row) => <LedgerRow key={row.id} row={row} />)
-            )}
-          </Section>
-
-          {items.other.length > 0 && (
-            <Section title="Other">
-              {items.other.map((row) => (
-                <LedgerRow key={row.id} row={row} muted />
-              ))}
+          {committedWithDates.length > 0 && (
+            <Section title="On your calendar">
+              <div className="flex flex-wrap gap-4">
+                {committedWithDates.map((row) => {
+                  const due = new Date(row.due_at as string);
+                  return (
+                    <CalendarCard
+                      key={row.id}
+                      variant="booked"
+                      activeDay={due.getDay()}
+                      title={row.title}
+                      time={due.toLocaleTimeString(undefined, {
+                        hour: "numeric",
+                        minute: "2-digit",
+                      })}
+                      tag="On your Google Calendar"
+                    />
+                  );
+                })}
+              </div>
             </Section>
           )}
 
@@ -423,33 +434,6 @@ export function DashboardApp() {
               ))}
             </Section>
           )}
-
-          <Section title="Messages">
-            <div className="flex max-h-[420px] flex-col gap-[9px] overflow-y-auto rounded-[10px] border border-border p-4">
-              {messages.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No messages yet.</p>
-              ) : (
-                messages.map((m, i) => (
-                  <Bubble
-                    key={i}
-                    item={{
-                      kind: "bubble",
-                      id: String(i),
-                      // messages.direction is system-relative ("in" = the
-                      // user's own text arriving, "out" = the bot's own
-                      // send) — Bubble's dir is speaker-relative ("out" =
-                      // the user's bubble, right-aligned), the opposite
-                      // convention, same as the hero mockup's own copy.
-                      dir: m.direction === "out" ? "in" : "out",
-                      text: m.body,
-                      showStamp: false,
-                    }}
-                    spacing={i > 0 ? "mt-[9px]" : ""}
-                  />
-                ))
-              )}
-            </div>
-          </Section>
 
           <Section title="Profile">
             <ProfilePanel token={token} profile={profile} />
