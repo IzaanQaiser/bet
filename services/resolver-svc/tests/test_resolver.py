@@ -878,58 +878,47 @@ def test_attach_reply_with_no_candidate_is_unhandled(client):
     )
 
 
-# --- effort-aware clarification + two-stage reminders --------------------
+# --- universal flat-30-minute reminders (no effort anywhere) -------------
 
 
-def test_compute_reminder_times_derives_early_and_final_from_effort():
+def test_compute_reminder_times_flat_30min_before_and_at_due():
+    """One universal rule, user-specified: 30 minutes before due_at, and
+    at due_at itself — no effort, no task/event distinction in the math
+    at all anymore."""
     from resolver_svc.main import _compute_reminder_times
 
-    times = _compute_reminder_times("2026-09-04T18:00:00", 120)
-    assert times == (datetime(2026, 9, 4, 14, 0), datetime(2026, 9, 4, 16, 0))
+    times = _compute_reminder_times("2026-09-04T18:00:00")
+    assert times == (datetime(2026, 9, 4, 17, 30), datetime(2026, 9, 4, 18, 0))
 
 
-def test_compute_reminder_times_none_when_either_input_missing():
+def test_compute_reminder_times_none_when_due_at_missing():
     from resolver_svc.main import _compute_reminder_times
 
-    assert _compute_reminder_times(None, 60) is None
-    assert _compute_reminder_times("2026-09-04T18:00:00", None) is None
+    assert _compute_reminder_times(None) is None
 
 
-def test_compute_reminder_times_event_reminds_at_start_not_before():
-    """Real bug, found live: a meeting used the task-shaped formula and
-    never got reminded at its own start time. An event gets a fixed
-    30-minute heads-up before start AND a reminder AT the actual start —
-    the second value equals due_at itself, on purpose."""
-    from resolver_svc.main import _compute_reminder_times
+def test_future_reminder_strings_drops_a_time_already_passed():
+    """Real bug, found live: a confirmation sent well after the 30-min
+    heads-up mark had already passed still told the user "I'll remind you
+    at 9:53pm" — a time already gone before the message was composed.
+    Only the still-future one should ever be returned."""
+    from resolver_svc.main import _future_reminder_strings
 
-    times = _compute_reminder_times("2026-08-25T20:39:00", 30, is_scheduled_event=True)
-    assert times == (datetime(2026, 8, 25, 20, 9), datetime(2026, 8, 25, 20, 39))
-
-
-def test_compute_reminder_times_event_lead_is_flat_30min_not_effort_scaled():
-    """User-directed correction: the event heads-up used to scale with
-    effort_minutes (the event's own duration) — wrong, since a longer
-    meeting doesn't deserve proportionally more notice, and it made the
-    lead time unpredictable. Always exactly 30 minutes before start,
-    regardless of effort."""
-    from resolver_svc.main import _compute_reminder_times
-
-    times_60 = _compute_reminder_times("2026-08-25T20:39:00", 60, is_scheduled_event=True)
-    times_240 = _compute_reminder_times("2026-08-25T20:39:00", 240, is_scheduled_event=True)
-    assert times_60[0] == datetime(2026, 8, 25, 20, 9)
-    assert times_240[0] == datetime(2026, 8, 25, 20, 9)
-    assert times_60[1] == times_240[1] == datetime(2026, 8, 25, 20, 39)
+    # due 10:23pm, "now" is 10:02pm — the 30-min-before mark (9:53pm) is
+    # already in the past; only the at-due-time one is still ahead.
+    now_local = datetime(2026, 8, 25, 22, 2)
+    r1, r2 = _future_reminder_strings("2026-08-25T22:23:00", now_local)
+    assert r1 is None
+    assert r2 == "10:23 PM"
 
 
-def test_compute_reminder_times_task_never_reminds_at_due_at():
-    """Regression guard for the earlier, opposite complaint: a task must
-    never get reminded at its own deadline — both reminders strictly
-    precede due_at."""
-    from resolver_svc.main import _compute_reminder_times
+def test_future_reminder_strings_both_future_when_confirmed_early():
+    from resolver_svc.main import _future_reminder_strings
 
-    times = _compute_reminder_times("2026-08-25T20:39:00", 30, is_scheduled_event=False)
-    assert times[0] < datetime(2026, 8, 25, 20, 39)
-    assert times[1] < datetime(2026, 8, 25, 20, 39)
+    now_local = datetime(2026, 8, 25, 21, 0)
+    r1, r2 = _future_reminder_strings("2026-08-25T22:23:00", now_local)
+    assert r1 == "9:53 PM"
+    assert r2 == "10:23 PM"
 
 
 def test_ensure_reminder_mention_noop_when_already_passed():
@@ -937,109 +926,49 @@ def test_ensure_reminder_mention_noop_when_already_passed():
 
     # reminder_1_at_passed non-None means converse() already had the
     # chance to mention it naturally — no deterministic append here.
-    text = _ensure_reminder_mention("bet, locked in", "2:00 PM", "2026-09-04T18:00:00", 120)
+    now_local = datetime(2026, 9, 4, 12, 0)
+    text = _ensure_reminder_mention(
+        "bet, locked in", "2:00 PM", "2026-09-04T18:00:00", now_local
+    )
     assert text == "bet, locked in"
 
 
-def test_ensure_reminder_mention_appends_when_newly_computable():
+def test_ensure_reminder_mention_appends_both_when_newly_computable():
     from resolver_svc.main import _ensure_reminder_mention
 
+    now_local = datetime(2026, 9, 4, 12, 0)
     text = _ensure_reminder_mention(
-        "alright, sounds good — confirm?", None, "2026-09-04T18:00:00", 120
+        "alright, sounds good — confirm?", None, "2026-09-04T18:00:00", now_local
     )
-    assert text == (
-        "alright, sounds good — confirm? I'll remind you at 2:00 PM and 4:00 PM."
+    assert text == "alright, sounds good — confirm? I'll remind you at 5:30 PM and 6:00 PM."
+
+
+def test_ensure_reminder_mention_appends_only_the_one_still_future():
+    """Confirming inside the 30-minute window: only the at-due-time
+    reminder is still ahead, so the append must name only that one, not
+    both."""
+    from resolver_svc.main import _ensure_reminder_mention
+
+    now_local = datetime(2026, 9, 4, 17, 45)
+    text = _ensure_reminder_mention(
+        "alright, sounds good — confirm?", None, "2026-09-04T18:00:00", now_local
     )
+    assert text == "alright, sounds good — confirm? I'll remind you at 6:00 PM."
 
 
 def test_ensure_reminder_mention_noop_when_still_not_computable():
     from resolver_svc.main import _ensure_reminder_mention
 
-    text = _ensure_reminder_mention("what's the deadline?", None, None, None)
+    now_local = datetime(2026, 9, 4, 12, 0)
+    text = _ensure_reminder_mention("what's the deadline?", None, None, now_local)
     assert text == "what's the deadline?"
-
-
-def test_effort_minutes_missing_starts_clarification(client):
-    """effort_minutes now joins due_at/email_recipient in the "ask, don't
-    guess" family — an extraction that flagged it missing gets a real
-    clarifying question, same as any other missing field."""
-    extracted = _extracted_message(missing_fields=["effort_minutes"], effort_minutes=None)
-    conn = _mock_connection()
-    with (
-        patch("resolver_svc.main.get_connection", return_value=conn),
-        patch("resolver_svc.main.converse") as mock_converse,
-        patch("resolver_svc.main._send_sms") as mock_sms,
-        _no_duplicate(),
-    ):
-        mock_converse.return_value = ConversationTurnResult(
-            effort_minutes_filled=False,
-            still_missing=["effort_minutes"],
-            reply_text="how long do you think it'll take?",
-        )
-        resp = client.post("/pubsub/push", json=_push_envelope(extracted))
-
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "clarifying", "item_id": str(extracted.item_id)}
-    mock_sms.assert_called_once_with(
-        extracted.user_id, "+15551234567", "how long do you think it'll take?"
-    )
-
-
-def test_effort_minutes_reply_persists_and_states_reminder_times(client):
-    """The user's own example, end to end at the mechanism level: due_at
-    was already known, effort_minutes was the only thing missing. The
-    reply that fills it ("2 hours") also completes the item on the same
-    turn — reminder_1_at/reminder_2_at can't have been passed into that
-    specific converse() call (nothing could compute them before it), so
-    the deterministic append in _ensure_reminder_mention is what states
-    them, not the LLM."""
-    item_id, user_id = str(uuid4()), str(uuid4())
-    conn = _mock_connection(
-        item_row=("obligation", "Pay rent", "Pay rent by Friday.", None, False, "CLARIFYING"),
-        conversation_row=(
-            ["effort_minutes"],
-            {"due_at": "2026-09-04T18:00:00", "action_type": "calendar"},
-            0,
-        ),
-    )
-    with (
-        patch("resolver_svc.main.get_connection", return_value=conn),
-        patch("resolver_svc.main._send_sms") as mock_sms,
-        patch("resolver_svc.main.converse") as mock_converse,
-    ):
-        mock_converse.return_value = ConversationTurnResult(
-            effort_minutes_filled=True,
-            effort_minutes=120,
-            still_missing=[],
-            reply_text="alright, sounds good — confirm?",
-        )
-        resp = client.post(
-            "/reply", json={"user_id": user_id, "item_id": item_id, "text": "2 hours"}
-        )
-
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "awaiting_confirmation", "item_id": item_id}
-
-    effort_updates = [
-        c
-        for c in conn.execute.call_args_list
-        if "UPDATE items" in c.args[0] and "effort_minutes" in c.args[0]
-    ]
-    assert len(effort_updates) == 1
-    assert effort_updates[0].args[1] == (120, item_id)
-
-    mock_sms.assert_called_once_with(
-        UUID(user_id),
-        "+15551234567",
-        "alright, sounds good — confirm? I'll remind you at 2:00 PM and 4:00 PM.",
-    )
 
 
 def test_affirm_publishes_reminder_times_on_confirmed_item(client):
     item_id, user_id = str(uuid4()), str(uuid4())
     conn = _mock_connection(
         item_row=(
-            "obligation", "Pay rent", "Pay rent by Friday.", 120, False, "AWAITING_CONFIRMATION"
+            "obligation", "Pay rent", "Pay rent by Friday.", 15, False, "AWAITING_CONFIRMATION"
         ),
         conversation_row=(
             {"due_at": "2026-09-04T18:00:00", "action_type": "calendar"},
@@ -1052,15 +981,15 @@ def test_affirm_publishes_reminder_times_on_confirmed_item(client):
         patch("resolver_svc.main._send_sms"),
     ):
         mock_converse.return_value = ConversationTurnResult(
-            intent="AFFIRM", reply_text="bet, locked it in — I'll remind you at 2 and 4pm"
+            intent="AFFIRM", reply_text="bet, locked it in — I'll remind you at 5:30 and 6pm"
         )
         resp = client.post("/reply", json={"user_id": user_id, "item_id": item_id, "text": "y"})
 
     assert resp.status_code == 200
     mock_publish.assert_called_once()
     _topic, confirmed = mock_publish.call_args[0]
-    assert confirmed.reminder_1_at == datetime(2026, 9, 4, 14, 0)
-    assert confirmed.reminder_2_at == datetime(2026, 9, 4, 16, 0)
+    assert confirmed.reminder_1_at == datetime(2026, 9, 4, 17, 30)
+    assert confirmed.reminder_2_at == datetime(2026, 9, 4, 18, 0)
 
 
 def test_health(client):
