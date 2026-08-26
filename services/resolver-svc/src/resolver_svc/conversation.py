@@ -14,12 +14,22 @@ in one schema validated correctly on 7/7 real scenarios (field merge alone,
 AFFIRM/DENY/CORRECTION/ATTACH, and voice-mirroring from history).
 
 ADR 0001/0003 note: this call NEVER decides whether a write happens — it
-only fills a classified `intent` field. Pipeline code in main.py does a
-plain `if intent == "AFFIRM":` before ever publishing to items.confirmed,
-same mechanism as the old `if classification == "Y":`. The LlmAgent below
-has no `tools=[...]` — it cannot call anything, only return structured
-text. CORRECTION never publishes on its own, no matter how complete the
-merged fields look — only a subsequent, separate AFFIRM turn does.
+only fills a classified `intent` field. The LlmAgent below has no
+`tools=[...]` — it cannot call anything, only return structured text.
+For the dedupe merge/different question, `intent == "AFFIRM"` is still
+main.py's plain gate before writing `parent_item_id`, same mechanism as
+the old `if classification == "Y":`.
+
+**V1 polish, superseding the paragraph above for the main (non-dedupe)
+flow — user-directed, main.py's own module docstring has the full note:**
+there is no more separate confirmation step, no more `awaiting_confirmation`,
+no more AFFIRM/DENY/CORRECTION/ATTACH classification for a fresh item.
+`still_missing` emptying out is now itself what triggers the commit —
+main.py calls `_confirm_and_publish` the instant that happens, no
+affirmative reply required. `intent` is only ever meaningfully set now for
+`awaiting_dedupe_reply` (AFFIRM/DENY/OTHER); CORRECTION and ATTACH are
+gone from the schema entirely, since both only ever existed for the
+removed confirmation step.
 
 Conversation-continuity note (Phase G follow-up, same session as step D):
 ingest-svc routes any inbound SMS to whichever item this user has open
@@ -81,15 +91,15 @@ with what the user's own history actually sounds like).
 You're given: the item (title/type/summary/effort/known fields), whether
 it's a scheduled event you attend at a specific time rather than a task
 with a completion deadline (is_scheduled_event), which fields (if any)
-are still missing, whether a confirmation message has
-ALREADY been sent for this item (awaiting_confirmation), a pending
-thread-attach candidate title if any, a possible-duplicate candidate title
-if any (dedupe_candidate_title) and whether a reply to THAT question is
-being interpreted right now (awaiting_dedupe_reply), recent message
-history, the user's other real committed obligations if any
-(other_items — what's already on their plate, separate from this item),
-and the user's latest reply (absent on the very first turn for a new
-item).
+are still missing, a pending thread-attach candidate title if any, a
+possible-duplicate candidate title if any (dedupe_candidate_title) and
+whether a reply to THAT question is being interpreted right now
+(awaiting_dedupe_reply), recent message history, the user's other real
+committed obligations if any (other_items — what's already on their plate,
+separate from this item), and the user's latest reply (absent on the very
+first turn for a new item). There is no separate confirmation step for a
+fresh item — the moment nothing is missing, it's locked in immediately, no
+yes/no required.
 
 Do, in order:
 
@@ -149,31 +159,20 @@ Do, in order:
    title/summary reads vague or effort is unstated; just work with what's
    given for those.
 
-2. Intent (ONLY set this if awaiting_confirmation OR awaiting_dedupe_reply
-   is true — a question was already sent and this reply is responding to
-   it; otherwise leave intent null):
+2. Intent (ONLY set this if awaiting_dedupe_reply is true — a dedupe
+   question was already sent and this reply is answering it; otherwise
+   leave intent null. There's no other kind of question left to classify
+   a reply against — a fresh item never waits for an explicit confirmation
+   anymore):
 
-   If awaiting_dedupe_reply is true, this reply is answering a DIFFERENT
-   question than usual — "is this the same as an existing item" — not
-   confirming a new one. Here AFFIRM/DENY mean:
+   This reply is answering "is this the same as an existing item", not
+   confirming a new one. AFFIRM/DENY mean:
    - AFFIRM: yes, it's the same thing (will be merged into the existing
      item — "yeah", "same one", "that's it", etc.)
    - DENY: no, it's different / a separate new thing ("no", "nah, different
      thing", "not the same", etc.)
-   CORRECTION and ATTACH don't apply to a dedupe reply — use OTHER for
-   anything that isn't a clear yes/no on "is this the same item".
-
-   Otherwise (awaiting_confirmation true, the normal case):
-   - AFFIRM: a clear yes/confirmation ("yes", "yeah", "bet", "sounds good",
-     "do it", etc.)
-   - DENY: a clear no/cancel ("no", "nah", "don't", "cancel", etc.)
-   - CORRECTION: the reply changes a detail (a different time, a different
-     recipient, etc.) rather than simply confirming or denying — resolve
-     the corrected field(s) per step 1 above even though they weren't in
-     the original missing list.
-   - ATTACH: the reply accepts the offered thread-attach ("attach it",
-     "yeah attach", "a").
-   - OTHER: genuinely unclear, off-topic, or a question.
+   - OTHER: genuinely unclear, off-topic, or a question — anything that
+     isn't a clear yes/no on "is this the same item".
 
 3. reply_text: the actual next SMS to send. Rules:
    - If dedupe_candidate_title is given and this is the very first turn
@@ -190,25 +189,19 @@ Do, in order:
      acknowledging it's separate/different — just an acknowledgment, do
      NOT ask a yes/no confirm question here, the next turn handles
      whatever's still needed for the new item.
-   - If still_missing is non-empty (fields remain missing, not yet at
-     confirmation): a short casual question asking for what's still
-     missing, in one natural sentence, never a list.
-   - If still_missing just became empty (nothing missing, first time this
-     item reaches a confirmation): a short casual message stating what
-     will happen (the task, the date/time if any) and asking them to
-     confirm — this doubles as the confirmation prompt itself, so it must
-     make clear a yes/no is expected. Mention the thread-attach candidate
-     naturally if one is given.
-   - If awaiting_confirmation and intent is AFFIRM: a short casual
-     acknowledgment that it's done/scheduled.
-   - If DENY (awaiting_confirmation, not a dedupe reply): a short casual
-     "no worries, scrapped it" style line.
-   - If CORRECTION: a short casual line restating the updated detail and
-     asking to confirm again — never assume yes just because a correction
-     was given.
-   - If ATTACH: a short casual line confirming the attach.
-   - If OTHER: a short casual line asking them to clarify (yes/no/what to
-     change, or — for a dedupe reply — whether it's the same thing or not).
+   - If still_missing is non-empty (fields remain missing): a short casual
+     question asking for what's still missing, in one natural sentence,
+     never a list.
+   - If still_missing just became empty (nothing left missing, this turn is
+     what completes the item): a short casual message stating what's
+     locked in — the task/event, the date/time if any — as a DONE fact, not
+     a question. This IS the commit, happening right now, no yes/no
+     follow-up expected or wanted — never phrase it as asking for
+     confirmation ("does that work?", "confirm?"), never leave it sounding
+     provisional. Mention the thread-attach candidate naturally if one is
+     given, as an FYI, not something to confirm.
+   - If OTHER (a dedupe reply that's genuinely unclear): a short casual
+     line asking them to clarify whether it's the same thing or not.
    If other_items is non-empty, use it like a friend who actually remembers
    what's going on would — bring one up ONLY when it's a genuine, concrete
    connection to what's being said right now (a real timing consideration:
@@ -228,8 +221,7 @@ Do, in order:
      for 6" reads as the reminder arriving at the deadline, which isn't
      true and isn't what happens. Say "it's due at 6pm" (or similar)
      instead. Real finding, not theoretical: a live conversation phrased a
-     6pm-due assignment exactly this wrong way on both the confirmation
-     prompt and the AFFIRM acknowledgment.
+     6pm-due assignment exactly this wrong way in the locked-in message.
    - is_scheduled_event true (a real event you attend — a meeting, party,
      call, appointment): word it as when it STARTS, e.g. "it starts at
      3pm" or "you're at it at 3pm" — never "due at 3pm", which is deadline
@@ -237,20 +229,19 @@ Do, in order:
      finding: a live conversation confirmed a party as "due at 3pm
      tomorrow", which read oddly for exactly this reason.
    If reminder_1_at and/or reminder_2_at are given (non-null) on this
-   turn's confirmation message or AFFIRM acknowledgment, state whichever
-   ones are actually given directly in the sentence, using those exact
-   given values, not placeholders. Both given: "I'll remind you at 12pm
-   and 3pm." Only one given (the other is null — this happens for real:
-   confirming something inside its own 30-minute reminder window means
-   only the later one is still ahead of right now): "I'll remind you at
-   3pm," never mentioning a second time or implying there's an earlier
-   one too. Never invent or infer a missing one from the other — only
-   state exactly what's given, exactly as given. So the user knows
-   exactly when they'll hear from the system again, not just that a
-   reminder exists. Don't mention either at all on any other kind of turn
-   (a still-missing question, DENY, CORRECTION, etc.) — only when stating
-   what will happen has already earned its place in the message per the
-   rules above.
+   turn's locked-in message, state whichever ones are actually given
+   directly in the sentence, using those exact given values, not
+   placeholders. Both given: "I'll remind you at 12pm and 3pm." Only one
+   given (the other is null — this happens for real: locking something in
+   within its own 30-minute reminder window means only the later one is
+   still ahead of right now): "I'll remind you at 3pm," never mentioning a
+   second time or implying there's an earlier one too. Never invent or
+   infer a missing one from the other — only state exactly what's given,
+   exactly as given. So the user knows exactly when they'll hear from the
+   system again, not just that a reminder exists. Don't mention either at
+   all on any other kind of turn (a still-missing question, a dedupe
+   acknowledgment, etc.) — only when stating what's locked in has already
+   earned its place in the message per the rules above.
    Keep it SMS-length, under 160 characters where possible.
 
 Output must conform exactly to the provided schema. No text outside it.
@@ -275,7 +266,10 @@ class ConversationTurnResult(BaseModel):
     # model's raw number to already be exactly one of the five.
     effort_minutes: int | None = None
     still_missing: list[str] = []
-    intent: Literal["AFFIRM", "DENY", "CORRECTION", "ATTACH", "OTHER"] | None = None
+    # Only ever meaningfully set for a dedupe reply now (awaiting_dedupe_reply)
+    # — CORRECTION/ATTACH are gone from the schema, both only ever existed
+    # for the removed confirmation step (v1 polish, module docstring note).
+    intent: Literal["AFFIRM", "DENY", "OTHER"] | None = None
     reply_text: str
 
 
@@ -320,7 +314,6 @@ async def converse(
     effort_minutes: int | None,
     known_fields: dict,
     missing_fields: list[str],
-    awaiting_confirmation: bool,
     thread_attach_title: str | None,
     history: list[str],
     latest_reply: str | None,
@@ -350,7 +343,6 @@ async def converse(
         f"Effort: {effort_line}\n"
         f"Known fields: {known_fields}\n"
         f"Missing fields: {missing_fields}\n"
-        f"awaiting_confirmation: {awaiting_confirmation}\n"
         f"Thread-attach candidate: {thread_attach_title}\n"
         f"dedupe_candidate_title: {dedupe_candidate_title}\n"
         f"awaiting_dedupe_reply: {awaiting_dedupe_reply}\n"
