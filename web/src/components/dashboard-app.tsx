@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
-import { CalendarCard } from "@/components/calendar-card";
 import { HeroMemory, type MemoryRowData } from "@/components/hero-memory";
 import { Button } from "@/components/ui/button";
+import { WeekCalendar } from "@/components/week-calendar";
 import { digitsOnly, formatPhoneDisplay, toE164 } from "@/lib/phone";
 
 const SESSION_KEY = "bet_dashboard_session";
@@ -17,6 +17,7 @@ interface ItemRow {
   updated_at?: string;
   due_at?: string | null;
   calendar_event_id?: string | null;
+  effort_minutes?: number | null;
   pending_fields?: string[] | null;
   last_message_at?: string | null;
 }
@@ -54,8 +55,6 @@ function humanizeState(state: string | undefined): string {
   return state.toLowerCase().replace(/_/g, " ");
 }
 
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
 // due_at is inherently anchored to the user's own registered timezone
 // (that's what committer-svc wrote the real Calendar event in) — every
 // display here has to use that same zone explicitly, never the ambient
@@ -65,12 +64,6 @@ const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 function shortDate(iso: string | null | undefined, timeZone: string): string {
   if (!iso) return "committed";
   return new Date(iso).toLocaleDateString("en-US", { timeZone, weekday: "short" });
-}
-
-function dayIndexInTimezone(iso: string, timeZone: string): number {
-  const weekday = new Date(iso).toLocaleDateString("en-US", { timeZone, weekday: "short" });
-  const index = WEEKDAYS.indexOf(weekday);
-  return index === -1 ? new Date(iso).getDay() : index;
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -383,27 +376,16 @@ export function DashboardApp() {
 
           {committedWithDates.length > 0 && (
             <Section title="On your calendar">
-              <div className="flex flex-wrap gap-4">
-                {committedWithDates.map((row) => {
-                  const dueIso = row.due_at as string;
-                  const due = new Date(dueIso);
-                  return (
-                    <CalendarCard
-                      key={row.id}
-                      variant="booked"
-                      activeDay={dayIndexInTimezone(dueIso, timeZone)}
-                      title={row.title}
-                      time={due.toLocaleTimeString("en-US", {
-                        timeZone,
-                        hour: "numeric",
-                        minute: "2-digit",
-                      })}
-                      tag="On your Google Calendar"
-                      onDelete={() => deleteItem(row.id)}
-                    />
-                  );
-                })}
-              </div>
+              <WeekCalendar
+                items={committedWithDates.map((row) => ({
+                  id: row.id,
+                  title: row.title,
+                  due_at: row.due_at as string,
+                  effort_minutes: row.effort_minutes ?? null,
+                }))}
+                timeZone={timeZone}
+                onDelete={deleteItem}
+              />
             </Section>
           )}
 
