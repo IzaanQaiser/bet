@@ -48,14 +48,21 @@ class ExtractedItemMessage(BaseModel):
     triage field. When false, the message is pure chat (banter/greeting/
     reaction/question) with nothing to capture — type/title/summary/due_at/
     effort_minutes/focus_depth/confidence are all null, missing_fields is
-    empty, and chat_reply carries the in-voice reply to send back. When
-    true, chat_reply is null and every other field is filled exactly as
-    before this step."""
+    empty. When true, every other field is filled exactly as before this
+    step.
+
+    raw_text is a plain passthrough of RawItemMessage.text, not a model
+    output — carried through so resolver-svc's chat handler has the
+    original message to react to with real conversation history/context
+    (its own converse() call, is_chat mode), replacing an earlier
+    chat_reply field that extractor-svc generated with zero history
+    available to it (a real bug: a casual "betski" sent right after a
+    task auto-committed got a context-blind "hey! what's up?" back)."""
 
     item_id: UUID
     user_id: UUID
     is_actionable: bool = True
-    chat_reply: str | None = None
+    raw_text: str | None = None
     type: Literal["obligation", "latent"] | None = None
     title: str | None = None
     summary: str | None = None

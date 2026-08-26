@@ -12,10 +12,15 @@ pattern as an ambiguous due_at.
 
 Phase G step B (agent-contracts.md §2.2) adds a leading is_actionable triage
 flag to this same call: pure chat (banter/greeting/reaction/question) gets
-is_actionable=False and an in-voice chat_reply, with every extraction field
-left null — no fake obligation gets invented out of "hello". resolver-svc
-decides what to actually do with that (send chat_reply, mark the item
-CHATTED) since this service still has zero Twilio/DB access (ADR 0003).
+is_actionable=False, with every extraction field left null — no fake
+obligation gets invented out of "hello". resolver-svc decides what to
+actually do with that (mark the item CHATTED) since this service still has
+zero Twilio/DB access (ADR 0003). resolver-svc also generates the actual
+reply text now, not this service — it has real conversation history to
+react with (its own converse() call, is_chat mode) and this call site
+never did (a real bug: a context-blind chat_reply generated here once
+replied "hey! what's up?" to a plain "betski" sent right after a task had
+just auto-committed, ignoring the history staring right at it).
 
 Zero DB access, zero Calendar/Gmail scope (ADR 0003) — this is the one service
 in the whole system that ever touches untrusted, unconfirmed user input, and
@@ -53,7 +58,6 @@ app = FastAPI()
 # unconstrained numeric field works fine in this same schema).
 class _ExtractionResult(BaseModel):
     is_actionable: bool = True
-    chat_reply: str | None = None
     type: Literal["obligation", "latent"] | None = None
     title: str | None = None
     summary: str | None = None
@@ -78,12 +82,10 @@ First decide is_actionable:
 - false if the message is pure chat with nothing to remember or schedule —
   a greeting, banter, a reaction, a question about the system itself, "you
   there?", etc. In this case leave type/title/summary/due_at/effort_minutes/
-  focus_depth/confidence null and missing_fields empty, and set chat_reply
-  to a short, casual, in-voice reply reacting to what they actually said —
-  lowercase, terse, a little slang is fine, like a real friend texting back.
-  Never invent an obligation or idea out of plain chat.
+  focus_depth/confidence null and missing_fields empty. Never invent an
+  obligation or idea out of plain chat.
 - true if the message describes a real obligation or idea worth capturing.
-  In this case leave chat_reply null and fill every field below normally.
+  In this case fill every field below normally.
 
 Extract exactly one structured item when is_actionable is true.
 
@@ -258,7 +260,7 @@ async def pubsub_push(request: Request):
         item_id=raw.item_id,
         user_id=raw.user_id,
         is_actionable=result.is_actionable,
-        chat_reply=result.chat_reply,
+        raw_text=raw.text,
         type=result.type,
         title=result.title,
         summary=result.summary,
