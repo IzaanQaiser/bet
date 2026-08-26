@@ -424,6 +424,78 @@ async def dispatch():
     return {"status": "ok", "results": results}
 
 
+@app.post("/latents/{item_id}/next-fit")
+async def compute_next_fit(item_id: UUID):
+    """User-directed real bug fix: a freshly-committed idea previously
+    showed "someday" on the dashboard until the next twice-daily /dispatch
+    sweep happened to reach it — up to ~6 hours of staleness. committer-svc
+    enqueues an immediate (schedule_time=now) Cloud Task at this endpoint
+    right after inserting the latents row (same reminders queue/OIDC-as-
+    sa-dispatcher pattern already used for reminder delivery), so
+    next_fit_start is real within seconds of commit instead of waiting for
+    the batch sweep. Forward-only Calendar read for just this one item/user
+    — no trailing window (load_delta isn't needed for block_fit), no other
+    latents, no reminders, no suggestion scoring. Snapshots are still
+    persisted via the same upsert /dispatch uses, so this also refreshes
+    that user's capacity_snapshots a little more often than the sweep
+    alone would — a side benefit, not the point."""
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT i.effort_minutes, i.user_id, u.timezone, u.working_hours_start,
+                   u.working_hours_end, u.google_refresh_token_ref
+            FROM items i
+            JOIN latents l ON l.item_id = i.id
+            JOIN users u ON u.id = i.user_id
+            WHERE i.id = %s
+            """,
+            (str(item_id),),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown latent item_id")
+    effort_minutes, user_id, tz_name, wh_start, wh_end, refresh_ref = row
+
+    if refresh_ref is None:
+        logger.info(
+            "item_id=%s user has no linked Google account, skipping next-fit compute", item_id
+        )
+        return {"status": "skipped_no_google_account", "item_id": str(item_id)}
+
+    tz = ZoneInfo(tz_name)
+    now_utc = datetime.now(UTC)
+    today = now_utc.astimezone(tz).date()
+    now_local = now_utc.astimezone(tz)
+    forward_end = today + timedelta(days=FORWARD_DAYS - 1)
+
+    session = AuthorizedSession(user_credentials(refresh_ref))
+    forward_events = fetch_events_for_range(session, today, forward_end, tz_name)
+
+    day_context = {}
+    with get_connection() as conn:
+        for d in sorted(forward_events):
+            day_wh_start = (
+                _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+            )
+            computation = _compute_day(forward_events[d], d, day_wh_start, wh_end, None)
+            computation.snapshot_id = _persist_snapshot(conn, user_id, computation)
+            day_context[d] = computation
+        conn.commit()
+
+        next_fit = _next_fitting_slot(day_context, tz, effort_minutes)
+        conn.execute(
+            "UPDATE latents SET next_fit_start = %s WHERE item_id = %s",
+            (next_fit, str(item_id)),
+        )
+        conn.commit()
+
+    logger.info("computed next_fit_start=%s item_id=%s", next_fit, item_id)
+    return {
+        "status": "ok",
+        "item_id": str(item_id),
+        "next_fit_start": next_fit.isoformat() if next_fit else None,
+    }
+
+
 @app.post("/dispatch/reminders")
 async def dispatch_reminders():
     """SAFETY-NET FALLBACK, not the primary reminder mechanism — see

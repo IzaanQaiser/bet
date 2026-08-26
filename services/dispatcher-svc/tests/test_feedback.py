@@ -244,3 +244,90 @@ def test_health(client):
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+# --- POST /latents/{item_id}/next-fit ----------------------------------
+# User-directed real bug fix: a freshly-committed idea previously showed
+# "someday" until the next twice-daily /dispatch sweep. committer-svc now
+# fires this endpoint immediately on commit via an unscheduled Cloud Task.
+
+
+def _mock_next_fit_connection(*, item_row, next_fit_updates):
+    """item_row feeds the initial items/latents/users join SELECT;
+    next_fit_updates is a list this appends (item_id, next_fit_start)
+    tuples to, from the final UPDATE latents call — snapshot INSERTs in
+    between get an arbitrary fetchone id, their SQL doesn't need
+    inspecting for what this test cares about."""
+
+    def execute_side_effect(sql, params=None):
+        result = MagicMock()
+        if "FROM items i" in sql and "JOIN latents l" in sql:
+            result.fetchone.return_value = item_row
+        elif "INSERT INTO capacity_snapshots" in sql:
+            result.fetchone.return_value = ("snap-id",)
+        elif "UPDATE latents SET next_fit_start" in sql:
+            next_fit_updates.append(params)
+        return result
+
+    conn = MagicMock()
+    conn.execute.side_effect = execute_side_effect
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    return conn
+
+
+def test_next_fit_computes_and_persists_earliest_fitting_day(client):
+    item_id = uuid4()
+    user_id = uuid4()
+    item_row = (
+        120,  # effort_minutes
+        user_id,
+        "America/Toronto",
+        time(9, 0),
+        time(18, 0),
+        "projects/p/secrets/user-refresh-token-x/versions/latest",
+    )
+    next_fit_updates = []
+    conn = _mock_next_fit_connection(item_row=item_row, next_fit_updates=next_fit_updates)
+    events_by_day = {date(2026, 8, 27): [], date(2026, 8, 28): []}
+
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main.user_credentials"),
+        patch("dispatcher_svc.main.AuthorizedSession"),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+    ):
+        resp = client.post(f"/latents/{item_id}/next-fit")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["next_fit_start"] is not None
+
+    assert len(next_fit_updates) == 1
+    updated_next_fit, updated_item_id = next_fit_updates[0]
+    assert updated_item_id == str(item_id)
+    assert updated_next_fit is not None
+
+
+def test_next_fit_skips_users_with_no_linked_google_account(client):
+    item_id = uuid4()
+    item_row = (120, uuid4(), "America/Toronto", time(9, 0), time(18, 0), None)
+    conn = _mock_next_fit_connection(item_row=item_row, next_fit_updates=[])
+
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main.fetch_events_for_range") as mock_fetch,
+    ):
+        resp = client.post(f"/latents/{item_id}/next-fit")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "skipped_no_google_account"
+    mock_fetch.assert_not_called()
+
+
+def test_next_fit_unknown_item_returns_404(client):
+    conn = _mock_next_fit_connection(item_row=None, next_fit_updates=[])
+    with patch("dispatcher_svc.main.get_connection", return_value=conn):
+        resp = client.post(f"/latents/{uuid4()}/next-fit")
+    assert resp.status_code == 404
