@@ -254,17 +254,15 @@ def test_health(client):
 
 def _mock_next_fit_connection(*, item_row, next_fit_updates):
     """item_row feeds the initial items/latents/users join SELECT;
-    next_fit_updates is a list this appends (item_id, next_fit_start)
-    tuples to, from the final UPDATE latents call — snapshot INSERTs in
-    between get an arbitrary fetchone id, their SQL doesn't need
-    inspecting for what this test cares about."""
+    next_fit_updates is a list this appends (next_fit_start, item_id)
+    tuples to, from the final UPDATE latents call. This endpoint never
+    touches capacity_snapshots (real bug, fixed: load_delta is NOT NULL
+    and this endpoint has no trailing window to compute it from)."""
 
     def execute_side_effect(sql, params=None):
         result = MagicMock()
         if "FROM items i" in sql and "JOIN latents l" in sql:
             result.fetchone.return_value = item_row
-        elif "INSERT INTO capacity_snapshots" in sql:
-            result.fetchone.return_value = ("snap-id",)
         elif "UPDATE latents SET next_fit_start" in sql:
             next_fit_updates.append(params)
         return result
@@ -278,10 +276,8 @@ def _mock_next_fit_connection(*, item_row, next_fit_updates):
 
 def test_next_fit_computes_and_persists_earliest_fitting_day(client):
     item_id = uuid4()
-    user_id = uuid4()
     item_row = (
         120,  # effort_minutes
-        user_id,
         "America/Toronto",
         time(9, 0),
         time(18, 0),
@@ -312,7 +308,7 @@ def test_next_fit_computes_and_persists_earliest_fitting_day(client):
 
 def test_next_fit_skips_users_with_no_linked_google_account(client):
     item_id = uuid4()
-    item_row = (120, uuid4(), "America/Toronto", time(9, 0), time(18, 0), None)
+    item_row = (120, "America/Toronto", time(9, 0), time(18, 0), None)
     conn = _mock_next_fit_connection(item_row=item_row, next_fit_updates=[])
 
     with (

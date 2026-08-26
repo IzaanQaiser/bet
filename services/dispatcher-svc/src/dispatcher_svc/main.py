@@ -434,15 +434,17 @@ async def compute_next_fit(item_id: UUID):
     sa-dispatcher pattern already used for reminder delivery), so
     next_fit_start is real within seconds of commit instead of waiting for
     the batch sweep. Forward-only Calendar read for just this one item/user
-    — no trailing window (load_delta isn't needed for block_fit), no other
-    latents, no reminders, no suggestion scoring. Snapshots are still
-    persisted via the same upsert /dispatch uses, so this also refreshes
-    that user's capacity_snapshots a little more often than the sweep
-    alone would — a side benefit, not the point."""
+    — no trailing window, no other latents, no reminders, no suggestion
+    scoring. Deliberately does NOT persist capacity_snapshots rows (real
+    bug, caught live: load_delta needs the trailing-14-day mean this
+    endpoint never fetches, and that column is NOT NULL — an earlier draft
+    tried reusing _persist_snapshot here and 500'd on exactly that). Snapshot
+    freshness for days outside the twice-daily sweep stays out of scope for
+    this endpoint; it only ever writes latents.next_fit_start."""
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT i.effort_minutes, i.user_id, u.timezone, u.working_hours_start,
+            SELECT i.effort_minutes, u.timezone, u.working_hours_start,
                    u.working_hours_end, u.google_refresh_token_ref
             FROM items i
             JOIN latents l ON l.item_id = i.id
@@ -453,7 +455,7 @@ async def compute_next_fit(item_id: UUID):
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="unknown latent item_id")
-    effort_minutes, user_id, tz_name, wh_start, wh_end, refresh_ref = row
+    effort_minutes, tz_name, wh_start, wh_end, refresh_ref = row
 
     if refresh_ref is None:
         logger.info(
@@ -471,17 +473,12 @@ async def compute_next_fit(item_id: UUID):
     forward_events = fetch_events_for_range(session, today, forward_end, tz_name)
 
     day_context = {}
-    with get_connection() as conn:
-        for d in sorted(forward_events):
-            day_wh_start = (
-                _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
-            )
-            computation = _compute_day(forward_events[d], d, day_wh_start, wh_end, None)
-            computation.snapshot_id = _persist_snapshot(conn, user_id, computation)
-            day_context[d] = computation
-        conn.commit()
+    for d in sorted(forward_events):
+        day_wh_start = _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+        day_context[d] = _compute_day(forward_events[d], d, day_wh_start, wh_end, None)
 
-        next_fit = _next_fitting_slot(day_context, tz, effort_minutes)
+    next_fit = _next_fitting_slot(day_context, tz, effort_minutes)
+    with get_connection() as conn:
         conn.execute(
             "UPDATE latents SET next_fit_start = %s WHERE item_id = %s",
             (next_fit, str(item_id)),
