@@ -119,11 +119,12 @@ def _insert_committed_obligation(user_id, due_at, effort_minutes=15, is_schedule
     """reminder_1_at/reminder_2_at mirror resolver-svc's own
     _compute_reminder_times — real production formula, not a test-only
     shortcut: a task (default) gets both reminders strictly before due_at
-    (due_at - 2*effort, due_at - effort); a scheduled event gets a
-    heads-up before start AND a reminder AT the actual start time
-    (due_at - effort, due_at)."""
+    (due_at - 2*effort, due_at - effort); a scheduled event gets a fixed
+    30-minute heads-up before start (not effort-scaled — effort means
+    the event's own duration, not lead time) AND a reminder AT the
+    actual start time (due_at - 30min, due_at)."""
     delta = timedelta(minutes=effort_minutes)
-    reminder_1_at = due_at - delta if is_scheduled_event else due_at - 2 * delta
+    reminder_1_at = due_at - timedelta(minutes=30) if is_scheduled_event else due_at - 2 * delta
     reminder_2_at = due_at if is_scheduled_event else due_at - delta
     with get_connection() as conn:
         row = conn.execute(
