@@ -49,17 +49,40 @@ export interface CalendarCardProps {
   time: string;
   tag: string;
   glow?: boolean;
+  // Optional, dashboard-only — the landing hero never passes this, so
+  // nothing renders differently there. A sibling of the role="img" card,
+  // not a child of it, so the card's accessible name stays exactly the
+  // single descriptive label it already is.
+  onDelete?: () => void;
 }
 
-export function CalendarCard({ variant, activeDay, title, time, tag, glow }: CalendarCardProps) {
+export function CalendarCard({
+  variant,
+  activeDay,
+  title,
+  time,
+  tag,
+  glow,
+  onDelete,
+}: CalendarCardProps) {
   const isOpen = variant === "open";
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.42, ease: "easeOut" }}
-      className="self-start max-w-[82%]"
+      className="relative self-start max-w-[82%]"
     >
+      {onDelete && (
+        <button
+          type="button"
+          onClick={onDelete}
+          aria-label={`Remove ${title}`}
+          className="absolute -right-2 -top-2 z-[1] flex h-5 w-5 items-center justify-center rounded-full border border-border bg-background text-xs text-muted-foreground hover:text-destructive"
+        >
+          ×
+        </button>
+      )}
       <div
         role="img"
         aria-label={`Google Calendar — ${title}, ${time}${isOpen ? " — free" : ""}`}

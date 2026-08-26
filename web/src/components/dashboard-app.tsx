@@ -54,9 +54,23 @@ function humanizeState(state: string | undefined): string {
   return state.toLowerCase().replace(/_/g, " ");
 }
 
-function shortDate(iso: string | null | undefined): string {
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// due_at is inherently anchored to the user's own registered timezone
+// (that's what committer-svc wrote the real Calendar event in) — every
+// display here has to use that same zone explicitly, never the ambient
+// timezone of whatever device happens to be looking at the dashboard,
+// or the same obligation reads as a different time depending on who's
+// viewing it and where they are.
+function shortDate(iso: string | null | undefined, timeZone: string): string {
   if (!iso) return "committed";
-  return new Date(iso).toLocaleDateString(undefined, { weekday: "short" });
+  return new Date(iso).toLocaleDateString("en-US", { timeZone, weekday: "short" });
+}
+
+function dayIndexInTimezone(iso: string, timeZone: string): number {
+  const weekday = new Date(iso).toLocaleDateString("en-US", { timeZone, weekday: "short" });
+  const index = WEEKDAYS.indexOf(weekday);
+  return index === -1 ? new Date(iso).getDay() : index;
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -326,6 +340,28 @@ export function DashboardApp() {
     }
   }
 
+  async function deleteItem(itemId: string) {
+    if (!token) return;
+    // Optimistic: pull it out of view immediately rather than waiting on
+    // the round trip (which also does a best-effort real Calendar
+    // delete) — a failed request just means it reappears on next load,
+    // not a broken state.
+    setItems((prev) =>
+      prev
+        ? {
+            in_progress: prev.in_progress.filter((r) => r.id !== itemId),
+            committed: prev.committed.filter((r) => r.id !== itemId),
+            other: prev.other.filter((r) => r.id !== itemId),
+          }
+        : prev
+    );
+    try {
+      await authedFetch(`/me/items/${itemId}`, token, { method: "DELETE" });
+    } catch {
+      // best-effort — see the optimistic-removal note above
+    }
+  }
+
   if (!token) {
     return (
       <>
@@ -340,6 +376,8 @@ export function DashboardApp() {
     );
   }
 
+  const timeZone = profile?.timezone ?? "UTC";
+
   const memoryRows: MemoryRowData[] = items
     ? [
         ...items.in_progress.map((row) => ({
@@ -353,7 +391,7 @@ export function DashboardApp() {
         ...items.committed.map((row) => ({
           key: row.id,
           title: row.title,
-          status: shortDate(row.due_at),
+          status: shortDate(row.due_at, timeZone),
           visible: true,
           glow: false,
           retrieved: true,
@@ -393,25 +431,28 @@ export function DashboardApp() {
               </p>
             </div>
           ) : (
-            <HeroMemory rows={memoryRows} />
+            <HeroMemory rows={memoryRows} onDelete={deleteItem} />
           )}
 
           {committedWithDates.length > 0 && (
             <Section title="On your calendar">
               <div className="flex flex-wrap gap-4">
                 {committedWithDates.map((row) => {
-                  const due = new Date(row.due_at as string);
+                  const dueIso = row.due_at as string;
+                  const due = new Date(dueIso);
                   return (
                     <CalendarCard
                       key={row.id}
                       variant="booked"
-                      activeDay={due.getDay()}
+                      activeDay={dayIndexInTimezone(dueIso, timeZone)}
                       title={row.title}
-                      time={due.toLocaleTimeString(undefined, {
+                      time={due.toLocaleTimeString("en-US", {
+                        timeZone,
                         hour: "numeric",
                         minute: "2-digit",
                       })}
                       tag="On your Google Calendar"
+                      onDelete={() => deleteItem(row.id)}
                     />
                   );
                 })}
