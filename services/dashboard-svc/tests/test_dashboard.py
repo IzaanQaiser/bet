@@ -334,6 +334,71 @@ def test_me_profile_patch_rejects_empty_body(client):
     mock_get_conn.assert_not_called()
 
 
+def test_me_profile_patch_working_hours_triggers_next_fit_recompute(client, monkeypatch):
+    """User-directed real bug fix: a working-hours change previously left
+    every already-committed idea's next_fit_start stale until the next
+    twice-daily sweep."""
+    monkeypatch.setenv("GCP_PROJECT_ID", "obligation-engine-hack")
+    monkeypatch.setenv("DISPATCHER_SVC_URL", "https://dispatcher-svc.example.run.app")
+    user_id = uuid4()
+    mock_conn = _mock_connection()
+    with (
+        patch("dashboard_svc.main.get_connection", return_value=mock_conn),
+        patch("dashboard_svc.main._enqueue_next_fit_recompute") as mock_enqueue,
+    ):
+        resp = client.patch(
+            "/me/profile", json={"working_hours_end": "23:00"}, headers=_auth_header(user_id)
+        )
+    assert resp.status_code == 200
+    mock_enqueue.assert_called_once_with(user_id)
+
+
+def test_me_profile_patch_timezone_only_does_not_trigger_next_fit_recompute(client):
+    mock_conn = _mock_connection()
+    with (
+        patch("dashboard_svc.main.get_connection", return_value=mock_conn),
+        patch("dashboard_svc.main._enqueue_next_fit_recompute") as mock_enqueue,
+    ):
+        resp = client.patch(
+            "/me/profile", json={"timezone": "America/Los_Angeles"}, headers=_auth_header(uuid4())
+        )
+    assert resp.status_code == 200
+    mock_enqueue.assert_not_called()
+
+
+def test_enqueue_next_fit_recompute_targets_dispatcher_immediately(monkeypatch):
+    from dashboard_svc.main import _enqueue_next_fit_recompute
+
+    monkeypatch.setenv("GCP_PROJECT_ID", "obligation-engine-hack")
+    monkeypatch.setenv("DISPATCHER_SVC_URL", "https://dispatcher-svc.example.run.app")
+    user_id = uuid4()
+
+    with patch("dashboard_svc.main.tasks_v2.CloudTasksClient") as mock_client_cls:
+        mock_client = mock_client_cls.return_value
+        mock_client.queue_path.return_value = "projects/p/locations/us-central1/queues/reminders"
+        _enqueue_next_fit_recompute(user_id)
+
+    mock_client.create_task.assert_called_once()
+    task = mock_client.create_task.call_args.kwargs["task"]
+    assert task["http_request"]["url"] == (
+        f"https://dispatcher-svc.example.run.app/users/{user_id}/next-fit"
+    )
+    assert task["http_request"]["oidc_token"]["service_account_email"] == (
+        "sa-dispatcher@obligation-engine-hack.iam.gserviceaccount.com"
+    )
+    assert "schedule_time" not in task
+
+
+def test_enqueue_next_fit_recompute_swallows_failure(monkeypatch):
+    from dashboard_svc.main import _enqueue_next_fit_recompute
+
+    monkeypatch.setenv("GCP_PROJECT_ID", "obligation-engine-hack")
+    monkeypatch.setenv("DISPATCHER_SVC_URL", "https://dispatcher-svc.example.run.app")
+
+    with patch("dashboard_svc.main.tasks_v2.CloudTasksClient", side_effect=RuntimeError("boom")):
+        _enqueue_next_fit_recompute(uuid4())  # does not raise
+
+
 # ---- DELETE /me/items/{id} ----
 
 
