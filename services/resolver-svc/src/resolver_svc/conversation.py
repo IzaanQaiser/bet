@@ -145,11 +145,16 @@ Do, in order:
    specific label in title. If it's still vague, leave title_filled false.
    If "effort_minutes" is listed as missing (only ever happens for a
    scheduled event with no stated duration yet) and the latest reply gives
-   a duration/scope signal ("an hour", "30 min", "quick one"), resolve it
-   to the nearest of 15/30/60/120/240 minutes — round up on a tie
-   (underestimating is the worse failure mode) — set effort_minutes_filled
-   true, put the value in effort_minutes. If still vague, leave
-   effort_minutes_filled false.
+   a real duration ("an hour" -> 60, "1.5 hours" -> 90, "quick 20 min
+   call" -> 20), resolve it to the EXACT number of minutes stated or
+   clearly implied — never round to a "nice" number, never bucket it.
+   This becomes a real Calendar event's exact end time, so precision
+   matters here in a way it doesn't for a task's rough work-time guess
+   (real bug, found live: "1.5 hours" got silently rounded to a 2-hour
+   Calendar event). Set effort_minutes_filled true, put the exact value
+   in effort_minutes. If the reply is still vague with no real number
+   ("quick one", "not long"), leave effort_minutes_filled false — a vague
+   scope signal isn't a real duration and must not be guessed into one.
    Only touch fields actually listed as missing, or explicitly updated
    during a correction. still_missing MUST be a subset of the given
    missing fields — the only four field names that can ever appear are
@@ -260,10 +265,8 @@ class ConversationTurnResult(BaseModel):
     # Plain int, not a Literal enum: Vertex AI structured output rejects an
     # integer Literal outright (extractor-svc's _ExtractionResult hit this
     # exact gap first, agent-contracts.md §2) but an unconstrained numeric
-    # field works fine (confidence: float already proves this). The prompt
-    # instructs the model to pick a bucket value directly; _round_to_bucket
-    # below re-buckets defensively regardless, rather than trusting the
-    # model's raw number to already be exactly one of the five.
+    # field works fine (confidence: float already proves this). Exact
+    # minutes, never bucketed — migrations/0016's note on why.
     effort_minutes: int | None = None
     still_missing: list[str] = []
     # Only ever meaningfully set for a dedupe reply now (awaiting_dedupe_reply)
@@ -293,15 +296,6 @@ _agent = LlmAgent(
     ),
 )
 _session_service = InMemorySessionService()
-
-_EFFORT_BUCKETS = (15, 30, 60, 120, 240)
-
-
-def _round_to_bucket(minutes: int) -> int:
-    """Nearest of _EFFORT_BUCKETS, rounding up on an exact tie —
-    underestimating available work time is the worse failure mode (same
-    reasoning extractor-svc's own bucket-guessing already uses)."""
-    return min(_EFFORT_BUCKETS, key=lambda b: (abs(b - minutes), -b))
 
 
 def _reconcile_still_missing(missing_fields: list[str], result) -> list[str]:
@@ -412,17 +406,26 @@ async def converse(
         if f in ("due_at", "email_recipient", "title", "effort_minutes")
     ]
 
+    # Defensive sanity bound, same reasoning as still_missing above — not
+    # bucketed anymore (migrations/0016), but still guarded against a
+    # nonsensical raw number (0, negative, or absurdly long) reaching a
+    # real Calendar event's end time unchecked. Matches items table's own
+    # CHECK constraint range; genuinely out-of-range is treated as not
+    # actually resolved rather than silently clamped, so the item keeps
+    # asking instead of committing a wrong duration. Runs BEFORE
+    # _reconcile_still_missing below so a rejected fill correctly lands
+    # back in still_missing rather than vanishing.
+    if result.effort_minutes_filled and (
+        result.effort_minutes is None or not (0 < result.effort_minutes <= 1440)
+    ):
+        result.effort_minutes_filled = False
+        result.effort_minutes = None
+
     # Defensive, real production bug (not theoretical, see
     # _reconcile_still_missing's own docstring) — re-added here, the one
     # choke point every caller goes through, rather than trusting the
     # model's still_missing list to be complete on its own.
     result.still_missing = _reconcile_still_missing(missing_fields, result)
-
-    # Defensive re-bucketing, same reasoning as still_missing above: don't
-    # trust the model's raw number to already be exactly one of the five
-    # canonical buckets, even though the prompt asks for that directly.
-    if result.effort_minutes_filled and result.effort_minutes is not None:
-        result.effort_minutes = _round_to_bucket(result.effort_minutes)
 
     # Defensive, same reasoning as above: relates_to_item is only ever
     # meaningful when there's an actual reply to judge. Forcing it true on

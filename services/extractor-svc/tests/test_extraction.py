@@ -36,7 +36,7 @@ async def test_extract_parses_final_event_text():
         "title": "Pay rent",
         "summary": "Pay rent by Friday.",
         "due_at": None,
-        "effort_minutes": "15",
+        "effort_minutes": 15,
         "focus_depth": "shallow",
         "confidence": 0.95,
         "missing_fields": ["due_at"],
@@ -56,7 +56,7 @@ async def test_extract_parses_final_event_text():
     assert result.type == "obligation"
     assert result.due_at is None  # ambiguous date never guessed
     assert result.missing_fields == ["due_at"]
-    assert result.effort_minutes == "15"  # still a string at this layer
+    assert result.effort_minutes == 15
 
 
 @pytest.mark.asyncio

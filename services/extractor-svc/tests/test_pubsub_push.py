@@ -1,6 +1,6 @@
 """Unit tests — the Gemini call (_extract) and Pub/Sub publish are mocked
-out, per docs/engineering/test-plan.md step 4. Envelope decoding, error
-handling, and the string-to-int effort_minutes cast only."""
+out, per docs/engineering/test-plan.md step 4. Envelope decoding and error
+handling only."""
 
 import base64
 from datetime import UTC, datetime
@@ -45,7 +45,7 @@ def _extraction_result(**overrides):
         title="Pay rent",
         summary="Pay rent by Friday.",
         due_at=None,
-        effort_minutes="15",
+        effort_minutes=15,
         focus_depth="shallow",
         confidence=0.95,
         missing_fields=["due_at"],
@@ -68,7 +68,7 @@ def test_valid_envelope_extracts_and_publishes(client):
     topic, published = mock_publish.call_args[0]
     assert topic == "items-extracted"
     assert published.item_id == item_id
-    assert published.effort_minutes == 15  # cast from wire string "15"
+    assert published.effort_minutes == 15
 
 
 def test_email_action_fields_pass_through_to_published_message(client):

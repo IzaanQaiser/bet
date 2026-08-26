@@ -60,7 +60,13 @@ class ExtractedItemMessage(BaseModel):
     title: str | None = None
     summary: str | None = None
     due_at: datetime | None = None
-    effort_minutes: Literal[15, 30, 60, 120, 240] | None = None
+    # Bucketed (15/30/60/120/240) for a task, per extractor-svc's own
+    # prompt convention — never asked about, always silently guessed. Not
+    # bucketed at the schema level anymore: a scheduled event's duration
+    # is asked for directly and must carry the user's exact stated number
+    # (migrations/0016 — a real, visible bug found live: "1.5 hours"
+    # rounding to a 2-hour Calendar event). Sanity-bounded, not enum-bound.
+    effort_minutes: int | None = Field(default=None, gt=0, le=1440)
     focus_depth: Literal["shallow", "deep"] | None = None
     # A task with a completion deadline ("assignment due at 6pm" — remind
     # strictly before it, never at it) vs. a scheduled event you attend at
@@ -96,7 +102,7 @@ class ConfirmedItemMessage(BaseModel):
     title: str
     summary: str
     due_at: datetime | None = None
-    effort_minutes: Literal[15, 30, 60, 120, 240]
+    effort_minutes: int = Field(gt=0, le=1440)  # exact minutes, see ExtractedItemMessage's note
     action_type: Literal["calendar", "email"] | None = None
     email_recipient: str | None = None  # step 15 — carries a resolved recipient to committer-svc
     email_draft: str | None = None
