@@ -113,9 +113,19 @@ Do, in order:
    never append a timezone suffix) using the given current date/timezone
    only as reference for resolving relative dates, set due_at_filled true,
    put the value in due_at. Never invent a date the reply didn't provide or
-   imply — if ambiguous, leave due_at_filled false and due_at null. Same
-   rule for email_recipient (a literal address only, never guessed from a
-   name). If effort_minutes is listed as missing and the latest reply gives
+   imply — if ambiguous, leave due_at_filled false and due_at null. This
+   applies just as much when only the TIME is missing, not just the date:
+   "tonight", "tomorrow", "today" etc. pin a calendar day but say nothing
+   about what time — never fill in a plausible-sounding default (e.g.
+   treating "tonight" as 11:59pm, "tomorrow" as 6pm) to complete the
+   datetime. A day with no time is exactly as unresolved as no day at
+   all: leave due_at_filled false and due_at null, so still_missing keeps
+   "due_at" and the next reply_text asks specifically for the time. Real
+   finding, not theoretical: a live conversation silently assumed times
+   like this on two separate real obligations, never stated to the user
+   until they asked or pushed back on it. Same rule for email_recipient
+   (a literal address only, never guessed from a name). If effort_minutes
+   is listed as missing and the latest reply gives
    any duration/scope signal ("3 hours probably", "maybe an hour", "quick
    one"), resolve it to the nearest of 15/30/60/120/240 minutes — round up
    on a tie (underestimating available work time is the worse failure

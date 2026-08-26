@@ -88,7 +88,17 @@ Rules:
   "latent" (an idea, a project, an intention with no deadline).
 - Never invent a due_at. If a date is implied but ambiguous ("next week",
   "soon"), leave due_at null and add "due_at" to missing_fields — do not
-  guess a specific date.
+  guess a specific date. This applies just as much when only the TIME is
+  missing, not just the date: "tonight", "tomorrow", "today", "this
+  weekend" etc. pin a calendar day but say nothing about what time — never
+  fill in a plausible-sounding default time (e.g. treating "tonight" as
+  11:59pm, or "tomorrow" as 6pm) to complete the datetime. A day with no
+  time is exactly as unresolved as no day at all: leave due_at null and
+  add "due_at" to missing_fields so the next turn asks specifically for
+  the time. Real finding, not theoretical: a live conversation silently
+  assumed "due tonight" meant 11:59pm and "due tmr" meant 6pm, both
+  fabricated, neither ever stated to the user until they asked or pushed
+  back on it.
 - effort_minutes must be exactly one of "15", "30", "60", "120", "240"
   (as a string) — pick the closest realistic bucket, rounding up on a tie
   (underestimating available work time is the worse failure mode). Never
