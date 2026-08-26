@@ -1,28 +1,25 @@
 """docs/engineering/test-plan.md step 7 — no I/O, every test here is a
 pure computation. capacity-engine.md §6's worked example gives exact
-expected numbers; reproduced to 3 decimal places, not approximated."""
+expected numbers; reproduced to 3 decimal places, not approximated.
+
+ADR 0009: revival_score/REVIVAL_THRESHOLD/select_suggestion/is_eligible/
+Candidate/fit_score/load_fit are removed along with the batch-scoring
+engine — see main.py's _recompute_and_reschedule for what replaced it."""
 
 from datetime import date, time
 
 import pytest
 from dispatcher_svc.capacity_engine import (
-    REVIVAL_THRESHOLD,
-    CapacitySnapshot,
     Event,
     Interval,
     LatentCandidate,
     block_fit,
     booked_minutes,
-    fit_score,
     fragmentation_index,
     free_intervals,
     free_minutes,
-    is_eligible,
     largest_contiguous_block,
     load_delta,
-    load_fit,
-    revival_score,
-    select_suggestion,
 )
 
 WH_START = time(9, 0)
@@ -31,21 +28,24 @@ A_DAY = date(2026, 8, 27)  # Thursday, matches capacity-engine.md §6
 
 
 def _latent(
-    created_at,
     effort_minutes=120,
     dismissal_count=0,
     dormant_until=None,
     last_surfaced_at=None,
     has_open_suggestion=False,
+    next_fit_start=None,
+    placeholder_event_id=None,
 ):
     return LatentCandidate(
         item_id="x",
-        created_at=created_at,
+        title="Test idea",
         effort_minutes=effort_minutes,
         dismissal_count=dismissal_count,
         dormant_until=dormant_until,
         last_surfaced_at=last_surfaced_at,
         has_open_suggestion=has_open_suggestion,
+        next_fit_start=next_fit_start,
+        placeholder_event_id=placeholder_event_id,
     )
 
 
@@ -72,28 +72,37 @@ def test_free_intervals_excludes_declined_and_transparent():
     assert intervals == [Interval(start=WH_START, end=WH_END)]  # neither event blocks anything
 
 
+def test_free_intervals_excludes_own_placeholder_by_event_id():
+    """capacity-engine.md §5's self-exclusion note: an item's own
+    [idea]-tagged placeholder must not count as busy when recomputing
+    that same item's own next_fit_start, or it would evict itself from a
+    perfectly good slot every time."""
+    events = [
+        Event(start=time(9, 0), end=time(10, 0), google_event_id="mine"),
+        Event(start=time(14, 0), end=time(15, 0), google_event_id="someone-elses"),
+    ]
+    intervals = free_intervals(A_DAY, events, WH_START, WH_END, exclude_event_id="mine")
+    # "mine" excluded (its 9-10 block is free again); the other event still counts as busy.
+    assert intervals == [
+        Interval(start=WH_START, end=time(14, 0)),
+        Interval(start=time(15, 0), end=WH_END),
+    ]
+
+
+def test_free_intervals_still_counts_every_other_events_placeholder():
+    """The flip side: every *other* item's placeholder is a real Calendar
+    event and stays busy — this is the whole mechanism behind a declined
+    idea landing after every already-scheduled one, no cascade needed."""
+    events = [Event(start=time(9, 0), end=time(18, 0), google_event_id="someone-elses")]
+    intervals = free_intervals(A_DAY, events, WH_START, WH_END, exclude_event_id="mine")
+    assert intervals == []
+
+
 def test_block_fit_one_universal_rule_no_margin():
     # User-directed, v1: "deep work" (focus_depth, depth_fit, the deep
     # margin) removed entirely — one rule for every idea, no distinction.
     assert block_fit(largest_block=120, effort_minutes=120) == 1
     assert block_fit(largest_block=119, effort_minutes=120) == 0
-
-
-def test_load_fit_at_mean_is_half():
-    assert load_fit(0.0) == pytest.approx(0.5)
-
-
-def test_load_fit_40_percent_below_is_one():
-    assert load_fit(-0.4) == pytest.approx(1.0)
-
-
-def test_load_fit_clips_at_bounds():
-    assert load_fit(-1.0) == 1.0  # would exceed 1.0 unclipped
-    assert load_fit(1.0) == 0.0  # would go negative unclipped
-
-
-def test_load_fit_cold_start_is_neutral():
-    assert load_fit(None) == 0.5
 
 
 def test_load_delta_cold_start_below_3_days():
@@ -108,9 +117,7 @@ def test_load_delta_zero_rolling_mean_empty_baseline_is_neutral():
 
 
 def test_load_delta_zero_rolling_mean_any_booking_reads_as_maximally_busy():
-    delta = load_delta(booked_today=30, trailing_booked_minutes=[0] * 14)
-    assert delta == 1.0
-    assert load_fit(delta) == 0.0
+    assert load_delta(booked_today=30, trailing_booked_minutes=[0] * 14) == 1.0
 
 
 def test_booked_minutes():
@@ -134,106 +141,7 @@ def test_worked_example_snapshot_matches_doc_exactly():
     assert delta == pytest.approx(-0.30)
 
 
-def test_fit_score_worked_example_reproduces_0_875():
-    snapshot = CapacitySnapshot(
-        date=A_DAY,
-        free_minutes=330,
-        largest_contiguous_block=180,
-        fragmentation_index=0.0,
-        load_delta=-0.30,
-    )
-    fit = fit_score(snapshot, effort_minutes=120)
-    assert round(fit, 3) == 0.875
-
-
-def test_revival_score_worked_example():
-    item = _latent(created_at=date(2026, 8, 9))  # 18 days before A_DAY
-    snapshot = CapacitySnapshot(
-        date=A_DAY,
-        free_minutes=330,
-        largest_contiguous_block=180,
-        fragmentation_index=0.0,
-        load_delta=-0.30,
-    )
-    fit = fit_score(snapshot, item.effort_minutes)
-    score = revival_score(item, today=A_DAY, fit=fit)
-    assert round(score, 3) == 0.633
-
-
-def test_contrast_example_insufficient_block_scores_zero():
-    """capacity-engine.md §6's contrast: a 240min idea can't fit a 180min
-    block, regardless of load_fit."""
-    snapshot = CapacitySnapshot(
-        date=A_DAY,
-        free_minutes=330,
-        largest_contiguous_block=180,
-        fragmentation_index=0.0,
-        load_delta=-0.30,
-    )
-    fit = fit_score(snapshot, effort_minutes=240)
-    assert fit == 0.0
-
-
-def test_eligibility_excludes_young_items():
-    item = _latent(created_at=A_DAY)  # captured today
-    assert is_eligible(item, today=A_DAY) is False
-
-
-def test_eligibility_excludes_dormant():
-    item = _latent(created_at=date(2026, 8, 1), dormant_until=date(2026, 9, 1))
-    assert is_eligible(item, today=A_DAY) is False
-
-
-def test_eligibility_excludes_recently_surfaced():
-    item = _latent(created_at=date(2026, 8, 1), last_surfaced_at=date(2026, 8, 20))  # 7 days ago
-    assert is_eligible(item, today=A_DAY) is False
-
-
-def test_eligibility_excludes_open_suggestion():
-    item = _latent(created_at=date(2026, 8, 1), has_open_suggestion=True)
-    assert is_eligible(item, today=A_DAY) is False
-
-
-def test_selection_picks_best_day_per_latent_then_argmax_across_latents():
-    strong_snapshot = CapacitySnapshot(
-        date=A_DAY,
-        free_minutes=330,
-        largest_contiguous_block=180,
-        fragmentation_index=0.0,
-        load_delta=-0.30,
-    )
-    weak_snapshot = CapacitySnapshot(
-        date=date(2026, 8, 28),
-        free_minutes=60,
-        largest_contiguous_block=60,
-        fragmentation_index=1.0,
-        load_delta=0.5,
-    )
-    strong_candidate = _latent(created_at=date(2026, 8, 9))  # 18 days old, matches worked example
-    weak_candidate = _latent(created_at=date(2026, 8, 20), effort_minutes=15)
-
-    result = select_suggestion(
-        [strong_candidate, weak_candidate], [strong_snapshot, weak_snapshot], today=A_DAY
-    )
-    assert result is not None
-    assert result.item is strong_candidate
-    assert result.snapshot is strong_snapshot
-    assert round(result.score, 3) == 0.633
-
-
-def test_selection_respects_threshold():
-    barely_eligible = _latent(created_at=date(2026, 8, 24))  # 3 days old — passes eligibility...
-    weak_snapshot = CapacitySnapshot(
-        date=A_DAY,
-        free_minutes=200,
-        largest_contiguous_block=150,
-        fragmentation_index=0.5,
-        load_delta=0.0,
-    )
-    # ...but low recency_decay at 3 days keeps the score under REVIVAL_THRESHOLD
-    result = select_suggestion([barely_eligible], [weak_snapshot], today=A_DAY)
-    assert result is None
-
-
-def test_revival_threshold_constant_is_0_4():
-    assert REVIVAL_THRESHOLD == 0.4
+def test_latent_candidate_carries_placeholder_state():
+    item = _latent(next_fit_start=None, placeholder_event_id="evt-1")
+    assert item.placeholder_event_id == "evt-1"
+    assert item.title == "Test idea"

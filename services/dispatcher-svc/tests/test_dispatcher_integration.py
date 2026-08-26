@@ -170,34 +170,62 @@ def test_dispatch_run_produces_7_snapshots(client, test_user):
     assert count == 7
 
 
-def test_dispatch_run_sends_at_most_one_suggestion(client, test_user):
-    user_id, phone = test_user
+def test_dispatch_run_recomputes_next_fit_and_upserts_placeholder(client, test_user):
+    """ADR 0009 replaced the old revival_score/'at most one per run'
+    engine — the sweep now recomputes every non-dormant committed
+    latent's next_fit_start unconditionally and, via the mocked
+    committer_client, would upsert a real [idea]-tagged placeholder for
+    each one that got a real slot. No SMS is sent by /dispatch itself
+    anymore — that only happens when /latents/{item_id}/fire's own Cloud
+    Task actually arrives."""
+    user_id, _phone = test_user
     today = datetime.now(UTC).astimezone(ZoneInfo(TZ_NAME)).date()
     old_enough = datetime.combine(today - timedelta(days=18), time(12, 0), tzinfo=UTC)
-
-    # Two latents, both old enough and both deep/120min — both would clear
-    # the threshold against the light forward day if scored independently.
-    _insert_committed_latent(user_id, old_enough)
-    _insert_committed_latent(user_id, old_enough)
+    item_id = _insert_committed_latent(user_id, old_enough)
 
     def mock_events_range(session, start, end, tz_name):
         return _mock_events_by_range(start, end, tz_name, forward_events=7)
 
+    def upsert_side_effect(item_uuid, *_args, **_kwargs):
+        # /dispatch iterates every real linked user in the shared dev DB,
+        # not just this test's — a real bug, found running this test for
+        # real, wrote this mock's fake "evt-1" into another real user's
+        # actual latents row. Only fake-succeed for this test's own item;
+        # raising for every other item makes _recompute_and_reschedule's
+        # own except-and-skip path leave every other user's real row
+        # completely untouched (verified: no DB write happens on that
+        # branch), rather than trying to filter after the fact.
+        if item_uuid == item_id:
+            return "evt-1"
+        raise RuntimeError("not this test's item — refuse to touch real data")
+
     p1, p2, p3 = _patched_calendar(mock_events_range)
-    with p1, p2, p3, patch("dispatcher_svc.main._send_sms") as mock_sms:
+    with (
+        p1, p2, p3,
+        patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.tasks_client") as mock_tasks,
+    ):
+        mock_committer.upsert_placeholder.side_effect = upsert_side_effect
         resp = client.post("/dispatch")
     assert resp.status_code == 200
-
-    suggestion_calls = [
-        c for c in mock_sms.call_args_list if "Want it on the calendar?" in c.kwargs["body"]
+    mock_sms.assert_not_called()
+    this_items_upserts = [
+        c for c in mock_committer.upsert_placeholder.call_args_list if c.args[0] == item_id
     ]
-    assert len(suggestion_calls) == 1
+    assert len(this_items_upserts) == 1
+    this_items_tasks = [
+        c for c in mock_tasks.enqueue_fire_task.call_args_list if c.args[0] == item_id
+    ]
+    assert len(this_items_tasks) == 1
 
     with get_connection() as conn:
-        count = conn.execute(
-            "SELECT count(*) FROM suggestions WHERE user_id = %s", (str(user_id),)
-        ).fetchone()[0]
-    assert count == 1
+        next_fit_start, placeholder_event_id = conn.execute(
+            "SELECT next_fit_start, placeholder_event_id FROM latents WHERE item_id = %s",
+            (str(item_id),),
+        ).fetchone()
+    assert next_fit_start is not None
+    assert placeholder_event_id == "evt-1"
 
 
 def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
@@ -361,26 +389,19 @@ def test_accept_path_full_cycle(client, test_user, confirmed_subscription):
         user_id, datetime.now(UTC) - timedelta(days=18, hours=1)
     )
 
-    # One consistent local "tomorrow" for the snapshot row, the mocked
+    # One consistent local "tomorrow" for scheduled_for, the mocked
     # Calendar events, and the final assertion — computed once so this
     # doesn't flake near UTC/local-date boundaries.
     tomorrow = (datetime.now(UTC) + timedelta(days=1)).astimezone(ZoneInfo(TZ_NAME)).date()
+    scheduled_for = datetime.combine(tomorrow, time(12, 0), tzinfo=ZoneInfo(TZ_NAME))
 
     with get_connection() as conn:
-        snapshot_row = conn.execute(
-            """
-            INSERT INTO capacity_snapshots
-                (user_id, date, free_minutes, largest_contiguous_block,
-                 fragmentation_index, load_delta)
-            VALUES (%s, %s, 180, 180, 0.0, -0.3)
-            RETURNING id
-            """,
-            (str(user_id), tomorrow),
-        ).fetchone()
-        snapshot_id = snapshot_row[0]
+        # snapshot_id is nullable (ADR 0009, migrations/0020) — a
+        # fire-time suggestion has no capacity_snapshots row to attach to.
         conn.execute(
-            "INSERT INTO suggestions (item_id, user_id, snapshot_id) VALUES (%s, %s, %s)",
-            (str(item_id), str(user_id), snapshot_id),
+            "INSERT INTO suggestions (item_id, user_id, snapshot_id, scheduled_for) "
+            "VALUES (%s, %s, NULL, %s)",
+            (str(item_id), str(user_id), scheduled_for),
         )
         conn.commit()
 

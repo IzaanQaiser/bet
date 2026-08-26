@@ -137,3 +137,22 @@ class RoutedReplyMessage(BaseModel):
     user_id: UUID
     item_id: UUID
     text: str
+
+
+class PlaceholderUpsertRequest(BaseModel):
+    """Internal dispatcher-svc -> committer-svc call (ADR 0009) — the
+    second synchronous service-to-service asymmetry in this codebase,
+    same treatment as RoutedReplyMessage above. dispatcher-svc computes
+    where a latent's [idea]-tagged placeholder belongs; committer-svc,
+    the only service with Calendar write credentials, is the one that
+    actually calls the API. existing_event_id=None means create; a real
+    id means try to move that event in place, falling back to create if
+    it 404s (the user deleted it by hand)."""
+
+    user_id: UUID
+    title: str
+    start: datetime  # naive local wall-clock, same convention as ConfirmedItemMessage.due_at
+    effort_minutes: int = Field(gt=0, le=1440)
+    existing_event_id: str | None = None
+
+    _strip_start_tz = field_validator("start")(_strip_due_at_tzinfo)

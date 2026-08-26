@@ -3,18 +3,18 @@ capacity-engine.md, PRD §6). Every formula here is transcribed exactly
 from that doc; if this module and the doc ever disagree, this module is
 buggy, not the doc.
 
-dispatcher-svc (step 8) is the only caller: it fetches real Calendar
-events and latents, builds the dataclasses below, and calls
-select_suggestion() once per run. Nothing in this file talks to Calendar,
-Postgres, or Pub/Sub — that's deliberate (capacity-engine.md §0, "no
-service, no deploy" for this step).
-"""
+dispatcher-svc is the only caller. Nothing in this file talks to
+Calendar, Postgres, or Pub/Sub — that's deliberate.
+
+revival_score/REVIVAL_THRESHOLD/select_suggestion/is_eligible/Candidate
+(the batch-scoring "at most one suggestion per run" engine) and
+fit_score/load_fit (only ever consumed by that engine) are removed —
+user-directed, replaced by the auto-scheduled-placeholder model
+(capacity-engine.md §5, ADR 0009): every committed latent gets its own
+next_fit_start-triggered text, not a single scored pick per sweep."""
 
 from dataclasses import dataclass
-from datetime import date, time
-from math import exp
-
-REVIVAL_THRESHOLD = 0.4  # tunable — capacity-engine.md §5's "on the threshold constant"
+from datetime import date, datetime, time
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class Event:
     all_day: bool = False
     declined: bool = False
     transparency: str = "opaque"  # "opaque" | "transparent"
+    google_event_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,19 +49,14 @@ class CapacitySnapshot:
 @dataclass(frozen=True)
 class LatentCandidate:
     item_id: str
-    created_at: date  # "days_since_capture" is measured from here, §5
+    title: str
     effort_minutes: int
     dismissal_count: int
     dormant_until: date | None
     last_surfaced_at: date | None
     has_open_suggestion: bool
-
-
-@dataclass(frozen=True)
-class Candidate:
-    item: LatentCandidate
-    snapshot: CapacitySnapshot
-    score: float
+    next_fit_start: datetime | None
+    placeholder_event_id: str | None
 
 
 def _to_minutes(t: time) -> int:
@@ -99,11 +95,28 @@ def _complement(merged: list[Interval], wh_start: time, wh_end: time) -> list[In
     return free
 
 
-def free_intervals(day: date, events: list[Event], wh_start: time, wh_end: time) -> list[Interval]:
+def free_intervals(
+    day: date,
+    events: list[Event],
+    wh_start: time,
+    wh_end: time,
+    exclude_event_id: str | None = None,
+) -> list[Interval]:
     """capacity-engine.md §2. `day` isn't used in the computation itself —
     the caller has already filtered `events` down to that day; kept as a
-    parameter for signature fidelity with the doc and so step 8's real
-    per-day Calendar fetch has an obvious place to pass it."""
+    parameter for signature fidelity with the doc and so the real per-day
+    Calendar fetch has an obvious place to pass it.
+
+    exclude_event_id (capacity-engine.md §5's self-exclusion note):
+    recomputing one latent's own next_fit_start must not see that same
+    latent's own [idea]-tagged placeholder as busy — otherwise it would
+    evict itself from a perfectly good slot every time. Every *other*
+    latent's placeholder is a real Calendar event and is deliberately
+    left in `events`, so it's still counted as busy — that's the whole
+    mechanism behind a declined idea naturally landing after every
+    already-scheduled one, no separate reflow needed."""
+    if exclude_event_id is not None:
+        events = [e for e in events if e.google_event_id != exclude_event_id]
     if any(e.all_day for e in events):
         return []
     busy = [
@@ -160,59 +173,3 @@ def block_fit(largest_block: int, effort_minutes: int) -> int:
     return 1 if largest_block >= effort_minutes else 0
 
 
-def load_fit(delta: float | None) -> float:
-    if delta is None:
-        return 0.5  # cold start, capacity-engine.md §3 — neutral, not a penalty
-    return min(1.0, max(0.0, 0.5 - delta * 1.25))
-
-
-def fit_score(snapshot: CapacitySnapshot, effort_minutes: int) -> float:
-    return block_fit(snapshot.largest_contiguous_block, effort_minutes) * load_fit(
-        snapshot.load_delta
-    )
-
-
-def revival_score(item: LatentCandidate, today: date, fit: float) -> float:
-    days_since_capture = (today - item.created_at).days
-    recency_decay = 1 - exp(-days_since_capture / 14)
-    dismissal_penalty = 1 / (1 + item.dismissal_count)
-    return recency_decay * dismissal_penalty * fit
-
-
-def is_eligible(item: LatentCandidate, today: date) -> bool:
-    """capacity-engine.md §5's eligibility filter, applied before scoring."""
-    days_since_capture = (today - item.created_at).days
-    if days_since_capture < 3:
-        return False
-    if item.dormant_until is not None and item.dormant_until > today:
-        return False
-    if item.last_surfaced_at is not None and (today - item.last_surfaced_at).days < 10:
-        return False
-    if item.has_open_suggestion:
-        return False
-    return True
-
-
-def select_suggestion(
-    latents: list[LatentCandidate], snapshots: list[CapacitySnapshot], today: date
-) -> Candidate | None:
-    """capacity-engine.md §5: for each eligible latent, find its own best
-    day among the given snapshots; then take the single highest-scoring
-    (latent, day) pair across the whole backlog, if it clears
-    REVIVAL_THRESHOLD. At most one suggestion per call, matching one
-    dispatcher run producing at most one suggestion."""
-    best: Candidate | None = None
-    for item in latents:
-        if not is_eligible(item, today):
-            continue
-        item_best: Candidate | None = None
-        for snapshot in snapshots:
-            fit = fit_score(snapshot, item.effort_minutes)
-            score = revival_score(item, today, fit)
-            if item_best is None or score > item_best.score:
-                item_best = Candidate(item=item, snapshot=snapshot, score=score)
-        if item_best is not None and (best is None or item_best.score > best.score):
-            best = item_best
-    if best is not None and best.score > REVIVAL_THRESHOLD:
-        return best
-    return None

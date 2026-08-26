@@ -1,7 +1,8 @@
 """docs/engineering/test-plan.md step 14 — the feedback loop: Y/N/Later
-replies to a sent suggestion, and the 24h no-response timeout. DB,
-Twilio, and Calendar all mocked; state-machine.md §2's outcome table is
-tested exhaustively."""
+replies to a fired suggestion, the 24h no-response timeout, and (ADR
+0009) the auto-scheduled-placeholder endpoints (/latents/{id}/next-fit,
+/users/{id}/next-fit, /latents/{id}/fire). DB, Twilio, Calendar, and the
+committer-svc/Cloud-Tasks client modules are all mocked here."""
 
 from datetime import date, datetime, time
 from unittest.mock import MagicMock, patch
@@ -37,31 +38,31 @@ def _mock_connection(fetchone_result=None):
 def _suggestion_context(
     *,
     suggestion_id="sugg-1",
-    snapshot_id="snap-1",
     title="Learn pottery",
     summary="Take a class.",
     effort_minutes=120,
     dismissal_count=0,
+    placeholder_event_id="evt-placeholder",
     tz_name="America/Toronto",
     wh_start=time(9, 0),
     wh_end=time(18, 0),
     refresh_ref="projects/p/secrets/user-refresh-token-x/versions/latest",
     phone="+15551234567",
-    snapshot_date=date(2026, 8, 27),
+    scheduled_for=datetime(2026, 8, 27, 9, 0),
 ):
     return (
         suggestion_id,
-        snapshot_id,
         title,
         summary,
         effort_minutes,
         dismissal_count,
+        placeholder_event_id,
         tz_name,
         wh_start,
         wh_end,
         refresh_ref,
         phone,
-        snapshot_date,
+        scheduled_for,
     )
 
 
@@ -107,66 +108,92 @@ def test_resolve_stale_suggestions_no_commit_when_none_stale():
     conn.commit.assert_not_called()
 
 
-# --- /reply outcome table (state-machine.md §2) ------------------------
+# --- /reply outcome table (state-machine.md §2, ADR 0009) --------------
 
 
-def test_n_reply_below_threshold_returns_to_eligible(client):
+def test_n_reply_below_threshold_reschedules_immediately(client):
     conn = _mock_connection(fetchone_result=_suggestion_context(dismissal_count=0))
+    events_by_day = {date(2026, 8, 28): []}
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
         patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.user_credentials"),
+        patch("dispatcher_svc.main.AuthorizedSession"),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.tasks_client") as mock_tasks,
     ):
+        mock_committer.upsert_placeholder.return_value = "new-evt-id"
         resp = client.post("/reply", json=_reply_payload("n"))
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "dismissed"
     mock_sms.assert_called_once()
+    # A first dismissal reschedules — not a cooldown message.
+    assert "np" in mock_sms.call_args.args[2]
+    mock_committer.upsert_placeholder.assert_called_once()
+    mock_tasks.enqueue_fire_task.assert_called_once()
 
-    update_calls = [c for c in conn.execute.call_args_list if "UPDATE latents" in c.args[0]]
-    assert len(update_calls) == 1
-    assert "dormant_until" not in update_calls[0].args[0]
-    assert update_calls[0].args[1][0] == 1  # dismissal_count incremented to 1
+    dismissal_update = [
+        c for c in conn.execute.call_args_list
+        if "UPDATE latents" in c.args[0] and "dismissal_count" in c.args[0]
+        and "dormant_until" not in c.args[0]
+    ]
+    assert len(dismissal_update) == 1
+    assert dismissal_update[0].args[1][0] == 1  # dismissal_count incremented to 1
 
 
-def test_n_reply_reaching_threshold_goes_dormant(client):
+def test_n_reply_reaching_threshold_goes_dormant_and_clears_placeholder(client):
     conn = _mock_connection(fetchone_result=_suggestion_context(dismissal_count=1))
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
         patch("dispatcher_svc.main._send_sms"),
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
     ):
         resp = client.post("/reply", json=_reply_payload("no"))
 
     assert resp.json()["status"] == "dismissed"
-    update_calls = [c for c in conn.execute.call_args_list if "UPDATE latents" in c.args[0]]
-    assert len(update_calls) == 1
-    assert "dormant_until" in update_calls[0].args[0]
-    assert update_calls[0].args[1][0] == 2  # dismissal_count incremented to 2
+    mock_committer.delete_placeholder.assert_called_once()
+
+    dormancy_update = [
+        c for c in conn.execute.call_args_list
+        if "UPDATE latents" in c.args[0] and "dormant_until" in c.args[0]
+        and "dismissal_count" in c.args[0]
+    ]
+    assert len(dormancy_update) == 1
+    assert dormancy_update[0].args[1][0] == 2  # dismissal_count incremented to 2
 
 
-def test_later_reply_snoozes_no_dismissal_change(client):
+def test_later_reply_snoozes_clears_placeholder_no_dismissal_change(client):
     conn = _mock_connection(fetchone_result=_suggestion_context(dismissal_count=1))
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
         patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
     ):
         resp = client.post("/reply", json=_reply_payload("later"))
 
     assert resp.json()["status"] == "snoozed"
     mock_sms.assert_called_once()
+    mock_committer.delete_placeholder.assert_called_once()
 
     suggestion_update = [
         c for c in conn.execute.call_args_list if "UPDATE suggestions" in c.args[0]
     ][0]
     assert "snoozed" in suggestion_update.args[0]
 
-    latent_update = [c for c in conn.execute.call_args_list if "UPDATE latents" in c.args[0]][0]
-    assert "dismissal_count" not in latent_update.args[0]
-    assert "dormant_until" in latent_update.args[0]
+    dormancy_update = [
+        c for c in conn.execute.call_args_list
+        if "UPDATE latents" in c.args[0] and "dormant_until" in c.args[0]
+    ][0]
+    assert "dismissal_count" not in dormancy_update.args[0]
 
 
 def test_y_reply_publishes_confirmed_and_sends_ack(client):
     conn = _mock_connection(
-        fetchone_result=_suggestion_context(effort_minutes=120, snapshot_date=date(2026, 8, 27))
+        fetchone_result=_suggestion_context(
+            effort_minutes=120, scheduled_for=datetime(2026, 8, 27, 9, 0)
+        )
     )
     events_by_day = {date(2026, 8, 27): []}
     with (
@@ -246,19 +273,13 @@ def test_health(client):
     assert resp.json() == {"status": "ok"}
 
 
-# --- POST /latents/{item_id}/next-fit ----------------------------------
+# --- POST /latents/{item_id}/next-fit (ADR 0009) ------------------------
 # User-directed real bug fix: a freshly-committed idea previously showed
 # "someday" until the next twice-daily /dispatch sweep. committer-svc now
 # fires this endpoint immediately on commit via an unscheduled Cloud Task.
 
 
 def _mock_next_fit_connection(*, item_row, next_fit_updates):
-    """item_row feeds the initial items/latents/users join SELECT;
-    next_fit_updates is a list this appends (next_fit_start, item_id)
-    tuples to, from the final UPDATE latents call. This endpoint never
-    touches capacity_snapshots (real bug, fixed: load_delta is NOT NULL
-    and this endpoint has no trailing window to compute it from)."""
-
     def execute_side_effect(sql, params=None):
         result = MagicMock()
         if "FROM items i" in sql and "JOIN latents l" in sql:
@@ -274,17 +295,23 @@ def _mock_next_fit_connection(*, item_row, next_fit_updates):
     return conn
 
 
+def _item_row(
+    title="Nerf gun turret", effort_minutes=120, user_id=None, tz_name="America/Toronto",
+    wh_start=time(9, 0), wh_end=time(18, 0),
+    refresh_ref="projects/p/secrets/user-refresh-token-x/versions/latest",
+    dismissal_count=0, dormant_until=None, last_surfaced_at=None,
+    next_fit_start=None, placeholder_event_id=None,
+):
+    return (
+        title, effort_minutes, user_id or uuid4(), tz_name, wh_start, wh_end, refresh_ref,
+        dismissal_count, dormant_until, last_surfaced_at, next_fit_start, placeholder_event_id,
+    )
+
+
 def test_next_fit_computes_and_persists_earliest_fitting_day(client):
     item_id = uuid4()
-    item_row = (
-        120,  # effort_minutes
-        "America/Toronto",
-        time(9, 0),
-        time(18, 0),
-        "projects/p/secrets/user-refresh-token-x/versions/latest",
-    )
     next_fit_updates = []
-    conn = _mock_next_fit_connection(item_row=item_row, next_fit_updates=next_fit_updates)
+    conn = _mock_next_fit_connection(item_row=_item_row(), next_fit_updates=next_fit_updates)
     events_by_day = {date(2026, 8, 27): [], date(2026, 8, 28): []}
 
     with (
@@ -292,24 +319,22 @@ def test_next_fit_computes_and_persists_earliest_fitting_day(client):
         patch("dispatcher_svc.main.user_credentials"),
         patch("dispatcher_svc.main.AuthorizedSession"),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.tasks_client") as mock_tasks,
     ):
+        mock_committer.upsert_placeholder.return_value = "evt-1"
         resp = client.post(f"/latents/{item_id}/next-fit")
 
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "ok"
-    assert body["next_fit_start"] is not None
-
+    assert resp.json()["status"] == "ok"
+    mock_committer.upsert_placeholder.assert_called_once()
+    mock_tasks.enqueue_fire_task.assert_called_once()
     assert len(next_fit_updates) == 1
-    updated_next_fit, updated_item_id = next_fit_updates[0]
-    assert updated_item_id == str(item_id)
-    assert updated_next_fit is not None
 
 
 def test_next_fit_skips_users_with_no_linked_google_account(client):
     item_id = uuid4()
-    item_row = (120, "America/Toronto", time(9, 0), time(18, 0), None)
-    conn = _mock_next_fit_connection(item_row=item_row, next_fit_updates=[])
+    conn = _mock_next_fit_connection(item_row=_item_row(refresh_ref=None), next_fit_updates=[])
 
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
@@ -329,7 +354,7 @@ def test_next_fit_unknown_item_returns_404(client):
     assert resp.status_code == 404
 
 
-# --- POST /users/{user_id}/next-fit -------------------------------------
+# --- POST /users/{user_id}/next-fit (ADR 0009) --------------------------
 # User-directed real bug fix: changing working hours on the dashboard
 # didn't recompute any already-committed idea's next_fit_start until the
 # next twice-daily sweep.
@@ -362,8 +387,8 @@ def test_next_fit_for_user_recomputes_every_committed_latent(client):
         "projects/p/secrets/user-refresh-token-x/versions/latest",
     )
     latent_rows = [
-        (uuid4(), datetime(2026, 8, 1), 120, 0, None, None, False),
-        (uuid4(), datetime(2026, 8, 10), 240, 0, None, None, False),
+        (uuid4(), "Idea one", 120, 0, None, None, False, None, None),
+        (uuid4(), "Idea two", 240, 0, None, None, False, None, None),
     ]
     next_fit_updates = []
     conn = _mock_user_next_fit_connection(
@@ -376,7 +401,10 @@ def test_next_fit_for_user_recomputes_every_committed_latent(client):
         patch("dispatcher_svc.main.user_credentials"),
         patch("dispatcher_svc.main.AuthorizedSession"),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.tasks_client"),
     ):
+        mock_committer.upsert_placeholder.return_value = "evt-1"
         resp = client.post(f"/users/{user_id}/next-fit")
 
     assert resp.status_code == 200
@@ -407,3 +435,113 @@ def test_next_fit_for_user_unknown_user_returns_404(client):
     with patch("dispatcher_svc.main.get_connection", return_value=conn):
         resp = client.post(f"/users/{uuid4()}/next-fit")
     assert resp.status_code == 404
+
+
+# --- POST /latents/{item_id}/fire (ADR 0009) -----------------------------
+# The Cloud Task tasks_client.enqueue_fire_task schedules for exactly a
+# latent's next_fit_start.
+
+
+def _mock_fire_connection(*, row):
+    conn = MagicMock()
+    conn.execute.return_value.fetchone.return_value = row
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    return conn
+
+
+def _fire_row(
+    title="Nerf gun turret", effort_minutes=240, user_id=None, tz_name="America/Vancouver",
+    wh_start=time(9, 0), wh_end=time(23, 0),
+    refresh_ref="projects/p/secrets/user-refresh-token-x/versions/latest",
+    dismissal_count=0, dormant_until=None, last_surfaced_at=None,
+    next_fit_start=None, placeholder_event_id="evt-1", has_open_suggestion=False,
+):
+    return (
+        title, effort_minutes, user_id or uuid4(), tz_name, wh_start, wh_end, refresh_ref, phone,
+        dismissal_count, dormant_until, last_surfaced_at, next_fit_start, placeholder_event_id,
+        has_open_suggestion,
+    )
+
+
+phone = "+15551234567"
+
+
+def test_fire_sends_sms_and_creates_suggestion_when_slot_still_fits(client):
+    scheduled_for = datetime(2026, 8, 27, 9, 0, tzinfo=None)
+    row = _fire_row(next_fit_start=datetime(2026, 8, 27, 9, 0))
+    conn = _mock_fire_connection(row=row)
+    events_by_day = {date(2026, 8, 27): []}  # fully free
+
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.user_credentials"),
+        patch("dispatcher_svc.main.AuthorizedSession"),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+    ):
+        resp = client.post(
+            f"/latents/{uuid4()}/fire", json={"scheduled_for": scheduled_for.isoformat()}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "fired"
+    mock_sms.assert_called_once()
+    insert_calls = [
+        c for c in conn.execute.call_args_list if "INSERT INTO suggestions" in c.args[0]
+    ]
+    assert len(insert_calls) == 1
+
+
+def test_fire_skips_stale_task(client):
+    """A later write already superseded this task's scheduled_for by the
+    time it actually fires — must no-op, not double-text."""
+    row = _fire_row(next_fit_start=datetime(2026, 8, 28, 9, 0))  # different from payload below
+    conn = _mock_fire_connection(row=row)
+
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main._send_sms") as mock_sms,
+    ):
+        resp = client.post(
+            f"/latents/{uuid4()}/fire",
+            json={"scheduled_for": datetime(2026, 8, 27, 9, 0).isoformat()},
+        )
+
+    assert resp.json()["status"] == "stale_task_skipped"
+    mock_sms.assert_not_called()
+
+
+def test_fire_no_longer_committed_latent_is_a_noop(client):
+    conn = _mock_fire_connection(row=None)
+    with patch("dispatcher_svc.main.get_connection", return_value=conn):
+        resp = client.post(
+            f"/latents/{uuid4()}/fire",
+            json={"scheduled_for": datetime(2026, 8, 27, 9, 0).isoformat()},
+        )
+    assert resp.json()["status"] == "skipped"
+
+
+def test_fire_reschedules_silently_when_slot_no_longer_fits(client):
+    next_fit = datetime(2026, 8, 27, 9, 0)
+    row = _fire_row(next_fit_start=next_fit)
+    conn = _mock_fire_connection(row=row)
+    # The block is now fully booked — the stored next_fit_start is stale.
+    events_by_day = {date(2026, 8, 27): [Event(start=time(9, 0), end=time(23, 0))]}
+
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.user_credentials"),
+        patch("dispatcher_svc.main.AuthorizedSession"),
+        patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+    ):
+        resp = client.post(
+            f"/latents/{uuid4()}/fire", json={"scheduled_for": next_fit.isoformat()}
+        )
+
+    assert resp.json()["status"] == "rescheduled_silently"
+    mock_sms.assert_not_called()
+    # No fitting slot anywhere in this mocked (all-booked) window -> cleared.
+    mock_committer.delete_placeholder.assert_called_once()

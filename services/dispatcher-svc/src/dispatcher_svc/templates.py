@@ -63,48 +63,24 @@ def render_event_reminder_start(title: str, due_at: datetime, today: date) -> st
     return f"⏰ {title} is starting now — {format_due_at(due_at)}."
 
 
-def _time_of_day_phrase(block_start_hour: int) -> str:
-    if block_start_hour < 12:
-        return "in the morning"
-    if block_start_hour < 17:
-        return "in the afternoon"
-    return "in the evening"
-
-
-def evidence_line(
-    booked_today: int, trailing_booked_minutes: list[int], load_delta: float | None
-) -> str | None:
-    """capacity-engine.md §6's two-tier rule, superlative before generic,
-    omitted rather than a weak claim if neither is true."""
-    if trailing_booked_minutes and booked_today == min(trailing_booked_minutes):
-        return "lightest day you've had in two weeks"
-    if load_delta is not None and load_delta < -0.15:
-        return "lighter than usual"
-    return None
-
-
-def render_suggestion(
-    day_name: str,
-    block_start_hour: int,
-    block_minutes: int,
-    booked_today: int,
-    trailing_booked_minutes: list[int],
-    load_delta: float | None,
-    item_title: str,
-    days_since_capture: int,
-) -> str:
-    evidence = evidence_line(booked_today, trailing_booked_minutes, load_delta)
-    opening = (
-        f"{day_name} looks open — {_format_block_hours(block_minutes)} clear "
-        f"{_time_of_day_phrase(block_start_hour)}"
-    )
-    opening += f",\n{evidence}." if evidence else "."
+def render_fire_suggestion(item_title: str, block_minutes: int) -> str:
+    """ADR 0009 — fires the instant a latent's own next_fit_start
+    arrives, replacing the old revival_score-picked, one-per-run
+    render_suggestion. Deliberately terser — no time-of-day clause, no
+    "lightest day" evidence line; the moment itself is the pitch."""
     return (
-        f"{opening}\n\n"
-        f'💡 "{item_title}"\n'
-        f"   (you mentioned this {days_since_capture} days ago)\n\n"
-        f"Want it on the calendar? Y / N / Later"
+        f'yo u have {_format_block_hours(block_minutes)} free right now — '
+        f'wanna bang out "{item_title}"?\n\nY / N / Later'
     )
+
+
+def render_deferred(next_fit_start: datetime | None, tz) -> str:
+    """N, first dismissal (< 2) — an immediate reschedule, not a cooldown,
+    so render_dismissed()'s "for a while" wording would be wrong here;
+    that one's kept for the second-dismissal/dormancy path only."""
+    if next_fit_start is None:
+        return "np, i'll keep an eye out for room."
+    return f"np — i'll text you again {next_fit_start.astimezone(tz).strftime('%A')}."
 
 
 def render_accepted(title: str, due_at: datetime) -> str:
@@ -112,6 +88,9 @@ def render_accepted(title: str, due_at: datetime) -> str:
 
 
 def render_dismissed() -> str:
+    """Only reached on the second dismissal now (30d dormancy) — the
+    first dismissal gets render_deferred() instead, since it reschedules
+    immediately rather than cooling down."""
     return "Got it, I won't suggest that again for a while."
 
 

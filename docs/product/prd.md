@@ -171,6 +171,8 @@ Want it on the calendar? Y / N / Later
 
 Naming the *evidence* ("3h clear", "lightest day in two weeks") is what makes this read as intelligence rather than a random reminder. Always include it.
 
+**Replaced, v1, user-directed — ADR [0009](../decisions/0009-tentative-placeholder-write-before-confirm.md):** the scored, "one suggestion per run, maximum" model above is gone. Every committed, non-dormant idea now gets its own real `[idea]`-tagged Calendar placeholder at its own next-fit slot, and its own text at the exact instant that slot arrives — no ranking against other ideas, no restraint threshold. See `capacity-engine.md` §5 for the replacement model and the reasoning; the design principle that motivated the old "restraint is the feature" framing is explicitly traded away here, not overlooked.
+
 ---
 
 ## 6. The capacity engine
@@ -202,11 +204,7 @@ recency_decay     = 1 − exp(−days_since_capture / 14)     # ideas need to br
 dismissal_penalty = 1 / (1 + dismissal_count)
 ```
 
-Rules:
-- Items younger than 3 days are never surfaced.
-- `dismissal_count ≥ 2` → dormant for 30 days.
-- `Later` response → snooze 7 days, no dismissal penalty.
-- An item surfaced in the last 10 days is not eligible.
+**Removed, v1, user-directed — ADR 0009:** `revival_score`/`recency_decay`/`dismissal_penalty` are gone along with the scoring engine (§5.3's note above). Of the original four eligibility rules, two specifically contradicted the replacement model and were dropped, not just the formula that used them: an idea younger than 3 days now gets scheduled immediately (there's no score left to protect from a fresh item), and a first decline now reschedules within the same reply even if that lands inside 10 days (see `capacity-engine.md` §5.5 for the reasoning). The other two are unchanged: `dismissal_count ≥ 2` → dormant 30 days; `Later` → snooze 7 days, no dismissal penalty.
 
 ### 6.4 Feedback loop
 Every suggestion outcome is written to `suggestions`. Dismissals adjust `dismissal_count`; acceptances are the ground truth signal that the fit model works. This is ~20 lines of code and it is the difference between "heuristic" and "adaptive system" in the write-up. Do not skip it.
