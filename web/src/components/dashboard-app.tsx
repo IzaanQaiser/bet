@@ -2,9 +2,7 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import { HeroMemory, type MemoryRowData } from "@/components/hero-memory";
-import { SettingsMenu } from "@/components/settings-menu";
 import { Button } from "@/components/ui/button";
-import { WeekCalendar } from "@/components/week-calendar";
 import { digitsOnly, formatPhoneDisplay, toE164 } from "@/lib/phone";
 
 const SESSION_KEY = "bet_dashboard_session";
@@ -18,7 +16,6 @@ interface ItemRow {
   updated_at?: string;
   due_at?: string | null;
   calendar_event_id?: string | null;
-  effort_minutes?: number | null;
   pending_fields?: string[] | null;
   last_message_at?: string | null;
 }
@@ -27,14 +24,6 @@ interface ItemsResponse {
   in_progress: ItemRow[];
   committed: ItemRow[];
   other: ItemRow[];
-}
-
-interface SuggestionRow {
-  id: string;
-  title: string;
-  outcome: string | null;
-  sent_at: string;
-  responded_at: string | null;
 }
 
 interface ProfileData {
@@ -65,17 +54,6 @@ function humanizeState(state: string | undefined): string {
 function shortDate(iso: string | null | undefined, timeZone: string): string {
   if (!iso) return "committed";
   return new Date(iso).toLocaleDateString("en-US", { timeZone, weekday: "short" });
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="mb-10">
-      <h2 className="mb-2 font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
-        {title}
-      </h2>
-      {children}
-    </section>
-  );
 }
 
 function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
@@ -200,7 +178,6 @@ export function DashboardApp() {
     }
   });
   const [items, setItems] = useState<ItemsResponse | null>(null);
-  const [suggestions, setSuggestions] = useState<SuggestionRow[]>([]);
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -215,9 +192,8 @@ export function DashboardApp() {
 
     async function load() {
       const t = token as string;
-      const [itemsRes, suggestionsRes, profileRes] = await Promise.all([
+      const [itemsRes, profileRes] = await Promise.all([
         authedFetch("/me/items", t),
-        authedFetch("/me/suggestions", t),
         authedFetch("/me/profile", t),
       ]);
       if (itemsRes.status === 401 || profileRes.status === 401) {
@@ -231,19 +207,14 @@ export function DashboardApp() {
         }
         return;
       }
-      if (!itemsRes.ok || !suggestionsRes.ok || !profileRes.ok) {
+      if (!itemsRes.ok || !profileRes.ok) {
         if (!cancelled) setLoadError("Couldn't load your data. Try refreshing.");
         return;
       }
-      const [itemsBody, suggestionsBody, profileBody] = await Promise.all([
-        itemsRes.json(),
-        suggestionsRes.json(),
-        profileRes.json(),
-      ]);
+      const [itemsBody, profileBody] = await Promise.all([itemsRes.json(), profileRes.json()]);
       if (cancelled) return;
       setLoadError(null);
       setItems(itemsBody);
-      setSuggestions(suggestionsBody.suggestions);
       setProfile(profileBody);
     }
 
@@ -267,7 +238,6 @@ export function DashboardApp() {
   function logout() {
     setToken(null);
     setItems(null);
-    setSuggestions([]);
     setProfile(null);
     try {
       localStorage.removeItem(SESSION_KEY);
@@ -277,43 +247,30 @@ export function DashboardApp() {
   }
 
   async function deleteItem(itemId: string) {
-    if (!token) return;
-    // Optimistic: pull it out of view immediately rather than waiting on
-    // the round trip (which also does a best-effort real Calendar
-    // delete) — a failed request just means it reappears on next load,
-    // not a broken state.
-    setItems((prev) =>
-      prev
-        ? {
-            in_progress: prev.in_progress.filter((r) => r.id !== itemId),
-            committed: prev.committed.filter((r) => r.id !== itemId),
-            other: prev.other.filter((r) => r.id !== itemId),
-          }
-        : prev
-    );
-    try {
-      await authedFetch(`/me/items/${itemId}`, token, { method: "DELETE" });
-    } catch {
-      // best-effort — see the optimistic-removal note above
+    if (!token || !items) return;
+    const target =
+      items.in_progress.find((r) => r.id === itemId) ??
+      items.committed.find((r) => r.id === itemId) ??
+      items.other.find((r) => r.id === itemId);
+    if (!window.confirm(`Remove "${target?.title ?? "this"}"? This can't be undone.`)) {
+      return;
     }
-  }
 
-  async function saveTimezone(timezone: string): Promise<boolean> {
-    if (!token) return false;
+    // Optimistic, but rolled back on failure (below) — silently reappearing
+    // hours later on the next poll with no explanation was confusing; a
+    // real failure now restores the item and says so immediately.
+    const previous = items;
+    setItems({
+      in_progress: items.in_progress.filter((r) => r.id !== itemId),
+      committed: items.committed.filter((r) => r.id !== itemId),
+      other: items.other.filter((r) => r.id !== itemId),
+    });
     try {
-      const res = await authedFetch("/me/profile", token, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ timezone }),
-      });
-      if (!res.ok) return false;
-      // Optimistic-on-success: dashboard-svc's PATCH already validated the
-      // zone name (400s on an unknown one, so we never get here with junk)
-      // — no need to re-fetch the whole profile just to reflect this one field.
-      setProfile((prev) => (prev ? { ...prev, timezone } : prev));
-      return true;
+      const res = await authedFetch(`/me/items/${itemId}`, token, { method: "DELETE" });
+      if (!res.ok) throw new Error(`delete failed: ${res.status}`);
     } catch {
-      return false;
+      setItems(previous);
+      setLoadError("Couldn't remove that — try again.");
     }
   }
 
@@ -359,13 +316,8 @@ export function DashboardApp() {
       ]
     : [];
 
-  const committedWithDates = items ? items.committed.filter((row) => row.due_at) : [];
-
   return (
     <>
-      <div className="mb-2">
-        <SettingsMenu timezone={timeZone} onSave={saveTimezone} />
-      </div>
       <div className="mb-8 flex items-baseline justify-between">
         <h1 className="font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
           What bet&apos;s tracking.
@@ -382,52 +334,17 @@ export function DashboardApp() {
 
       {!items || !profile ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : memoryRows.length === 0 ? (
+        <div className="mb-10 rounded-[10px] border-[1.5px] border-dashed border-border px-[18px] py-4">
+          <p className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
+            agent memory
+          </p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Nothing yet — text bet something and it&apos;ll show up here.
+          </p>
+        </div>
       ) : (
-        <>
-          {memoryRows.length === 0 ? (
-            <div className="mb-10 rounded-[10px] border-[1.5px] border-dashed border-border px-[18px] py-4">
-              <p className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
-                agent memory
-              </p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                Nothing yet — text bet something and it&apos;ll show up here.
-              </p>
-            </div>
-          ) : (
-            <HeroMemory rows={memoryRows} onDelete={deleteItem} />
-          )}
-
-          {committedWithDates.length > 0 && (
-            <Section title="On your calendar">
-              <WeekCalendar
-                items={committedWithDates.map((row) => ({
-                  id: row.id,
-                  title: row.title,
-                  due_at: row.due_at as string,
-                  effort_minutes: row.effort_minutes ?? null,
-                }))}
-                timeZone={timeZone}
-                onDelete={deleteItem}
-              />
-            </Section>
-          )}
-
-          {suggestions.length > 0 && (
-            <Section title="Suggestions">
-              {suggestions.map((s) => (
-                <div
-                  key={s.id}
-                  className="flex items-baseline justify-between gap-4 border-t border-dashed border-border py-2 text-sm first:border-t-0"
-                >
-                  <span>{s.title}</span>
-                  <span className="font-mono text-[0.6875rem] text-muted-foreground">
-                    {s.outcome ?? "pending"}
-                  </span>
-                </div>
-              ))}
-            </Section>
-          )}
-        </>
+        <HeroMemory rows={memoryRows} onDelete={deleteItem} />
       )}
     </>
   );
