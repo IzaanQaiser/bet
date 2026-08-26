@@ -5,7 +5,7 @@ resolver_svc.conversation.converse() for this flow; converse() itself is
 mocked here, same as clarify() was before it."""
 
 import base64
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -40,12 +40,19 @@ def client(monkeypatch):
 
 
 def _mock_connection(
-    *, phone="+15551234567", tz="America/Los_Angeles", item_row=None, conversation_row=None
+    *,
+    phone="+15551234567",
+    tz="America/Los_Angeles",
+    item_row=None,
+    conversation_row=None,
+    other_items_rows=None,
 ):
     def execute_side_effect(sql, params=None):
         result = MagicMock()
         if "FROM users" in sql:
             result.fetchone.return_value = (phone, tz)
+        elif "JOIN obligations" in sql:
+            result.fetchall.return_value = other_items_rows or []  # _other_items_context
         elif "FROM items" in sql:
             result.fetchone.return_value = item_row
         elif "FROM conversations" in sql:
@@ -544,6 +551,37 @@ def test_check_duplicate_excludes_dead_states_from_both_queries():
     assert "CANCELLED" in hash_params[-1] and "MERGED" in hash_params[-1]
     assert "state != ALL" in vector_sql
     assert "CANCELLED" in vector_params[-2] and "MERGED" in vector_params[-2]
+
+
+def test_other_items_context_formats_and_excludes_current_item():
+    """Cross-item situational awareness (user-directed): converse() should
+    see the user's other real committed obligations, formatted as plain
+    strings, excluding whichever item is currently being discussed."""
+    from resolver_svc.main import _other_items_context
+
+    user_id, item_id = uuid4(), uuid4()
+    due = datetime(2026, 8, 26, 23, 0, tzinfo=UTC)  # naive-local due_at stored as UTC-aware here
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = [("Assignment due", due)]
+
+    result = _other_items_context(conn, user_id, item_id, "America/Toronto")
+
+    sql, params = conn.execute.call_args.args
+    assert "state = 'COMMITTED'" in sql
+    assert "i.id != %s" in sql
+    assert params == (str(user_id), str(item_id), 20)
+    assert result == ["Assignment due — due Wed 26 Aug, 7:00 PM"]
+
+
+def test_other_items_context_empty_when_nothing_committed():
+    from resolver_svc.main import _other_items_context
+
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = []
+
+    result = _other_items_context(conn, uuid4(), uuid4(), "America/Toronto")
+
+    assert result == []
 
 
 def test_duplicate_found_routes_to_duplicate_suspected_not_clarification(client):
