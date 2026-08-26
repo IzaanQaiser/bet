@@ -192,72 +192,6 @@ function LoginForm({ onLoggedIn }: { onLoggedIn: (token: string) => void }) {
   );
 }
 
-function ProfilePanel({ token, profile }: { token: string; profile: ProfileData }) {
-  const [timezone, setTimezone] = useState(profile.timezone);
-  const [start, setStart] = useState(profile.working_hours_start.slice(0, 5));
-  const [end, setEnd] = useState(profile.working_hours_end.slice(0, 5));
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-
-  async function save(e: FormEvent) {
-    e.preventDefault();
-    setSaving(true);
-    setSaved(false);
-    try {
-      await authedFetch("/me/profile", token, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          timezone,
-          working_hours_start: start,
-          working_hours_end: end,
-        }),
-      });
-      setSaved(true);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <form onSubmit={save} className="flex flex-wrap items-end gap-4">
-      <div className="flex flex-col gap-1.5">
-        <label className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
-          Timezone
-        </label>
-        <input
-          value={timezone}
-          onChange={(e) => setTimezone(e.target.value)}
-          className="h-9 w-[220px] rounded-[10px] border border-border bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-        />
-      </div>
-      <div className="flex flex-col gap-1.5">
-        <label className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
-          Working hours
-        </label>
-        <div className="flex items-center gap-2">
-          <input
-            type="time"
-            value={start}
-            onChange={(e) => setStart(e.target.value)}
-            className="h-9 rounded-[10px] border border-border bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-          />
-          <span className="text-muted-foreground">–</span>
-          <input
-            type="time"
-            value={end}
-            onChange={(e) => setEnd(e.target.value)}
-            className="h-9 rounded-[10px] border border-border bg-background px-3 text-sm text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-          />
-        </div>
-      </div>
-      <Button type="submit" variant="outline" disabled={saving}>
-        {saving ? "Saving…" : saved ? "Saved" : "Save"}
-      </Button>
-    </form>
-  );
-}
-
 export function DashboardApp() {
   // Lazy initializer, not an effect + setState — same reasoning as
   // register-flow.tsx: the build-time prerender and a real stored-session
@@ -275,6 +209,11 @@ export function DashboardApp() {
   const [suggestions, setSuggestions] = useState<SuggestionRow[]>([]);
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  // Polls rather than loading once: real feedback — the dashboard is
+  // meant to reflect what the agent is doing right now, not a snapshot
+  // from whenever the page happened to load.
+  const POLL_INTERVAL_MS = 8000;
 
   useEffect(() => {
     if (!token || !baseUrl) return;
@@ -308,14 +247,17 @@ export function DashboardApp() {
         profileRes.json(),
       ]);
       if (cancelled) return;
+      setLoadError(null);
       setItems(itemsBody);
       setSuggestions(suggestionsBody.suggestions);
       setProfile(profileBody);
     }
 
     load();
+    const interval = setInterval(load, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
+      clearInterval(interval);
     };
   }, [token]);
 
@@ -475,10 +417,6 @@ export function DashboardApp() {
               ))}
             </Section>
           )}
-
-          <Section title="Profile">
-            <ProfilePanel token={token} profile={profile} />
-          </Section>
         </>
       )}
     </>
