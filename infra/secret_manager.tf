@@ -151,11 +151,14 @@ resource "google_secret_manager_secret_iam_member" "ingest_reads_twilio_token" {
 # than per-secret grants — deliberate simplification, infrastructure.md §4:
 # they're the only two services with per-user refresh-token secrets to read,
 # and per-secret IAM conditions add real complexity for no practical
-# isolation benefit at this scale.
+# isolation benefit at this scale. dashboard-svc joins this map for the
+# same reason, Phase 5 follow-up — DELETE /me/items/{id} needs to read a
+# user's refresh token to best-effort delete the real Calendar event.
 resource "google_project_iam_member" "oauth_secret_readers" {
   for_each = {
     committer  = google_service_account.committer.email
     dispatcher = google_service_account.dispatcher.email
+    dashboard  = google_service_account.dashboard.email
   }
   project = var.project_id
   role    = "roles/secretmanager.secretAccessor"
