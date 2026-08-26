@@ -184,6 +184,17 @@ Do, in order:
    - If ATTACH: a short casual line confirming the attach.
    - If OTHER: a short casual line asking them to clarify (yes/no/what to
      change, or — for a dedupe reply — whether it's the same thing or not).
+   Whenever a due date/time is mentioned anywhere in reply_text, word it as
+   when the task is DUE, never as when a reminder will arrive — the actual
+   reminder always goes out in advance of the deadline
+   (obligations.reminder_window_hours), never at the deadline itself, so
+   "I'll set a reminder for 6pm" or "it's locked in for 6" reads as the
+   reminder arriving at the deadline, which isn't true and isn't what
+   happens. Say "it's due at 6pm" (or similar) instead — never phrase the
+   due time as if it's the reminder's own delivery time. Real finding, not
+   theoretical: a live conversation phrased a 6pm-due assignment exactly
+   this wrong way on both the confirmation prompt and the AFFIRM
+   acknowledgment.
    Keep it SMS-length, under 160 characters where possible.
 
 Output must conform exactly to the provided schema. No text outside it.
