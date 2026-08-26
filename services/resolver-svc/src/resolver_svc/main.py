@@ -10,12 +10,14 @@ same as X?" — never silently merged (ADR 0003). A 0.82-0.92 match
 against an existing *latent* is folded into the eventual confirmation
 message as a non-blocking thread-attach offer instead of its own stage.
 
-Every path that can reach AWAITING_CONFIRMATION carries a possible
-thread-attach candidate forward through conversations.resolved_fields
-(the documented scratchpad, data-model.md §2.4) under `_thread_attach_*`
-keys, since the offer is decided once at the initial dedupe check but
-may need to be rendered much later — after a full clarification
-exchange, or after the user says a dedupe match "N, it's different."
+Every path that can reach a completed item carries a possible thread-attach
+candidate forward through conversations.resolved_fields (the documented
+scratchpad, data-model.md §2.4) under `_thread_attach_*` keys, since the
+offer is decided once at the initial dedupe check but may need to be
+mentioned much later — after a full clarification exchange, or after the
+user says a dedupe match "N, it's different." Purely informational now (see
+the v1-polish note below) — mentioned naturally in the auto-commit message,
+not something a reply can act on anymore.
 Likewise `_dedupe_match_item_id`/`_dedupe_match_title` carry the
 matched item across the DUPLICATE_SUSPECTED Y/N round trip; there is no
 dedicated column for either, matching how `due_at` already had nowhere
@@ -62,6 +64,20 @@ completely untouched and gives the text its own new item via the same
 path a first-contact message takes (`create_raw_item` + `items-raw`
 publish). The DUPLICATE_SUSPECTED path applies the same `relates_to_item`
 check now too (below), on top of its own separate dedupe-question fix.
+
+V1 polish, user-directed: the explicit confirmation step (AWAITING_CONFIRMATION,
+"down to lock that in?" + a required Y reply) is removed. The moment
+still_missing empties out — first pass or after a clarification reply — the
+item auto-commits straight to CONFIRMED via `_confirm_and_publish`, no
+affirmative required. This is a deliberate override of PRD §5.2's "never
+write to the calendar on inference alone" non-negotiable, flagged to the
+user and confirmed explicitly before implementing, not an oversight —
+scoped to v2 being a from-scratch rebuild, not a permanent architectural
+stance. `_handle_confirmation_reply` and the whole AFFIRM/DENY/CORRECTION/
+ATTACH-for-a-fresh-item machinery it implemented are gone with it — no
+code path sets `items.state = 'AWAITING_CONFIRMATION'` anymore. The dedupe
+question (below) is untouched: a likely-duplicate match is still never
+silently merged, that wasn't part of what was asked to change.
 
 The guard checks for an existing `conversations` row, not `items.state`
 — an earlier draft checked state, and a second real bug (found
@@ -345,6 +361,36 @@ def _compute_reminder_times(due_at_iso: str | None) -> tuple[datetime, datetime]
     return due_at - _REMINDER_LEAD, due_at
 
 
+def _confirm_and_publish(
+    conn, item_id, user_id, item_type, title, summary, effort_minutes, resolved_fields
+) -> None:
+    """The only path into CONFIRMED now (module docstring's v1-polish
+    note) — called the instant still_missing empties out, no affirmative
+    required. Publishes items.confirmed and flips items.state; the caller
+    owns its own conversations row write, commit, and SMS send, since
+    those differ per call site (INSERT vs. UPDATE, different columns)."""
+    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"))
+    confirmed = ConfirmedItemMessage(
+        item_id=item_id,
+        user_id=user_id,
+        type=item_type,
+        title=title,
+        summary=summary,
+        due_at=resolved_fields.get("due_at"),
+        effort_minutes=effort_minutes,
+        action_type=resolved_fields.get("action_type"),
+        email_recipient=resolved_fields.get("email_recipient"),
+        email_draft=resolved_fields.get("email_draft"),
+        reminder_1_at=reminder_times[0] if reminder_times else None,
+        reminder_2_at=reminder_times[1] if reminder_times else None,
+    )
+    publish("items-confirmed", confirmed)
+    conn.execute(
+        "UPDATE items SET state = 'CONFIRMED', updated_at = now() WHERE id = %s",
+        (str(item_id),),
+    )
+
+
 def _format_reminder_time(dt: datetime) -> str:
     return dt.strftime("%-I:%M %p")
 
@@ -507,7 +553,6 @@ async def _start_duplicate_suspected(extracted: ExtractedItemMessage, dedupe: De
         effort_minutes=extracted.effort_minutes,
         known_fields=resolved_fields,
         missing_fields=extracted.missing_fields,
-        awaiting_confirmation=False,
         thread_attach_title=None,
         history=history,
         latest_reply=None,
@@ -574,7 +619,6 @@ async def _start_clarification(
         effort_minutes=effort_minutes,
         known_fields=resolved_fields,
         missing_fields=extracted.missing_fields,
-        awaiting_confirmation=False,
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=None,
@@ -613,6 +657,17 @@ async def _start_clarification(
                 Json(resolved_fields),
             ),
         )
+        if not result.still_missing:
+            _confirm_and_publish(
+                conn,
+                extracted.item_id,
+                extracted.user_id,
+                extracted.type,
+                title,
+                extracted.summary,
+                effort_minutes,
+                resolved_fields,
+            )
         conn.commit()
 
     if result.still_missing:
@@ -620,15 +675,9 @@ async def _start_clarification(
         logger.info("CLARIFYING item_id=%s sent question 1/%d", extracted.item_id, MAX_EXCHANGES)
         return "clarifying"
 
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
-            (str(extracted.item_id),),
-        )
-        conn.commit()
     _send_sms(extracted.user_id, phone, reply_text)
-    logger.info("AWAITING_CONFIRMATION item_id=%s (resolved on first pass)", extracted.item_id)
-    return "awaiting_confirmation"
+    logger.info("CONFIRMED item_id=%s (resolved on first pass, auto-committed)", extracted.item_id)
+    return "confirmed"
 
 
 @app.post("/pubsub/push")
@@ -745,7 +794,6 @@ async def _handle_clarification_reply(
         effort_minutes=effort_minutes,
         known_fields=resolved_fields,
         missing_fields=pending_fields,
-        awaiting_confirmation=False,
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=latest_reply,
@@ -804,9 +852,8 @@ async def _handle_clarification_reply(
     reply_text = _ensure_reminder_mention(
         result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
     )
-    conn.execute(
-        "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
-        (str(item_id),),
+    _confirm_and_publish(
+        conn, item_id, user_id, item_type, title, summary, effort_minutes, resolved_fields
     )
     conn.execute(
         "UPDATE conversations SET resolved_fields = %s, pending_fields = %s, "
@@ -815,8 +862,8 @@ async def _handle_clarification_reply(
     )
     conn.commit()
     _send_sms(user_id, phone, reply_text)
-    logger.info("AWAITING_CONFIRMATION item_id=%s (clarification resolved)", item_id)
-    return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+    logger.info("CONFIRMED item_id=%s (clarification resolved, auto-committed)", item_id)
+    return {"status": "confirmed", "item_id": str(item_id)}
 
 
 async def _handle_duplicate_reply(
@@ -860,7 +907,6 @@ async def _handle_duplicate_reply(
         effort_minutes=effort_minutes,
         known_fields=resolved_fields,
         missing_fields=[],
-        awaiting_confirmation=False,
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=text,
@@ -913,7 +959,6 @@ async def _handle_duplicate_reply(
             effort_minutes=effort_minutes,
             known_fields=resolved_fields,
             missing_fields=pending_fields,
-            awaiting_confirmation=False,
             thread_attach_title=thread_attach_title,
             history=history,
             latest_reply=None,
@@ -951,9 +996,8 @@ async def _handle_duplicate_reply(
         reply_text = _ensure_reminder_mention(
             result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
         )
-        conn.execute(
-            "UPDATE items SET state = 'AWAITING_CONFIRMATION', updated_at = now() WHERE id = %s",
-            (str(item_id),),
+        _confirm_and_publish(
+            conn, item_id, user_id, item_type, title, summary, effort_minutes, resolved_fields
         )
         conn.execute(
             "UPDATE conversations SET pending_fields = %s, resolved_fields = %s, "
@@ -962,8 +1006,8 @@ async def _handle_duplicate_reply(
         )
         conn.commit()
         _send_sms(user_id, phone, reply_text)
-        logger.info("AWAITING_CONFIRMATION item_id=%s (post-dedupe, resolved)", item_id)
-        return {"status": "awaiting_confirmation", "item_id": str(item_id)}
+        logger.info("CONFIRMED item_id=%s (post-dedupe, auto-committed)", item_id)
+        return {"status": "confirmed", "item_id": str(item_id)}
 
     # OTHER — genuinely ambiguous about whether this is the same item
     # (relates_to_item already routed genuinely unrelated text away above).
@@ -973,146 +1017,6 @@ async def _handle_duplicate_reply(
     # case in this flow, it gets a real natural clarifying reply instead.
     _send_sms(user_id, phone, dedupe_result.reply_text)
     logger.info("dedupe reply ambiguous item_id=%s text=%r", item_id, text)
-    return {"status": "unhandled_reply", "item_id": str(item_id)}
-
-
-async def _handle_confirmation_reply(
-    conn,
-    user_id,
-    item_id,
-    phone,
-    tz_name,
-    title,
-    item_type,
-    summary,
-    effort_minutes,
-    is_scheduled_event,
-    latest_reply,
-) -> dict:
-    convo_row = conn.execute(
-        "SELECT resolved_fields FROM conversations WHERE item_id = %s "
-        "ORDER BY last_message_at DESC LIMIT 1",
-        (str(item_id),),
-    ).fetchone()
-    resolved_fields = convo_row[0] if convo_row else {}
-    thread_attach_title = resolved_fields.get("_thread_attach_title")
-    history = _recent_history(conn, user_id)
-    other_items = _other_items_context(conn, user_id, item_id, tz_name)
-
-    now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_1_at, reminder_2_at = _future_reminder_strings(
-        resolved_fields.get("due_at"), now_local
-    )
-    result = await converse(
-        session_id=f"{item_id}-{uuid4().hex[:8]}",
-        now_local=now_local,
-        tz_name=tz_name,
-        title=title,
-        item_type=item_type,
-        summary=summary,
-        effort_minutes=effort_minutes,
-        known_fields=resolved_fields,
-        missing_fields=[],
-        awaiting_confirmation=True,
-        thread_attach_title=thread_attach_title,
-        history=history,
-        latest_reply=latest_reply,
-        reminder_1_at=reminder_1_at,
-        reminder_2_at=reminder_2_at,
-        other_items=other_items,
-        is_scheduled_event=is_scheduled_event,
-    )
-    if not result.relates_to_item:
-        return _route_as_new_item(
-            conn, item_id, user_id, latest_reply,
-            reason="reply unrelated during AWAITING_CONFIRMATION",
-        )
-
-    if result.intent == "AFFIRM":
-        # Deliberately the raw, unfiltered _compute_reminder_times here —
-        # this becomes the real persisted obligations.reminder_1_at/
-        # reminder_2_at row, and committer-svc's own overdue-slot check
-        # (_enqueue_reminder_task, "skip if already past at commit time")
-        # is what actually decides whether it fires, not this function.
-        # Storing the value even when it'll never fire is correct, not a
-        # bug — it's a real record of what the ideal early heads-up would
-        # have been.
-        reminder_times = _compute_reminder_times(resolved_fields.get("due_at"))
-        confirmed = ConfirmedItemMessage(
-            item_id=item_id,
-            user_id=user_id,
-            type=item_type,
-            title=title,
-            summary=summary,
-            due_at=resolved_fields.get("due_at"),
-            effort_minutes=effort_minutes,
-            action_type=resolved_fields.get("action_type"),
-            email_recipient=resolved_fields.get("email_recipient"),
-            email_draft=resolved_fields.get("email_draft"),
-            reminder_1_at=reminder_times[0] if reminder_times else None,
-            reminder_2_at=reminder_times[1] if reminder_times else None,
-        )
-        publish("items-confirmed", confirmed)
-        conn.execute(
-            "UPDATE items SET state = 'CONFIRMED', updated_at = now() WHERE id = %s",
-            (str(item_id),),
-        )
-        conn.commit()
-        _send_sms(user_id, phone, result.reply_text)
-        logger.info("CONFIRMED item_id=%s (real AFFIRM reply)", item_id)
-        return {"status": "confirmed", "item_id": str(item_id)}
-
-    if result.intent == "DENY":
-        conn.execute(
-            "UPDATE items SET state = 'CANCELLED', updated_at = now() WHERE id = %s",
-            (str(item_id),),
-        )
-        conn.commit()
-        _send_sms(user_id, phone, result.reply_text)
-        logger.info("CANCELLED item_id=%s (real DENY reply)", item_id)
-        return {"status": "cancelled", "item_id": str(item_id)}
-
-    if result.intent == "CORRECTION":
-        if result.due_at_filled and result.due_at:
-            resolved_fields = {**resolved_fields, "due_at": result.due_at}
-        if result.email_recipient_filled and result.email_recipient:
-            resolved_fields = {**resolved_fields, "email_recipient": result.email_recipient}
-        _persist_effort_minutes_fill(conn, item_id, result)
-        _persist_title_fill(conn, item_id, result)
-        conn.execute(
-            "UPDATE conversations SET resolved_fields = %s, last_message_at = now() "
-            "WHERE item_id = %s",
-            (Json(resolved_fields), str(item_id)),
-        )
-        # Deliberately stays AWAITING_CONFIRMATION — see module docstring:
-        # a correction never publishes on its own, no matter how complete
-        # the merged fields look. Only a subsequent, separate AFFIRM turn
-        # ever triggers items.confirmed.
-        conn.commit()
-        _send_sms(user_id, phone, result.reply_text)
-        logger.info("AWAITING_CONFIRMATION item_id=%s (correction applied)", item_id)
-        return {"status": "awaiting_confirmation", "item_id": str(item_id)}
-
-    if result.intent == "ATTACH":
-        target_id = resolved_fields.get("_thread_attach_item_id")
-        if target_id:
-            conn.execute(
-                "UPDATE items SET parent_item_id = %s, updated_at = now() WHERE id = %s",
-                (target_id, str(item_id)),
-            )
-            conn.commit()
-            _send_sms(user_id, phone, result.reply_text)
-            logger.info("thread-attached item_id=%s to=%s", item_id, target_id)
-            return {"status": "attached", "item_id": str(item_id)}
-        # No candidate on record for this item — falls through to the
-        # generic reply below, same as any other stray text.
-
-    # OTHER (or ATTACH with no real candidate on record) — reply naturally,
-    # no state change, no write.
-    _send_sms(user_id, phone, result.reply_text)
-    logger.info(
-        "reply outside AFFIRM/DENY item_id=%s intent=%s", item_id, result.intent
-    )
     return {"status": "unhandled_reply", "item_id": str(item_id)}
 
 
@@ -1141,21 +1045,6 @@ async def reply(payload: RoutedReplyMessage):
 
             if state == "CLARIFYING":
                 return await _handle_clarification_reply(
-                    conn,
-                    payload.user_id,
-                    payload.item_id,
-                    phone,
-                    tz_name,
-                    title,
-                    item_type,
-                    summary,
-                    effort_minutes,
-                    is_scheduled_event,
-                    payload.text,
-                )
-
-            if state == "AWAITING_CONFIRMATION":
-                return await _handle_confirmation_reply(
                     conn,
                     payload.user_id,
                     payload.item_id,
