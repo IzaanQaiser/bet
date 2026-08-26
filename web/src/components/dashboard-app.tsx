@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type FormEvent } from "react";
 import { HeroMemory, type MemoryRowData } from "@/components/hero-memory";
+import { SettingsMenu } from "@/components/settings-menu";
 import { Button } from "@/components/ui/button";
 import { WeekCalendar } from "@/components/week-calendar";
 import { digitsOnly, formatPhoneDisplay, toE164 } from "@/lib/phone";
@@ -297,6 +298,25 @@ export function DashboardApp() {
     }
   }
 
+  async function saveTimezone(timezone: string): Promise<boolean> {
+    if (!token) return false;
+    try {
+      const res = await authedFetch("/me/profile", token, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ timezone }),
+      });
+      if (!res.ok) return false;
+      // Optimistic-on-success: dashboard-svc's PATCH already validated the
+      // zone name (400s on an unknown one, so we never get here with junk)
+      // — no need to re-fetch the whole profile just to reflect this one field.
+      setProfile((prev) => (prev ? { ...prev, timezone } : prev));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   if (!token) {
     return (
       <>
@@ -343,6 +363,9 @@ export function DashboardApp() {
 
   return (
     <>
+      <div className="mb-2">
+        <SettingsMenu timezone={timeZone} onSave={saveTimezone} />
+      </div>
       <div className="mb-8 flex items-baseline justify-between">
         <h1 className="font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
           What bet&apos;s tracking.
