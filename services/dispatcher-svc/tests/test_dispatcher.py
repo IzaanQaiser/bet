@@ -221,6 +221,25 @@ def test_next_fitting_slot_picks_earliest_day_that_physically_fits():
     assert result == datetime(2026, 8, 28, 9, 0, tzinfo=TZ)
 
 
+def test_next_fitting_slot_prefers_earliest_fitting_gap_not_largest():
+    """Real bug, found live: a 2h idea got scheduled into a 3h gap at 8pm
+    instead of the 2h36m gap at 5pm that already comfortably fit it —
+    picking the day's *largest* free interval instead of its *earliest*
+    fitting one. WH 9-23 (matches the real account this was found on);
+    a meeting 15:00-15:30 splits the day into an earlier ~7h15m block and
+    a later ~7h block, both far bigger than the 120min needed, but the
+    earlier one must win since it starts first."""
+    day = date(2026, 8, 27)
+    wh_start, wh_end = time(9, 0), time(23, 0)
+    forward_events = {day: [Event(start=time(15, 0), end=time(15, 30))]}
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    result = _next_fitting_slot(
+        forward_events, TZ, wh_start, wh_end, now_local, today=day, effort_minutes=120,
+        exclude_event_id=None,
+    )
+    assert result == datetime(2026, 8, 27, 9, 0, tzinfo=TZ)  # the earlier gap, not 15:30
+
+
 def test_next_fitting_slot_none_when_nothing_fits():
     forward_events = {A_DAY: [Event(start=time(9, 15), end=time(18, 0))]}  # 15min free only
     now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
