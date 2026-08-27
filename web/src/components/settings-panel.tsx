@@ -104,10 +104,6 @@ export function SettingsPanel({
           <p className="mb-2 block font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
             Working hours
           </p>
-          <p className="mb-2 text-[11px] leading-snug text-muted-foreground">
-            When you&apos;re free to work — this is what idea suggestions and reminders are
-            scored against.
-          </p>
           <div className="flex items-center gap-2">
             <input
               type="time"
