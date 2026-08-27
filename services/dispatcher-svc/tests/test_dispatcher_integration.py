@@ -322,6 +322,33 @@ def test_dispatch_reminders_fire_sends_the_one_named_slot(client, test_user):
     assert reminder_2_sent_at is None  # only the named slot fired
 
 
+def test_dispatch_reminders_fire_skips_stale_scheduled_for(client, test_user):
+    """Real bug, found designing calendar-sync-svc's two-way sync: without
+    this check, a due_at change would leave the *old* task still armed
+    for the *old* instant — it would fire, send at the wrong time, and
+    mark reminder_1_sent_at, silently blocking the correct later task."""
+    user_id, phone = test_user
+    due_at = datetime.now(UTC) + timedelta(hours=1)
+    item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=60)
+    wrong_scheduled_for = (due_at - timedelta(hours=5)).isoformat()  # not the real reminder_1_at
+
+    with patch("dispatcher_svc.main._send_sms") as mock_sms:
+        resp = client.post(
+            "/dispatch/reminders/fire",
+            json={"item_id": str(item_id), "slot": 1, "scheduled_for": wrong_scheduled_for},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "stale_task_skipped"
+    mock_sms.assert_not_called()
+
+    with get_connection() as conn:
+        reminder_1_sent_at = conn.execute(
+            "SELECT reminder_1_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
+        ).fetchone()[0]
+    assert reminder_1_sent_at is None  # not marked sent — the real task can still fire correctly
+
+
 def test_dispatch_reminders_fire_is_idempotent_on_redelivery(client, test_user):
     """Cloud Tasks delivers at-least-once — a redelivered task for an
     already-sent slot must be a real no-op against the DB, not a second

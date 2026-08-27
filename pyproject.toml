@@ -31,6 +31,7 @@ dev = [
     "dispatcher-svc",
     "registration-svc",
     "dashboard-svc",
+    "calendar-sync-svc",
 ]
 
 [tool.uv.sources]
@@ -42,6 +43,7 @@ committer-svc = { workspace = true }
 dispatcher-svc = { workspace = true }
 registration-svc = { workspace = true }
 dashboard-svc = { workspace = true }
+calendar-sync-svc = { workspace = true }
 
 [tool.ruff]
 line-length = 100

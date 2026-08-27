@@ -8,6 +8,7 @@ resolution-markers = [
 
 [manifest]
 members = [
+    "calendar-sync-svc",
     "committer-svc",
     "dashboard-svc",
     "dispatcher-svc",
@@ -213,6 +214,43 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/36/98/7d93f30d029643c0275dbc0bd6d5a6f670661ee6c9a94d93af7ab4887600/authlib-1.7.2.tar.gz", hash = "sha256:2cea25fefcd4e7173bdf1372c0afc265c8034b23a8cd5dcb6a9164b826c64231", size = 176511, upload-time = "2026-05-06T08:10:23.116Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fb/95/adcb68e20c34162e9135f370d6e31737719c2b6f94bc953fe7ed1f10fe21/authlib-1.7.2-py2.py3-none-any.whl", hash = "sha256:3e1faedc9d87e7d56a164eca3ccb6ace0d61b94abe83e92242f8dc8bba9b4a9f", size = 259548, upload-time = "2026-05-06T08:10:21.436Z" },
+]
+
+[[package]]
+name = "calendar-sync-svc"
+version = "0.1.0"
+source = { editable = "services/calendar-sync-svc" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "google-auth" },
+    { name = "google-cloud-secret-manager" },
+    { name = "google-cloud-tasks" },
+    { name = "obligation-engine-shared" },
+    { name = "requests" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "httpx2" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "google-auth", specifier = ">=2.35" },
+    { name = "google-cloud-secret-manager", specifier = ">=2.20" },
+    { name = "google-cloud-tasks", specifier = ">=2.16" },
+    { name = "obligation-engine-shared", editable = "shared" },
+    { name = "requests", specifier = ">=2.32" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "httpx2" },
+    { name = "pytest", specifier = ">=8.3" },
 ]
 
 [[package]]
@@ -1403,6 +1441,7 @@ source = { virtual = "." }
 
 [package.dev-dependencies]
 dev = [
+    { name = "calendar-sync-svc" },
     { name = "committer-svc" },
     { name = "dashboard-svc" },
     { name = "dispatcher-svc" },
@@ -1421,6 +1460,7 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "calendar-sync-svc", editable = "services/calendar-sync-svc" },
     { name = "committer-svc", editable = "services/committer-svc" },
     { name = "dashboard-svc", editable = "services/dashboard-svc" },
     { name = "dispatcher-svc", editable = "services/dispatcher-svc" },

@@ -466,6 +466,73 @@ case "$SERVICE" in
       --allow-unauthenticated \
       --account=waslyrideshare@gmail.com
     ;;
+  calendar-sync-svc)
+    echo "Deploying ${SERVICE}..."
+    # Two-way Calendar sync — the one service in this project that needs
+    # --allow-unauthenticated: Google's push notifications hit /webhook
+    # with no Cloud Run IAM token, and that toggle is service-wide, not
+    # per-route. Both /webhook and /sync/run verify the caller
+    # independently in application code instead (channel-token check,
+    # Google-signed OIDC identity check respectively) — see
+    # calendar_sync_svc/main.py's module docstring.
+    DISPATCHER_SVC_URL=$(gcloud run services describe dispatcher-svc \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
+    gcloud run deploy "$SERVICE" \
+      --project="$PROJECT_ID" \
+      --region="$REGION" \
+      --image="$IMAGE" \
+      --service-account="$SA" \
+      --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
+      --set-env-vars="DB_USER=sa-calendar-sync@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},DISPATCHER_SVC_URL=${DISPATCHER_SVC_URL}" \
+      --set-secrets="GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest" \
+      --min-instances=0 \
+      --allow-unauthenticated \
+      --account=waslyrideshare@gmail.com
+
+    SERVICE_URL=$(gcloud run services describe "$SERVICE" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --format='value(status.url)' --account=waslyrideshare@gmail.com)
+
+    # CALENDAR_SYNC_SVC_URL: this service's own URL, needed to build both
+    # the /webhook address it hands Google at watch-registration time and
+    # the audience it checks incoming /sync/run OIDC tokens against — set
+    # via update, not the initial deploy above, same "needs itself to
+    # exist first" ordering as dispatcher-svc's own DISPATCHER_SVC_URL.
+    echo "Setting CALENDAR_SYNC_SVC_URL=${SERVICE_URL} on ${SERVICE}..."
+    gcloud run services update "$SERVICE" \
+      --project="$PROJECT_ID" --region="$REGION" \
+      --update-env-vars="CALENDAR_SYNC_SVC_URL=${SERVICE_URL}" \
+      --account=waslyrideshare@gmail.com
+
+    # calendar-sync every 15 min: both the channel-renewal check and the
+    # fallback poll half of the same precise-push + infrequent-poll
+    # pattern already used for reminders. OIDC identity is sa-calendar-
+    # sync itself; /sync/run verifies this token's email claim in code
+    # (see above) since the platform-level Cloud Run IAM check isn't
+    # available on a public service.
+    echo "Creating/updating calendar-sync..."
+    if gcloud scheduler jobs describe calendar-sync \
+      --project="$PROJECT_ID" --location="$REGION" --account=waslyrideshare@gmail.com >/dev/null 2>&1; then
+      gcloud scheduler jobs update http calendar-sync \
+        --project="$PROJECT_ID" --location="$REGION" \
+        --uri="${SERVICE_URL}/sync/run" \
+        --http-method=POST \
+        --oidc-service-account-email="$SA" \
+        --oidc-token-audience="${SERVICE_URL}/sync/run" \
+        --account=waslyrideshare@gmail.com
+    else
+      gcloud scheduler jobs create http calendar-sync \
+        --project="$PROJECT_ID" --location="$REGION" \
+        --schedule="*/15 * * * *" \
+        --uri="${SERVICE_URL}/sync/run" \
+        --http-method=POST \
+        --oidc-service-account-email="$SA" \
+        --oidc-token-audience="${SERVICE_URL}/sync/run" \
+        --account=waslyrideshare@gmail.com
+    fi
+    ;;
   *)
     echo "No deploy config yet for ${SERVICE} — add a case in scripts/deploy.sh." >&2
     exit 1

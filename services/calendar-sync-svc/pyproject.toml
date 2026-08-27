@@ -1,0 +1,32 @@
+[project]
+name = "calendar-sync-svc"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "obligation-engine-shared",
+    "google-auth>=2.35",
+    "google-cloud-secret-manager>=2.20",
+    "google-cloud-tasks>=2.16",
+    "requests>=2.32",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "httpx2",
+]
+
+[tool.uv.sources]
+obligation-engine-shared = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/calendar_sync_svc"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
