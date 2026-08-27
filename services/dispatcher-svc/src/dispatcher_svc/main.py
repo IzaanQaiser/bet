@@ -41,6 +41,7 @@ from obligation_engine_shared.db import get_connection, log_message
 from obligation_engine_shared.pubsub import publish
 from obligation_engine_shared.reply_classifier import classify_reply
 from obligation_engine_shared.schemas import ConfirmedItemMessage, RoutedReplyMessage
+from obligation_engine_shared.text import strip_em_dash
 from pydantic import BaseModel
 from twilio.rest import Client as TwilioClient
 
@@ -62,11 +63,9 @@ from dispatcher_svc.templates import (
     render_accepted,
     render_deferred,
     render_dismissed,
-    render_event_reminder_early,
-    render_event_reminder_start,
+    render_event_reminder,
     render_fire_suggestion,
-    render_reminder_early,
-    render_reminder_final,
+    render_reminder,
     render_snoozed,
 )
 
@@ -115,8 +114,13 @@ def _twilio_client() -> TwilioClient:
 
 def _send_sms(user_id, to: str, body: str) -> None:
     """Sends, then logs to the messages table (migrations/0007) in its own
-    short transaction — same pattern as resolver-svc's _send_sms, this
-    project's one implementation not being duplicated with drift."""
+    short transaction — same pattern as resolver-svc's _send_sms.
+
+    strip_em_dash here is the real backstop: the one choke point every
+    outbound message in this service passes through regardless of source
+    (a template literal, or a user-supplied title interpolated into
+    one)."""
+    body = strip_em_dash(body)
     _twilio_client().messages.create(to=to, from_=TWILIO_FROM_NUMBER, body=body)
     with get_connection() as log_conn:
         log_message(log_conn, user_id, "out", body)
@@ -177,59 +181,33 @@ def _persist_snapshot(conn, user_id, computation: DayComputation) -> str:
 
 
 def _send_reminders(conn, user_id, phone, now_utc, tz) -> int:
-    """Two independent fire conditions, not one (state-machine.md §4.1's
-    old single reminder_window_hours/reminder_sent_at replaced by
-    per-obligation reminder_1_at/reminder_2_at — resolver-svc computes both
-    from due_at at confirm time, a flat 30-minute-before/at-due rule for
-    everything, no effort involved — user-directed simplification). Each
-    obligation can fire both in the same /dispatch run if both thresholds
-    already passed — same forgiving "better late than never" semantics
-    the old single reminder always had."""
+    """One reminder per obligation now, at the time-of (v1 simplification,
+    user-directed — was two independently-scheduled reminders, an early
+    30-min-before heads-up and this one; the early one is gone, its
+    30-minute lead lives only in the Calendar event's own native popup
+    reminder now, not a second text)."""
     today_local = now_utc.astimezone(tz).date()
     sent = 0
 
-    early_rows = conn.execute(
+    rows = conn.execute(
         """
         SELECT o.item_id, i.title, o.due_at, i.is_scheduled_event
         FROM obligations o JOIN items i ON i.id = o.item_id
-        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_1_sent_at IS NULL
-          AND o.reminder_1_at IS NOT NULL AND o.reminder_1_at <= %s
+        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_sent_at IS NULL
+          AND o.reminder_at IS NOT NULL AND o.reminder_at <= %s
         """,
         (str(user_id), now_utc),
     ).fetchall()
-    for item_id, title, due_at, is_scheduled_event in early_rows:
+    for item_id, title, due_at, is_scheduled_event in rows:
         local_due = due_at.astimezone(tz)
         body = (
-            render_event_reminder_early(title, local_due, today_local)
+            render_event_reminder(title, local_due, today_local)
             if is_scheduled_event
-            else render_reminder_early(title, local_due, today_local)
+            else render_reminder(title, local_due, today_local)
         )
         _send_sms(user_id, to=phone, body=body)
         conn.execute(
-            "UPDATE obligations SET reminder_1_sent_at = now() WHERE item_id = %s",
-            (str(item_id),),
-        )
-        sent += 1
-
-    final_rows = conn.execute(
-        """
-        SELECT o.item_id, i.title, o.due_at, i.is_scheduled_event
-        FROM obligations o JOIN items i ON i.id = o.item_id
-        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND o.reminder_2_sent_at IS NULL
-          AND o.reminder_2_at IS NOT NULL AND o.reminder_2_at <= %s
-        """,
-        (str(user_id), now_utc),
-    ).fetchall()
-    for item_id, title, due_at, is_scheduled_event in final_rows:
-        local_due = due_at.astimezone(tz)
-        body = (
-            render_event_reminder_start(title, local_due, today_local)
-            if is_scheduled_event
-            else render_reminder_final(title, local_due, today_local)
-        )
-        _send_sms(user_id, to=phone, body=body)
-        conn.execute(
-            "UPDATE obligations SET reminder_2_sent_at = now() WHERE item_id = %s",
+            "UPDATE obligations SET reminder_sent_at = now() WHERE item_id = %s",
             (str(item_id),),
         )
         sent += 1
@@ -612,30 +590,31 @@ async def dispatch_reminders():
 
 class ReminderFirePayload(BaseModel):
     item_id: UUID
-    slot: int
     scheduled_for: datetime | None = None
 
 
 @app.post("/dispatch/reminders/fire")
 async def dispatch_reminders_fire(payload: ReminderFirePayload):
     """The actual, precise reminder mechanism: committer-svc enqueues one
-    Cloud Task per reminder slot at the exact reminder instant
-    (committer_svc/main.py's _enqueue_reminder_task), and Cloud Tasks
-    invokes this directly at that time — no polling, no 5-40 minute
-    slop, the reminder fires when it's actually supposed to.
+    Cloud Task at the exact reminder instant (committer_svc/main.py's
+    _enqueue_reminder_task), and Cloud Tasks invokes this directly at
+    that time — no polling, no 5-40 minute slop, the reminder fires when
+    it's actually supposed to. v1 simplification: one reminder per
+    obligation now (was two independently-scheduled ones), so no more
+    slot to disambiguate.
 
     Still checked against real DB state, not blindly fired: a task
     enqueued hours or days ago could find the item since deleted or
     cancelled, or already sent by the /dispatch/reminders fallback in the
     meantime (Cloud Tasks delivers at-least-once) — same
-    reminder_N_sent_at IS NULL idempotency guard every other reminder
-    path already relies on.
+    reminder_sent_at IS NULL idempotency guard every other reminder path
+    already relies on.
 
     scheduled_for (real bug, found designing calendar-sync-svc's two-way
     sync): without it, a due_at change (from Calendar sync, or any future
     reschedule path) leaves the *old* task still armed for the *old*
     instant — it would fire early, send a reminder with the freshly-read
-    (now-correct) text at the *wrong time*, and mark reminder_N_sent_at,
+    (now-correct) text at the *wrong time*, and mark reminder_sent_at,
     silently suppressing the real, later task via this same idempotency
     check. Optional only for backward compatibility with any already-
     enqueued task from before this field existed; every enqueuer now sets
@@ -644,8 +623,7 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
         row = conn.execute(
             """
             SELECT i.title, o.due_at, i.is_scheduled_event, i.user_id,
-                   o.reminder_1_sent_at, o.reminder_2_sent_at, u.timezone, u.phone_e164,
-                   o.reminder_1_at, o.reminder_2_at
+                   o.reminder_sent_at, u.timezone, u.phone_e164, o.reminder_at
             FROM obligations o
             JOIN items i ON i.id = o.item_id
             JOIN users u ON u.id = i.user_id
@@ -655,9 +633,7 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
         ).fetchone()
         if row is None:
             logger.info(
-                "reminder fire skipped item_id=%s slot=%s (no longer committed)",
-                payload.item_id,
-                payload.slot,
+                "reminder fire skipped item_id=%s (no longer committed)", payload.item_id
             )
             return {"status": "skipped", "item_id": str(payload.item_id)}
 
@@ -666,55 +642,39 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
             due_at,
             is_scheduled_event,
             user_id,
-            reminder_1_sent_at,
-            reminder_2_sent_at,
+            reminder_sent_at,
             tz_name,
             phone,
-            reminder_1_at,
-            reminder_2_at,
+            reminder_at,
         ) = row
 
         if payload.scheduled_for is not None:
-            current_target = reminder_1_at if payload.slot == 1 else reminder_2_at
-            if current_target is None or payload.scheduled_for != current_target:
+            if reminder_at is None or payload.scheduled_for != reminder_at:
                 logger.info(
-                    "reminder fire skipped item_id=%s slot=%s (stale task, current=%s != %s)",
-                    payload.item_id, payload.slot, current_target, payload.scheduled_for,
+                    "reminder fire skipped item_id=%s (stale task, current=%s != %s)",
+                    payload.item_id, reminder_at, payload.scheduled_for,
                 )
                 return {"status": "stale_task_skipped", "item_id": str(payload.item_id)}
 
-        already_sent = reminder_1_sent_at if payload.slot == 1 else reminder_2_sent_at
-        if already_sent is not None:
+        if reminder_sent_at is not None:
             return {"status": "already_sent", "item_id": str(payload.item_id)}
 
         tz = ZoneInfo(tz_name)
         local_due = due_at.astimezone(tz)
         today_local = datetime.now(UTC).astimezone(tz).date()
-        if payload.slot == 1:
-            body = (
-                render_event_reminder_early(title, local_due, today_local)
-                if is_scheduled_event
-                else render_reminder_early(title, local_due, today_local)
-            )
-            _send_sms(user_id, to=phone, body=body)
-            conn.execute(
-                "UPDATE obligations SET reminder_1_sent_at = now() WHERE item_id = %s",
-                (str(payload.item_id),),
-            )
-        else:
-            body = (
-                render_event_reminder_start(title, local_due, today_local)
-                if is_scheduled_event
-                else render_reminder_final(title, local_due, today_local)
-            )
-            _send_sms(user_id, to=phone, body=body)
-            conn.execute(
-                "UPDATE obligations SET reminder_2_sent_at = now() WHERE item_id = %s",
-                (str(payload.item_id),),
-            )
+        body = (
+            render_event_reminder(title, local_due, today_local)
+            if is_scheduled_event
+            else render_reminder(title, local_due, today_local)
+        )
+        _send_sms(user_id, to=phone, body=body)
+        conn.execute(
+            "UPDATE obligations SET reminder_sent_at = now() WHERE item_id = %s",
+            (str(payload.item_id),),
+        )
         conn.commit()
 
-    logger.info("reminder fired item_id=%s slot=%s", payload.item_id, payload.slot)
+    logger.info("reminder fired item_id=%s", payload.item_id)
     return {"status": "sent", "item_id": str(payload.item_id)}
 
 

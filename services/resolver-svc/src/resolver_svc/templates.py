@@ -17,6 +17,6 @@ of its own, unrelated to either of the above."""
 
 def render_needs_review(title: str | None) -> str:
     return (
-        f"I couldn't get all the details for \"{title or 'that'}\" — I've saved what I have. "
+        f"I couldn't get all the details for \"{title or 'that'}\". I've saved what I have. "
         f"Send it again with more detail if you'd like me to try again."
     )

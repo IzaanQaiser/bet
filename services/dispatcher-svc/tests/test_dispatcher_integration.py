@@ -116,14 +116,11 @@ def _insert_committed_latent(user_id, created_at):
 
 
 def _insert_committed_obligation(user_id, due_at, effort_minutes=15, is_scheduled_event=False):
-    """reminder_1_at/reminder_2_at mirror resolver-svc's own
-    _compute_reminder_times — real production formula, not a test-only
-    shortcut: one universal rule now, task or event, user-directed —
-    30 minutes before due_at, and at due_at itself. effort_minutes no
-    longer factors into reminder timing at all (still stored on items,
-    purely for Calendar event sizing)."""
-    reminder_1_at = due_at - timedelta(minutes=30)
-    reminder_2_at = due_at
+    """reminder_at mirrors resolver-svc's own _compute_reminder_time —
+    real production formula, not a test-only shortcut: v1 simplification,
+    user-directed, the reminder fires AT due_at itself, no offset.
+    effort_minutes doesn't factor into reminder timing at all (still
+    stored on items, purely for Calendar event sizing)."""
     with get_connection() as conn:
         row = conn.execute(
             """
@@ -136,9 +133,8 @@ def _insert_committed_obligation(user_id, due_at, effort_minutes=15, is_schedule
         ).fetchone()
         item_id = row[0]
         conn.execute(
-            "INSERT INTO obligations (item_id, due_at, reminder_1_at, reminder_2_at) "
-            "VALUES (%s, %s, %s, %s)",
-            (str(item_id), due_at, reminder_1_at, reminder_2_at),
+            "INSERT INTO obligations (item_id, due_at, reminder_at) VALUES (%s, %s, %s)",
+            (str(item_id), due_at, due_at),
         )
         conn.commit()
     return item_id
@@ -229,10 +225,9 @@ def test_dispatch_run_recomputes_next_fit_and_upserts_placeholder(client, test_u
 
 
 def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
-    """due_at already 2 minutes in the past: both the flat 30-min-before
-    and the at-due-time reminder have already passed, so a single run
-    fires both — real DB-backed idempotency for each slot independently,
-    not just one shared reminder_sent_at."""
+    """due_at already 2 minutes in the past: the reminder has already
+    passed, so a single run fires it — real DB-backed idempotency, not
+    just an in-memory guard."""
     user_id, phone = test_user
     due_at = datetime.now(UTC) - timedelta(minutes=2)
     item_id = _insert_committed_obligation(user_id, due_at)
@@ -245,17 +240,15 @@ def test_dispatch_run_sends_reminder_and_marks_idempotent(client, test_user):
         client.post("/dispatch")
 
     reminder_calls = [c for c in mock_sms.call_args_list if "⏰" in c.kwargs["body"]]
-    assert len(reminder_calls) == 2
+    assert len(reminder_calls) == 1
 
     with get_connection() as conn:
-        reminder_1_sent_at, reminder_2_sent_at = conn.execute(
-            "SELECT reminder_1_sent_at, reminder_2_sent_at FROM obligations WHERE item_id = %s",
-            (str(item_id),),
-        ).fetchone()
-    assert reminder_1_sent_at is not None
-    assert reminder_2_sent_at is not None
+        reminder_sent_at = conn.execute(
+            "SELECT reminder_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
+        ).fetchone()[0]
+    assert reminder_sent_at is not None
 
-    # Second run: already reminded (both slots), must not send again.
+    # Second run: already reminded, must not send again.
     p1, p2, p3 = _patched_calendar(mock_events_range)
     with p1, p2, p3, patch("dispatcher_svc.main._send_sms") as mock_sms_second_run:
         client.post("/dispatch")
@@ -290,23 +283,23 @@ def test_dispatch_reminders_fires_a_same_day_event_start_with_no_calendar_calls(
     assert "starts" in reminder_calls[0].kwargs["body"]
 
     with get_connection() as conn:
-        reminder_1_sent_at = conn.execute(
-            "SELECT reminder_1_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
+        reminder_sent_at = conn.execute(
+            "SELECT reminder_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
         ).fetchone()[0]
-    assert reminder_1_sent_at is not None
+    assert reminder_sent_at is not None
 
 
-def test_dispatch_reminders_fire_sends_the_one_named_slot(client, test_user):
+def test_dispatch_reminders_fire_sends_the_reminder(client, test_user):
     """The actual precise mechanism: committer-svc's Cloud Task hits this
-    directly with a specific item_id/slot, not a batch scan. Real DB,
-    real endpoint, no Calendar mocking (proof it never touches Calendar,
-    same reasoning as the poll-fallback test above)."""
+    directly with the item_id, not a batch scan. Real DB, real endpoint,
+    no Calendar mocking (proof it never touches Calendar, same reasoning
+    as the poll-fallback test above)."""
     user_id, phone = test_user
     due_at = datetime.now(UTC) + timedelta(hours=1)
     item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=60)
 
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
-        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id)})
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "sent"
@@ -314,28 +307,26 @@ def test_dispatch_reminders_fire_sends_the_one_named_slot(client, test_user):
     assert "⏰" in mock_sms.call_args.kwargs["body"]
 
     with get_connection() as conn:
-        reminder_1_sent_at, reminder_2_sent_at = conn.execute(
-            "SELECT reminder_1_sent_at, reminder_2_sent_at FROM obligations WHERE item_id = %s",
-            (str(item_id),),
-        ).fetchone()
-    assert reminder_1_sent_at is not None
-    assert reminder_2_sent_at is None  # only the named slot fired
+        reminder_sent_at = conn.execute(
+            "SELECT reminder_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
+        ).fetchone()[0]
+    assert reminder_sent_at is not None
 
 
 def test_dispatch_reminders_fire_skips_stale_scheduled_for(client, test_user):
     """Real bug, found designing calendar-sync-svc's two-way sync: without
     this check, a due_at change would leave the *old* task still armed
     for the *old* instant — it would fire, send at the wrong time, and
-    mark reminder_1_sent_at, silently blocking the correct later task."""
+    mark reminder_sent_at, silently blocking the correct later task."""
     user_id, phone = test_user
     due_at = datetime.now(UTC) + timedelta(hours=1)
     item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=60)
-    wrong_scheduled_for = (due_at - timedelta(hours=5)).isoformat()  # not the real reminder_1_at
+    wrong_scheduled_for = (due_at - timedelta(hours=5)).isoformat()  # not the real reminder_at
 
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         resp = client.post(
             "/dispatch/reminders/fire",
-            json={"item_id": str(item_id), "slot": 1, "scheduled_for": wrong_scheduled_for},
+            json={"item_id": str(item_id), "scheduled_for": wrong_scheduled_for},
         )
 
     assert resp.status_code == 200
@@ -343,25 +334,25 @@ def test_dispatch_reminders_fire_skips_stale_scheduled_for(client, test_user):
     mock_sms.assert_not_called()
 
     with get_connection() as conn:
-        reminder_1_sent_at = conn.execute(
-            "SELECT reminder_1_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
+        reminder_sent_at = conn.execute(
+            "SELECT reminder_sent_at FROM obligations WHERE item_id = %s", (str(item_id),)
         ).fetchone()[0]
-    assert reminder_1_sent_at is None  # not marked sent — the real task can still fire correctly
+    assert reminder_sent_at is None  # not marked sent — the real task can still fire correctly
 
 
 def test_dispatch_reminders_fire_is_idempotent_on_redelivery(client, test_user):
     """Cloud Tasks delivers at-least-once — a redelivered task for an
-    already-sent slot must be a real no-op against the DB, not a second
-    text."""
+    already-sent reminder must be a real no-op against the DB, not a
+    second text."""
     user_id, phone = test_user
     due_at = datetime.now(UTC) + timedelta(hours=1)
     item_id = _insert_committed_obligation(user_id, due_at, effort_minutes=60)
 
     with patch("dispatcher_svc.main._send_sms"):
-        client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+        client.post("/dispatch/reminders/fire", json={"item_id": str(item_id)})
 
     with patch("dispatcher_svc.main._send_sms") as mock_sms_second:
-        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id)})
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "already_sent"
@@ -380,7 +371,7 @@ def test_dispatch_reminders_fire_skips_a_deleted_item(client, test_user):
         conn.commit()
 
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
-        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id), "slot": 1})
+        resp = client.post("/dispatch/reminders/fire", json={"item_id": str(item_id)})
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "skipped"

@@ -98,7 +98,7 @@ actually finishes), so its existence is the one true completion signal.
 import logging
 import os
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -111,6 +111,7 @@ from obligation_engine_shared.schemas import (
     RawItemMessage,
     RoutedReplyMessage,
 )
+from obligation_engine_shared.text import strip_em_dash
 from psycopg.types.json import Json
 from twilio.rest import Client as TwilioClient
 
@@ -151,7 +152,14 @@ def _send_sms(user_id, to: str, body: str) -> None:
     short transaction, decoupled from whatever transaction the caller is
     mid-way through — the SMS really was sent regardless of what the
     caller's transaction later does, so the log entry shouldn't be tied to
-    its commit/rollback."""
+    its commit/rollback.
+
+    strip_em_dash here (not just at converse()'s own reply_text filter) is
+    the real backstop: this is the one choke point every outbound message
+    in this service passes through regardless of source — a template
+    literal, the LLM's reply_text, or a user-supplied title/summary
+    interpolated into either."""
+    body = strip_em_dash(body)
     _t0 = time.monotonic()
     _twilio_client().messages.create(to=to, from_=TWILIO_FROM_NUMBER, body=body)
     _t1 = time.monotonic()
@@ -238,7 +246,7 @@ def _other_items_context(
     ).fetchall()
     tz = ZoneInfo(tz_name)
     return [
-        f"{title} — due {due_at.astimezone(tz).strftime('%a %-d %b, %-I:%M %p')}"
+        f"{title}, due {due_at.astimezone(tz).strftime('%a %-d %b, %-I:%M %p')}"
         for title, due_at in rows
     ]
 
@@ -333,31 +341,20 @@ def _persist_title_fill(conn, item_id, result) -> None:
         )
 
 
-_REMINDER_LEAD = timedelta(minutes=30)
-
-
-def _compute_reminder_times(due_at_iso: str | None) -> tuple[datetime, datetime] | None:
-    """One universal rule, user-specified, no effort/type distinction:
-    a fixed 30-minute heads-up before due_at, and a reminder AT due_at
-    itself. Confirm 30+ minutes ahead of due_at and you get both; confirm
-    within 30 minutes of it and you get ONLY the at-due-time reminder,
-    nothing more — that half is committer-svc's job (_enqueue_reminder_task
-    skips any slot already in the past at commit time), not this
-    function's; this always returns both computed instants, before-the-fact.
-
-    Deliberately not effort-scaled — user-directed simplification: effort
-    (asking about it, bucketing it, scaling reminder timing off it) added
-    real complexity and real bugs for little value. effort_minutes still
-    exists elsewhere purely for Calendar event sizing, unrelated to this.
-
-    Naive local, same "naive means local" convention due_at itself already
-    carries through this whole pipeline (committer-svc attaches the real
-    timezone at commit time). None when due_at isn't known yet — a latent,
-    or an obligation still missing it."""
+def _compute_reminder_time(due_at_iso: str | None) -> datetime | None:
+    """V1 simplification, user-directed: the one remaining SMS reminder
+    fires AT due_at itself — no more separate offset to compute. (The
+    30-minute-before lead that used to drive a second SMS now lives only
+    in the Calendar event's own native popup reminder, set once at
+    creation by committer-svc's _write_calendar_event/
+    _create_placeholder_event — a purely Calendar-side notification,
+    unrelated to this.) Naive local, same "naive means local" convention
+    due_at itself already carries through this whole pipeline
+    (committer-svc attaches the real timezone at commit time). None when
+    due_at isn't known yet — a latent, or an obligation still missing it."""
     if not due_at_iso:
         return None
-    due_at = datetime.fromisoformat(due_at_iso)
-    return due_at - _REMINDER_LEAD, due_at
+    return datetime.fromisoformat(due_at_iso)
 
 
 def _confirm_and_publish(
@@ -368,7 +365,6 @@ def _confirm_and_publish(
     required. Publishes items.confirmed and flips items.state; the caller
     owns its own conversations row write, commit, and SMS send, since
     those differ per call site (INSERT vs. UPDATE, different columns)."""
-    reminder_times = _compute_reminder_times(resolved_fields.get("due_at"))
     confirmed = ConfirmedItemMessage(
         item_id=item_id,
         user_id=user_id,
@@ -380,71 +376,13 @@ def _confirm_and_publish(
         action_type=resolved_fields.get("action_type"),
         email_recipient=resolved_fields.get("email_recipient"),
         email_draft=resolved_fields.get("email_draft"),
-        reminder_1_at=reminder_times[0] if reminder_times else None,
-        reminder_2_at=reminder_times[1] if reminder_times else None,
+        reminder_at=_compute_reminder_time(resolved_fields.get("due_at")),
     )
     publish("items-confirmed", confirmed)
     conn.execute(
         "UPDATE items SET state = 'CONFIRMED', updated_at = now() WHERE id = %s",
         (str(item_id),),
     )
-
-
-def _format_reminder_time(dt: datetime) -> str:
-    return dt.strftime("%-I:%M %p")
-
-
-def _future_reminder_strings(
-    due_at_iso: str | None, now_local: datetime
-) -> tuple[str | None, str | None]:
-    """The formatted, message-facing counterpart to _compute_reminder_times
-    — filters out any computed instant that's already in the past relative
-    to right now, not just at commit time. Real bug, found live: a
-    confirmation sent well after the 30-min-heads-up mark had already
-    passed still told the user "I'll remind you at 9:53pm" — a time that
-    had already come and gone before the message was even composed. This
-    is a separate check from committer-svc's own overdue-slot skip (which
-    only protects the real send, not what the text claims will happen) —
-    both are needed, since the text can be composed well before the
-    eventual commit (the very first clarifying/confirmation turn, not
-    just the AFFIRM one)."""
-    times = _compute_reminder_times(due_at_iso)
-    if times is None:
-        return None, None
-    now_naive = now_local.replace(tzinfo=None)
-    r1, r2 = times
-    return (
-        _format_reminder_time(r1) if r1 > now_naive else None,
-        _format_reminder_time(r2) if r2 > now_naive else None,
-    )
-
-
-def _ensure_reminder_mention(
-    reply_text: str,
-    reminder_1_at_passed: str | None,
-    due_at_iso: str | None,
-    now_local: datetime,
-) -> str:
-    """converse() is already asked to state reminder_1_at/reminder_2_at
-    naturally whenever they're given as known context going into that
-    call. But the one reply that resolves the LAST missing piece needed to
-    compute them (due_at itself, on the very turn still_missing empties
-    out) can't have had them passed in — nothing could compute them before
-    a call that is itself what fills them. This deterministic append
-    covers exactly that one gap (reminder_1_at_passed was None going in,
-    but due_at is known after merging this turn's result); every other
-    case already got a natural, in-voice mention from converse() itself
-    and this is a no-op. Mentions only whichever of the two is still
-    genuinely ahead of now — one, both, or (rare) neither."""
-    if reminder_1_at_passed is not None:
-        return reply_text
-    r1_str, r2_str = _future_reminder_strings(due_at_iso, now_local)
-    times = [t for t in (r1_str, r2_str) if t is not None]
-    if not times:
-        return reply_text
-    if len(times) == 1:
-        return f"{reply_text} I'll remind you at {times[0]}."
-    return f"{reply_text} I'll remind you at {times[0]} and {times[1]}."
 
 
 async def _handle_chat(extracted: ExtractedItemMessage) -> None:
@@ -626,9 +564,6 @@ async def _start_clarification(
     is_scheduled_event = extracted.is_scheduled_event
     thread_attach_title = thread_attach[1] if thread_attach else None
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_1_at, reminder_2_at = _future_reminder_strings(
-        resolved_fields.get("due_at"), now_local
-    )
     result = await converse(
         session_id=f"{extracted.item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -642,8 +577,6 @@ async def _start_clarification(
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=None,
-        reminder_1_at=reminder_1_at,
-        reminder_2_at=reminder_2_at,
         other_items=other_items,
         is_scheduled_event=is_scheduled_event,
     )
@@ -656,9 +589,6 @@ async def _start_clarification(
         resolved_fields["_thread_attach_title"] = thread_attach[1]
     effort_minutes = _merge_effort_minutes(effort_minutes, result)
     title = _merge_title(title, result)
-    reply_text = _ensure_reminder_mention(
-        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
-    )
 
     with get_connection() as conn:
         _persist_effort_minutes_fill(conn, extracted.item_id, result)
@@ -695,7 +625,7 @@ async def _start_clarification(
         logger.info("CLARIFYING item_id=%s sent question 1/%d", extracted.item_id, MAX_EXCHANGES)
         return "clarifying"
 
-    _send_sms(extracted.user_id, phone, reply_text)
+    _send_sms(extracted.user_id, phone, result.reply_text)
     logger.info("CONFIRMED item_id=%s (resolved on first pass, auto-committed)", extracted.item_id)
     return "confirmed"
 
@@ -801,9 +731,6 @@ async def _handle_clarification_reply(
     other_items = _other_items_context(conn, user_id, item_id, tz_name)
 
     now_local = datetime.now(UTC).astimezone(ZoneInfo(tz_name))
-    reminder_1_at, reminder_2_at = _future_reminder_strings(
-        resolved_fields.get("due_at"), now_local
-    )
     result = await converse(
         session_id=f"{item_id}-{uuid4().hex[:8]}",
         now_local=now_local,
@@ -817,8 +744,6 @@ async def _handle_clarification_reply(
         thread_attach_title=thread_attach_title,
         history=history,
         latest_reply=latest_reply,
-        reminder_1_at=reminder_1_at,
-        reminder_2_at=reminder_2_at,
         other_items=other_items,
         is_scheduled_event=is_scheduled_event,
     )
@@ -869,9 +794,6 @@ async def _handle_clarification_reply(
         logger.info("NEEDS_REVIEW item_id=%s (exhausted %d exchanges)", item_id, MAX_EXCHANGES)
         return {"status": "needs_review", "item_id": str(item_id)}
 
-    reply_text = _ensure_reminder_mention(
-        result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
-    )
     _confirm_and_publish(
         conn, item_id, user_id, item_type, title, summary, effort_minutes, resolved_fields
     )
@@ -881,7 +803,7 @@ async def _handle_clarification_reply(
         (Json(resolved_fields), [], str(item_id)),
     )
     conn.commit()
-    _send_sms(user_id, phone, reply_text)
+    _send_sms(user_id, phone, result.reply_text)
     logger.info("CONFIRMED item_id=%s (clarification resolved, auto-committed)", item_id)
     return {"status": "confirmed", "item_id": str(item_id)}
 
@@ -966,9 +888,6 @@ async def _handle_duplicate_reply(
         # its one job — classifying the dedupe question — dedupe_result's
         # own reply_text was just the "keeping separate" acknowledgment,
         # not a real attempt at resolving missing fields).
-        reminder_1_at, reminder_2_at = _future_reminder_strings(
-        resolved_fields.get("due_at"), now_local
-    )
         result = await converse(
             session_id=f"{item_id}-{uuid4().hex[:8]}",
             now_local=now_local,
@@ -982,8 +901,6 @@ async def _handle_duplicate_reply(
             thread_attach_title=thread_attach_title,
             history=history,
             latest_reply=None,
-            reminder_1_at=reminder_1_at,
-            reminder_2_at=reminder_2_at,
             other_items=other_items,
             is_scheduled_event=is_scheduled_event,
         )
@@ -1013,9 +930,6 @@ async def _handle_duplicate_reply(
             )
             return {"status": "clarifying", "item_id": str(item_id)}
 
-        reply_text = _ensure_reminder_mention(
-            result.reply_text, reminder_1_at, resolved_fields.get("due_at"), now_local
-        )
         _confirm_and_publish(
             conn, item_id, user_id, item_type, title, summary, effort_minutes, resolved_fields
         )
@@ -1025,7 +939,7 @@ async def _handle_duplicate_reply(
             ([], Json(resolved_fields), str(item_id)),
         )
         conn.commit()
-        _send_sms(user_id, phone, reply_text)
+        _send_sms(user_id, phone, result.reply_text)
         logger.info("CONFIRMED item_id=%s (post-dedupe, auto-committed)", item_id)
         return {"status": "confirmed", "item_id": str(item_id)}
 

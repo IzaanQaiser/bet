@@ -111,16 +111,14 @@ class ConfirmedItemMessage(BaseModel):
     action_type: Literal["calendar", "email"] | None = None
     email_recipient: str | None = None  # step 15 — carries a resolved recipient to committer-svc
     email_draft: str | None = None
-    # Two-stage reminder scheduling: resolver-svc computes these from
-    # due_at/effort_minutes (due_at - 2*effort, due_at - effort) once both
-    # are known — plain arithmetic on an already-validated due_at, so no
-    # tzinfo-stripping validator needed here the way due_at itself needs
-    # one (that one guards untrusted LLM output, this is our own subtraction).
-    # Null whenever due_at or effort_minutes isn't applicable (a latent, an
-    # email action with no due date). committer-svc persists them as-is;
-    # dispatcher-svc fires each independently.
-    reminder_1_at: datetime | None = None
-    reminder_2_at: datetime | None = None
+    # Single time-of reminder — resolver-svc sets this to due_at itself
+    # once known (v1 simplification: was a two-stage due_at-30min/due_at
+    # pair, collapsed to just due_at; the 30-minute lead now lives only in
+    # the Calendar event's own native popup reminder, committer-svc's
+    # _write_calendar_event/_create_placeholder_event). Null whenever
+    # due_at isn't applicable (a latent, an email action with no due
+    # date). committer-svc persists it as-is; dispatcher-svc fires it.
+    reminder_at: datetime | None = None
 
     _strip_due_at_tz = field_validator("due_at")(_strip_due_at_tzinfo)
 

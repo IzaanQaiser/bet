@@ -77,6 +77,7 @@ from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from obligation_engine_shared.text import strip_em_dash as _strip_em_dash
 from pydantic import BaseModel
 
 logger = logging.getLogger("resolver_svc.conversation")
@@ -251,21 +252,13 @@ Otherwise (is_chat false, the normal case), do, in order:
      language and reads wrong for something you just show up to. Real
      finding: a live conversation confirmed a party as "due at 3pm
      tomorrow", which read oddly for exactly this reason.
-   If reminder_1_at and/or reminder_2_at are given (non-null) on this
-   turn's locked-in message, state whichever ones are actually given
-   directly in the sentence, using those exact given values, not
-   placeholders. Both given: "I'll remind you at 12pm and 3pm." Only one
-   given (the other is null — this happens for real: locking something in
-   within its own 30-minute reminder window means only the later one is
-   still ahead of right now): "I'll remind you at 3pm," never mentioning a
-   second time or implying there's an earlier one too. Never invent or
-   infer a missing one from the other — only state exactly what's given,
-   exactly as given. So the user knows exactly when they'll hear from the
-   system again, not just that a reminder exists. Don't mention either at
-   all on any other kind of turn (a still-missing question, a dedupe
-   acknowledgment, etc.) — only when stating what's locked in has already
-   earned its place in the message per the rules above.
+   v1 simplification: there's exactly one reminder now, and it always
+   fires at the same instant already stated above (the due/start time) —
+   never separately mention a reminder or restate that time a second
+   time, it would just repeat what was already said.
    Keep it SMS-length, under 160 characters where possible.
+   NEVER use an em dash (—) anywhere in reply_text, under any
+   circumstance. Use a period, a comma, or a new sentence instead.
 
 Output must conform exactly to the provided schema. No text outside it.
 """
@@ -356,8 +349,6 @@ async def converse(
     thread_attach_title: str | None = None,
     dedupe_candidate_title: str | None = None,
     awaiting_dedupe_reply: bool = False,
-    reminder_1_at: str | None = None,
-    reminder_2_at: str | None = None,
     other_items: list[str] | None = None,
     is_scheduled_event: bool = False,
     is_chat: bool = False,
@@ -403,8 +394,6 @@ async def converse(
             f"Thread-attach candidate: {thread_attach_title}\n"
             f"dedupe_candidate_title: {dedupe_candidate_title}\n"
             f"awaiting_dedupe_reply: {awaiting_dedupe_reply}\n"
-            f"reminder_1_at: {reminder_1_at}\n"
-            f"reminder_2_at: {reminder_2_at}\n"
             f"User's other real committed obligations (other_items, separate from this item):\n"
             f"{other_items_block}\n"
             f"Recent message history (oldest first):\n{hist_block}\n"
@@ -428,6 +417,8 @@ async def converse(
     if final_text is None:
         raise RuntimeError("Gemini produced no final response")
     result = ConversationTurnResult.model_validate(json.loads(final_text))
+
+    result.reply_text = _strip_em_dash(result.reply_text)
 
     # Defensive, not just prompted: still_missing is an unconstrained
     # list[str] at the schema level (Vertex AI structured output doesn't

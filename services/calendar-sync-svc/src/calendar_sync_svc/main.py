@@ -55,7 +55,6 @@ CALENDAR_STOP_URL = "https://www.googleapis.com/calendar/v3/channels/stop"
 TASKS_LOCATION = "us-central1"
 TASKS_QUEUE = "reminders"
 
-REMINDER_LEAD = timedelta(minutes=30)  # resolver_svc/main.py's own _REMINDER_LEAD, mirrored
 CHANNEL_RENEW_WINDOW = timedelta(hours=48)
 
 
@@ -99,7 +98,7 @@ def _verify_scheduler_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="wrong identity")
 
 
-def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
+def _enqueue_reminder_task(item_id, fire_at: datetime) -> None:
     """Same shape as committer_svc's own _enqueue_reminder_task, plus
     scheduled_for — the staleness-protection fix (dispatcher_svc/main.py's
     ReminderFirePayload) needs the target instant in the task body so a
@@ -123,7 +122,6 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
                     "body": json.dumps(
                         {
                             "item_id": str(item_id),
-                            "slot": slot,
                             "scheduled_for": fire_at.isoformat(),
                         }
                     ).encode(),
@@ -133,7 +131,7 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
             },
         )
     except Exception:
-        logger.exception("failed to enqueue reminder task item_id=%s slot=%s", item_id, slot)
+        logger.exception("failed to enqueue reminder task item_id=%s", item_id)
 
 
 def _enqueue_fire_task(item_id, fire_at: datetime) -> None:
@@ -256,33 +254,33 @@ def _reconcile_obligation(conn, item_id, stored_due_at, event: dict, cancelled: 
     if new_start is None or (stored_due_at is not None and new_start == stored_due_at):
         return
 
-    reminder_1_at = new_start - REMINDER_LEAD
-    reminder_2_at = new_start
+    # v1 simplification: the single SMS reminder now fires AT due_at
+    # itself, no offset left to compute — the 30-minute lead lives only
+    # in the Calendar event's own native popup reminder, unaffected by a
+    # time-only PATCH (committer_svc's CALENDAR_REMINDER_OVERRIDE, set
+    # once at creation).
+    reminder_at = new_start
     now = datetime.now(UTC)
-    # A slot whose new target has already passed is marked sent, same as
-    # committer-svc's own commit-time logic — suppresses a late/incorrect
-    # send rather than firing a "heads up" after the fact.
-    r1_sent = now if reminder_1_at <= now else None
-    r2_sent = now if reminder_2_at <= now else None
+    # A reminder whose new target has already passed is marked sent, same
+    # as committer-svc's own commit-time logic — suppresses a late/
+    # incorrect send rather than firing after the fact.
+    reminder_sent = now if reminder_at <= now else None
 
     conn.execute(
         """
         UPDATE obligations
-        SET due_at = %s, reminder_1_at = %s, reminder_2_at = %s,
-            reminder_1_sent_at = %s, reminder_2_sent_at = %s
+        SET due_at = %s, reminder_at = %s, reminder_sent_at = %s
         WHERE item_id = %s
         """,
-        (new_start, reminder_1_at, reminder_2_at, r1_sent, r2_sent, str(item_id)),
+        (new_start, reminder_at, reminder_sent, str(item_id)),
     )
     conn.commit()
     logger.info(
         "sync: obligation due_at changed on Calendar item_id=%s new_due_at=%s", item_id, new_start
     )
 
-    if r1_sent is None:
-        _enqueue_reminder_task(item_id, 1, reminder_1_at)
-    if r2_sent is None:
-        _enqueue_reminder_task(item_id, 2, reminder_2_at)
+    if reminder_sent is None:
+        _enqueue_reminder_task(item_id, reminder_at)
 
 
 def _reconcile_latent(conn, item_id, stored_next_fit, event: dict, cancelled: bool) -> None:

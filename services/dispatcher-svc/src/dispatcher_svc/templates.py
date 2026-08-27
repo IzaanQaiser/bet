@@ -28,39 +28,23 @@ def _format_block_hours(minutes: int) -> str:
     return f"{hours}h {mins}min"
 
 
-def render_reminder_early(title: str, due_at: datetime, today: date) -> str:
-    """Fires at due_at - 30min — the early heads-up. Deliberately no
-    effort/duration claim (e.g. "block off ~2h") — user-directed
-    simplification: the reminder itself is a flat 30 minutes regardless of
-    effort, so a duration-based claim here would no longer even be true."""
+def render_reminder(title: str, due_at: datetime, today: date) -> str:
+    """Fires AT due_at — v1 simplification, user-directed: the only SMS
+    reminder now, at the time-of. The old 30-min-before heads-up SMS is
+    gone; that lead now lives only in the Calendar event's own native
+    popup reminder (committer_svc's CALENDAR_REMINDER_OVERRIDE), not a
+    second text."""
     return (
-        f"⏰ heads up — {title} is due {relative_due_description(due_at.date(), today)}, "
+        f"⏰ last call, {title} is due {relative_due_description(due_at.date(), today)}, "
         f"{format_due_at(due_at)}."
     )
 
 
-def render_reminder_final(title: str, due_at: datetime, today: date) -> str:
-    """Fires at due_at — the reminder at the deadline itself."""
-    return (
-        f"⏰ last call — {title} is due {relative_due_description(due_at.date(), today)}, "
-        f"{format_due_at(due_at)}."
-    )
-
-
-def render_event_reminder_early(title: str, due_at: datetime, today: date) -> str:
-    """Fires at due_at - effort — a heads-up before a scheduled event
-    (meeting/party/call/appointment) starts. No "block off time"
-    framing — that's task language, wrong for something you just attend."""
-    return (
-        f"⏰ heads up — {title} starts {relative_due_description(due_at.date(), today)}, "
-        f"{format_due_at(due_at)}."
-    )
-
-
-def render_event_reminder_start(title: str, due_at: datetime, today: date) -> str:
-    """Fires AT due_at — the reminder a task deliberately never gets, and
-    a scheduled event deliberately does: it's happening right now."""
-    return f"⏰ {title} is starting now — {format_due_at(due_at)}."
+def render_event_reminder(title: str, due_at: datetime, today: date) -> str:
+    """Fires AT due_at — the scheduled-event (meeting/party/call/
+    appointment) counterpart to render_reminder above, worded as
+    starting rather than due."""
+    return f"⏰ {title} is starting now, {format_due_at(due_at)}."
 
 
 def render_fire_suggestion(item_title: str, block_minutes: int) -> str:
@@ -69,7 +53,7 @@ def render_fire_suggestion(item_title: str, block_minutes: int) -> str:
     render_suggestion. Deliberately terser — no time-of-day clause, no
     "lightest day" evidence line; the moment itself is the pitch."""
     return (
-        f'yo u have {_format_block_hours(block_minutes)} free right now — '
+        f'yo u have {_format_block_hours(block_minutes)} free right now, '
         f'wanna bang out "{item_title}"?\n\nY / N / Later'
     )
 
@@ -80,11 +64,11 @@ def render_deferred(next_fit_start: datetime | None, tz) -> str:
     that one's kept for the second-dismissal/dormancy path only."""
     if next_fit_start is None:
         return "np, i'll keep an eye out for room."
-    return f"np — i'll text you again {next_fit_start.astimezone(tz).strftime('%A')}."
+    return f"np, i'll text you again {next_fit_start.astimezone(tz).strftime('%A')}."
 
 
 def render_accepted(title: str, due_at: datetime) -> str:
-    return f"📅 {title}\n{format_due_at(due_at)} — added to your calendar."
+    return f"📅 {title}\nAdded to your calendar for {format_due_at(due_at)}."
 
 
 def render_dismissed() -> str:

@@ -33,41 +33,29 @@ def _mock_connection(fetchall_result=None, fetchone_result=None):
     return conn
 
 
-def _mock_reminder_connection(early_rows=None, final_rows=None):
-    """Two independent SELECTs now, not one (reminder_1_at/reminder_2_at
-    replaced the old single reminder_window_hours/reminder_sent_at) — a
-    uniform fetchall_result can't distinguish them, so this keys off which
-    reminder slot each query's SQL text mentions, same SQL-aware side_effect
-    pattern resolver-svc's own tests already use for a multi-query function."""
-
-    def execute_side_effect(sql, params=None):
-        result = MagicMock()
-        if "SELECT" in sql and "reminder_1" in sql:
-            result.fetchall.return_value = early_rows or []
-        elif "SELECT" in sql and "reminder_2" in sql:
-            result.fetchall.return_value = final_rows or []
-        return result
-
+def _mock_reminder_connection(rows=None):
+    """v1 simplification: one SELECT now, not two (a single reminder_at/
+    reminder_sent_at pair replaced the old reminder_1/reminder_2 pair)."""
     conn = MagicMock()
-    conn.execute.side_effect = execute_side_effect
+    conn.execute.return_value.fetchall.return_value = rows or []
     return conn
 
 
 def test_reminder_not_resent_if_already_sent():
-    """The SQL's own `reminder_N_sent_at IS NULL` clause is what enforces
+    """The SQL's own `reminder_sent_at IS NULL` clause is what enforces
     this for real (verified against live Postgres in the integration
     test) — here, an empty result set (what that clause produces once a
-    reminder slot has already fired) must send nothing for that slot."""
-    conn = _mock_reminder_connection(early_rows=[], final_rows=[])
+    reminder has already fired) must send nothing."""
+    conn = _mock_reminder_connection(rows=[])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 0
     mock_sms.assert_not_called()
 
 
-def test_early_reminder_sent_marks_reminder_1_sent_at():
+def test_reminder_sent_marks_reminder_sent_at():
     due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_reminder_connection(early_rows=[("item-1", "Pay rent", due_at, False)])
+    conn = _mock_reminder_connection(rows=[("item-1", "Pay rent", due_at, False)])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
     assert sent == 1
@@ -75,62 +63,27 @@ def test_early_reminder_sent_marks_reminder_1_sent_at():
     call_kwargs = mock_sms.call_args.kwargs
     assert call_kwargs["to"] == "+15551234567"
     assert "Pay rent" in call_kwargs["body"]
-    assert "heads up" in call_kwargs["body"]
-
-    update_calls = [c for c in conn.execute.call_args_list if "UPDATE obligations" in c.args[0]]
-    assert len(update_calls) == 1
-    assert "reminder_1_sent_at" in update_calls[0].args[0]
-    assert update_calls[0].args[1] == ("item-1",)
-
-
-def test_final_reminder_sent_marks_reminder_2_sent_at():
-    due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_reminder_connection(final_rows=[("item-1", "Pay rent", due_at, False)])
-    with patch("dispatcher_svc.main._send_sms") as mock_sms:
-        sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
-    assert sent == 1
-    mock_sms.assert_called_once()
-    call_kwargs = mock_sms.call_args.kwargs
     assert "last call" in call_kwargs["body"]
 
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE obligations" in c.args[0]]
     assert len(update_calls) == 1
-    assert "reminder_2_sent_at" in update_calls[0].args[0]
+    assert "reminder_sent_at" in update_calls[0].args[0]
     assert update_calls[0].args[1] == ("item-1",)
 
 
-def test_scheduled_event_gets_event_templates_not_task_templates():
-    """Real bug, found live: a meeting used the task-shaped templates
-    ("last call... start now") and never got reminded at its own start
-    time. is_scheduled_event routes both reminder slots to the event
-    templates instead."""
+def test_scheduled_event_gets_event_template_not_task_template():
+    """Real bug, found live: a meeting used the task-shaped template
+    ("last call... due") and never got reminded as something it starts,
+    not something due. is_scheduled_event routes to the event template
+    instead."""
     due_at = datetime(2026, 8, 25, 20, 39, tzinfo=UTC)
-    conn = _mock_reminder_connection(
-        early_rows=[("item-1", "Meeting", due_at, True)],
-        final_rows=[("item-1", "Meeting", due_at, True)],
-    )
+    conn = _mock_reminder_connection(rows=[("item-1", "Meeting", due_at, True)])
     with patch("dispatcher_svc.main._send_sms") as mock_sms:
         sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
-    assert sent == 2
-    bodies = [c.kwargs["body"] for c in mock_sms.call_args_list]
-    assert any("starts" in b for b in bodies)
-    assert any("starting now" in b for b in bodies)
-    assert not any("last call" in b or "Block off" in b for b in bodies)
-
-
-def test_both_reminders_can_fire_in_the_same_run():
-    """An obligation due soon enough can have both thresholds already
-    passed by the time a /dispatch run finds it — same forgiving "better
-    late than never" semantics the old single reminder always had."""
-    due_at = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
-    conn = _mock_reminder_connection(
-        early_rows=[("item-1", "Pay rent", due_at, False)],
-        final_rows=[("item-1", "Pay rent", due_at, False)],
-    )
-    with patch("dispatcher_svc.main._send_sms") as mock_sms:
-        sent = _send_reminders(conn, "user-1", "+15551234567", datetime.now(UTC), TZ)
-    assert sent == 2
-    assert mock_sms.call_count == 2
+    assert sent == 1
+    body = mock_sms.call_args.kwargs["body"]
+    assert "starting now" in body
+    assert "last call" not in body
 
 
 def test_compute_day_reproduces_worked_example():
