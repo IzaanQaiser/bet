@@ -125,9 +125,10 @@ stateDiagram-v2
     ELIGIBLE --> ELIGIBLE: next_fit_start computed, real [idea]-tagged placeholder written (ADR 0009)
     ELIGIBLE --> SURFACED: the item's own next_fit_start arrives, fire-time text sent
     SURFACED --> ACCEPTED: reply classified ACCEPT
-    SURFACED --> ELIGIBLE: reply classified DECLINE, dismissal_count < 2 (rescheduled immediately, new placeholder)
-    SURFACED --> DORMANT: reply classified DECLINE, dismissal_count reaches 2 (placeholder cleared)
-    SURFACED --> ELIGIBLE: user replies "Later" (snoozed 7d via dormant_until, placeholder cleared, no dismissal_count change)
+    SURFACED --> SURFACED: reply classified DECLINE, dismissal_count < 2 (asks how long, awaiting_deferral_reply=true, stays open)
+    SURFACED --> ELIGIBLE: deferral answer resolved (rescheduled to the answered floor, new placeholder)
+    SURFACED --> DORMANT: reply classified DECLINE, dismissal_count reaches 2 (asks nothing, placeholder cleared)
+    SURFACED --> ELIGIBLE: reply classified SNOOZE (7d via dormant_until, placeholder cleared, no dismissal_count change)
     SURFACED --> ELIGIBLE: no reply within 24h (outcome=no_response, no penalty)
     DORMANT --> ELIGIBLE: dormant_until passes (pure timestamp comparison, no job needed)
     ACCEPTED --> [*]: converted to obligation, follows obligation lifecycle from here
@@ -143,13 +144,16 @@ There is no scorer left to gate candidates *for*, so the PRD §6.3 filter is nar
 - `dormant_until` in the future → still excluded — `_eligible_latents`'s own SQL filter, not a post-fetch check.
 - an open (`outcome IS NULL`) `suggestions` row already exists → still excluded (already `SURFACED`, never recompute/re-text mid-conversation).
 
+**V1 addition, user-directed: an `ELIGIBLE` item's `next_fit_start` can now change reactively, not just at the next sweep.** If a real Calendar event — new, or an existing one moved — lands directly on top of an already-scheduled placeholder's slot, `calendar-sync-svc`'s own webhook (already firing on every Calendar change for two-way sync) detects the overlap and immediately triggers the same recompute the initial commit already uses, rather than waiting for the twice-daily sweep or the fire-time re-verify to eventually catch it. Full mechanism: `capacity-engine.md` §5.4.1.
+
 ### 2.2 `SURFACED` outcomes — decisions made in this doc
 
 PRD §6.3 defines `Later` (snooze 7d) and dismissal (`dismissal_count ≥ 2` → dormant 30d) but not what `dormant_until` means mechanically or what happens on no reply. Resolved here:
 
 - **`dormant_until` is reused for both snooze and dismissal-dormancy.** It generically means "not eligible until this timestamp." What differs is only whether `dismissal_count` was also incremented (dismissal: yes; snooze: no). One column, two callers.
 - **No reply within 24h → `outcome = 'no_response'`.** No dismissal penalty (silence isn't rejection). Since the "not eligible within 10 days of `last_surfaced_at`" rule that used to prevent an immediate resurface is gone (§2.1, ADR 0009), a no-response item can be recomputed and re-texted again as soon as the next sweep finds a fitting slot — closes the one PRD gap where a `suggestions` row could otherwise sit with `outcome IS NULL` forever, permanently stuck in `SURFACED`.
-- **ADR 0009: N and Later now also clear or move the real placeholder, not just the DB columns.** First dismissal (`dismissal_count` about to become `< 2`) reschedules immediately — the placeholder *moves* to the next fitting slot via `PUT .../placeholder` (capacity-engine.md §5.3), not left tagged at a slot the user just declined. Second dismissal (`dismissal_count` reaches 2) and `Later` both `DELETE` the placeholder outright, since neither has anywhere to move it to right now.
+- **ADR 0009: DECLINE and SNOOZE now also clear or move the real placeholder, not just the DB columns.** Second dismissal (`dismissal_count` reaches 2) and SNOOZE both `DELETE` the placeholder outright, since neither has anywhere to move it to right now.
+- **V1 simplification, user-directed: a first decline no longer silently auto-reschedules.** It asks how long to put it off instead (`agent-contracts.md` §4.2) — `suggestions.awaiting_deferral_reply` (`migrations/0023`) stays true and `outcome` stays `NULL` through that follow-up, so the item stays `SURFACED` (the derivation rule above already treats any `outcome IS NULL` row as `SURFACED`, no new phase needed) and `ingest-svc` keeps routing the next reply here. Once that reply resolves to a concrete instant, the placeholder *moves* to the next fitting slot at or after it via `PUT .../placeholder` (capacity-engine.md §5.1/§5.3) — only then does `dismissal_count` increment and `outcome` get set, moving the item back to `ELIGIBLE`.
 
 ### 2.3 `ACCEPTED` — how a latent actually becomes a calendar write
 

@@ -16,16 +16,26 @@ entire mechanism behind a declined idea landing after every
 already-scheduled one — no explicit cross-item reflow needed
 (capacity-engine.md §5).
 
-`POST /reply` — the Y/N/Later response to a fired suggestion
-(state-machine.md §2.2/§2.3), routed here by `ingest-svc`. `Y` re-fetches
-*real, current* Calendar availability for the placeholder's slot (it can
-be stale by the time a reply arrives) and publishes directly to
+`POST /reply` — the reply to a fired suggestion (state-machine.md
+§2.2/§2.3), routed here by `ingest-svc`. Natural language, not a Y/N/Later
+keyword match — `dispatcher_svc.conversation.converse_suggestion`
+classifies it as ACCEPT/DECLINE/SNOOZE/OTHER. ACCEPT re-fetches *real,
+current* Calendar availability for the placeholder's slot (it can be
+stale by the time a reply arrives) and publishes directly to
 `items.confirmed`; committer-svc promotes the same placeholder event in
-place rather than writing a duplicate. `N` increments `dismissal_count`
-and immediately reschedules to the next available slot (>= 2 → 30d
-dormancy instead, placeholder cleared). `Later` snoozes 7d, placeholder
-cleared, no dismissal penalty. The 24h no-response timeout (§2.2) still
-runs at the top of `/dispatch`'s per-user loop.
+place rather than writing a duplicate. DECLINE, user-directed: the first
+one no longer silently auto-reschedules — it asks how long to put it
+off, and the *next* reply (interpreted as that answer, not reclassified)
+sets the floor for the next fitting slot (>= 2 declines still goes
+straight to 30d dormancy, placeholder cleared, no question asked).
+SNOOZE snoozes 7d, placeholder cleared, no dismissal penalty. The 24h
+no-response timeout (§2.2) still runs at the top of `/dispatch`'s
+per-user loop.
+
+Idea placeholder slots (both the initial one and every reschedule) now
+require the free interval to be at least `effort_minutes + 30min`, not
+just `>= effort_minutes` (user-directed) — leaves real margin around the
+task, not an exact-fit slot with no room either side.
 """
 
 import logging
@@ -39,7 +49,6 @@ from fastapi import FastAPI, HTTPException
 from google.auth.transport.requests import AuthorizedSession
 from obligation_engine_shared.db import get_connection, log_message
 from obligation_engine_shared.pubsub import publish
-from obligation_engine_shared.reply_classifier import classify_reply
 from obligation_engine_shared.schemas import ConfirmedItemMessage, RoutedReplyMessage
 from obligation_engine_shared.text import strip_em_dash
 from pydantic import BaseModel
@@ -59,12 +68,12 @@ from dispatcher_svc.capacity_engine import (
     largest_contiguous_block,
     load_delta,
 )
+from dispatcher_svc.conversation import converse_suggestion
 from dispatcher_svc.templates import (
     render_accepted,
     render_deferred,
     render_dismissed,
     render_event_reminder,
-    render_fire_suggestion,
     render_reminder,
     render_snoozed,
 )
@@ -91,6 +100,19 @@ FORWARD_DAYS = 7
 # which naturally reduces to a no-op for every day after today (already
 # entirely in the future, so the clip can never bind).
 SUGGESTION_LEAD = timedelta(minutes=30)
+
+# User-directed (v1): a candidate free interval for an idea's placeholder
+# must be at least effort_minutes + this much, not just >= effort_minutes
+# — real margin around the task, not an exact-fit slot with nothing
+# either side of it. Applies to every idea slot search
+# (_next_fitting_slot) — initial placement, the sweep, a post-decline
+# reschedule, and a conflict-triggered reschedule alike. Deliberately
+# separate from block_fit's own shared, no-margin rule (capacity-
+# engine.md §4) rather than changing it there — that function is also
+# used for obligation accept-path fit checks and day-level capacity
+# metrics, neither of which this ask was about. A plain int, not a
+# timedelta, since it's only ever added onto an effort_minutes int.
+IDEA_FIT_BUFFER_MINUTES = 30
 
 
 def _buffered_wh_start(wh_start: time, wh_end: time, now_local: datetime) -> time:
@@ -275,10 +297,12 @@ def _eligible_latents(conn, user_id, tz) -> list[LatentCandidate]:
 
 def _next_fitting_slot(
     forward_events: dict, tz, wh_start, wh_end, now_local, today, effort_minutes: int,
-    exclude_event_id: str | None,
+    exclude_event_id: str | None, min_start: datetime | None = None,
 ) -> datetime | None:
     """The earliest day in the given window, and the earliest free
     interval *within* that day, whose duration physically fits this item
+    plus IDEA_FIT_BUFFER of margin (user-directed — a candidate interval
+    must be at least effort_minutes + 30min, not just >= effort_minutes)
     — not the day's largest free interval, which can start much later
     than an earlier, smaller-but-still-sufficient one (real bug, found
     live: a 2h idea got scheduled into a 3h gap at 8pm instead of the
@@ -290,15 +314,25 @@ def _next_fitting_slot(
     item's own current placeholder from what counts as busy
     (capacity-engine.md §5's self-exclusion note — every *other* item's
     placeholder is left in, which is what makes a declined idea naturally
-    land after every already-scheduled one). None when nothing in the
-    window fits."""
+    land after every already-scheduled one).
+
+    min_start (user-directed, the decline-and-defer flow): an additional
+    floor beyond the usual SUGGESTION_LEAD-buffered "now" — days before
+    it are skipped entirely, and its own day is further clipped up to
+    its time-of-day, same clamping shape _buffered_wh_start already uses
+    for today. None (the default) leaves every other caller's existing
+    behavior untouched. None when nothing in the window fits."""
     for d in sorted(forward_events):
+        if min_start is not None and d < min_start.date():
+            continue
         day_wh_start = _buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+        if min_start is not None and d == min_start.date():
+            day_wh_start = min(max(day_wh_start, min_start.time()), wh_end)
         intervals = free_intervals(
             d, forward_events[d], day_wh_start, wh_end, exclude_event_id=exclude_event_id
         )
         for interval in intervals:
-            if block_fit(interval.duration_minutes, effort_minutes):
+            if block_fit(interval.duration_minutes, effort_minutes + IDEA_FIT_BUFFER_MINUTES):
                 return datetime.combine(d, interval.start, tzinfo=tz)
     return None
 
@@ -323,22 +357,28 @@ def _clear_placeholder(conn, user_id, item: LatentCandidate) -> None:
 
 
 def _recompute_and_reschedule(
-    conn, user_id, tz, wh_start, wh_end, now_local, today, forward_events, item: LatentCandidate
+    conn, user_id, tz, wh_start, wh_end, now_local, today, forward_events, item: LatentCandidate,
+    min_start: datetime | None = None,
 ) -> None:
     """The one place that ever writes latents.next_fit_start/
     placeholder_event_id — every writer (initial commit, working-hours
-    change, the sweep, a post-decline reschedule) goes through this.
-    Diffs against the value already stored and only touches the
-    Calendar/Cloud Tasks when it actually changed, which bounds Cloud
-    Tasks volume to "once per real slot change" and guarantees at most
-    one live fire-task per latent (an old one that fires anyway is a
-    guaranteed no-op — see /latents/{item_id}/fire's staleness check).
-    Returns the resulting next_fit_start (None if cleared/never found) so
-    callers (e.g. /reply's N-path, which texts back the new day) don't
-    need a second query to learn what this just wrote."""
+    change, the sweep, a post-decline-and-defer reschedule, a conflict-
+    triggered reschedule) goes through this. Diffs against the value
+    already stored and only touches the Calendar/Cloud Tasks when it
+    actually changed, which bounds Cloud Tasks volume to "once per real
+    slot change" and guarantees at most one live fire-task per latent (an
+    old one that fires anyway is a guaranteed no-op — see
+    /latents/{item_id}/fire's staleness check). Returns the resulting
+    next_fit_start (None if cleared/never found) so callers (e.g.
+    /reply's decline path, which texts back the new day) don't need a
+    second query to learn what this just wrote.
+
+    min_start — user-directed decline-and-defer flow: search no earlier
+    than this instant (see _next_fitting_slot's own docstring). None
+    (the default) is every other caller's existing behavior."""
     new_next_fit = _next_fitting_slot(
         forward_events, tz, wh_start, wh_end, now_local, today, item.effort_minutes,
-        exclude_event_id=item.placeholder_event_id,
+        exclude_event_id=item.placeholder_event_id, min_start=min_start,
     )
 
     if new_next_fit == item.next_fit_start:
@@ -753,8 +793,8 @@ async def fire(item_id: UUID, payload: FirePayload):
         exclude_event_id=placeholder_event_id,
     )
     largest = max(intervals, key=lambda i: i.duration_minutes, default=None)
-    still_fits = (
-        largest is not None and block_fit(largest_contiguous_block(intervals), effort_minutes)
+    still_fits = largest is not None and block_fit(
+        largest_contiguous_block(intervals), effort_minutes + IDEA_FIT_BUFFER_MINUTES
     )
 
     if not still_fits:
@@ -766,8 +806,11 @@ async def fire(item_id: UUID, payload: FirePayload):
             conn.commit()
         return {"status": "rescheduled_silently", "item_id": str(item_id)}
 
+    nudge = await converse_suggestion(
+        title=title, effort_minutes=effort_minutes, now_local=now_local, tz_name=tz_name,
+    )
     with get_connection() as conn:
-        _send_sms(user_id, phone, render_fire_suggestion(title, largest.duration_minutes))
+        _send_sms(user_id, phone, nudge.message_text)
         conn.execute(
             "INSERT INTO suggestions (item_id, user_id, snapshot_id, scheduled_for) "
             "VALUES (%s, %s, NULL, %s)",
@@ -799,13 +842,18 @@ def _open_suggestion_context(conn, item_id):
     """scheduled_for (the exact instant /latents/{item_id}/fire actually
     texted about) replaces the old snapshot-derived date — a fire-time
     suggestion has no capacity_snapshots row to join to at all (ADR 0009,
-    migrations/0020)."""
+    migrations/0020). awaiting_deferral_reply (migrations/0023,
+    user-directed): true while this open suggestion is mid-way through
+    the "how long do you wanna put this off?" follow-up — the *next*
+    reply is interpreted as answering that question, not reclassified as
+    a fresh accept/decline/snooze/other."""
     return conn.execute(
         """
         SELECT s.id, i.title, i.summary, i.effort_minutes,
                l.dismissal_count, l.placeholder_event_id,
                u.timezone, u.working_hours_start, u.working_hours_end,
-               u.google_refresh_token_ref, u.phone_e164, s.scheduled_for
+               u.google_refresh_token_ref, u.phone_e164, s.scheduled_for,
+               s.awaiting_deferral_reply
         FROM suggestions s
         JOIN items i ON i.id = s.item_id
         JOIN latents l ON l.item_id = s.item_id
@@ -819,7 +867,7 @@ def _open_suggestion_context(conn, item_id):
 
 def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
     (_id, title, summary, effort_minutes, _dismissal_count, placeholder_event_id, tz_name,
-     wh_start, wh_end, refresh_ref, phone, scheduled_for) = ctx
+     wh_start, wh_end, refresh_ref, phone, scheduled_for, _awaiting_deferral_reply) = ctx
 
     if refresh_ref is None:
         logger.error("user_id=%s has no linked Google account, cannot accept", payload.user_id)
@@ -874,7 +922,7 @@ def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
         _send_sms(
             payload.user_id,
             phone,
-            f'Sorry, that day filled up — I couldn\'t find room for "{title}" anymore.',
+            f'Sorry, that day filled up. I couldn\'t find room for "{title}" anymore.',
         )
         logger.info("accept failed, no free block left item_id=%s", payload.item_id)
         return {"status": "no_capacity", "item_id": str(payload.item_id)}
@@ -906,6 +954,79 @@ def _accept_suggestion(payload: RoutedReplyMessage, suggestion_id, ctx) -> dict:
     return {"status": "accepted", "item_id": str(payload.item_id)}
 
 
+async def _resolve_deferral_reply(
+    payload: RoutedReplyMessage, suggestion_id, title, effort_minutes, dismissal_count,
+    placeholder_event_id, tz_name, wh_start, wh_end, refresh_ref, phone, now_local,
+) -> dict:
+    """The second turn of the decline-and-defer flow (user-directed): the
+    suggestion was already declined once and asked "how long do you
+    wanna put this off?" — this reply is the answer. Only ever reaches
+    here for a *first* decline (dismissal_count was < 2 when the
+    question was asked, per /reply's own gate below), so dismissal_count
+    + 1 here is always exactly 1, never the 30d-dormancy threshold."""
+    turn = await converse_suggestion(
+        title=title, effort_minutes=effort_minutes, now_local=now_local, tz_name=tz_name,
+        latest_reply=payload.text, awaiting_deferral_reply=True,
+    )
+
+    if not turn.defer_resolved or not turn.defer_until:
+        _send_sms(payload.user_id, phone, turn.reply_text)
+        logger.info("deferral reply still unresolved item_id=%s", payload.item_id)
+        return {"status": "awaiting_deferral", "item_id": str(payload.item_id)}
+
+    new_count = dismissal_count + 1
+    tz = ZoneInfo(tz_name)
+    defer_until_local = datetime.fromisoformat(turn.defer_until).replace(tzinfo=tz)
+
+    new_next_fit = None
+    if refresh_ref is not None:
+        now_utc = datetime.now(UTC)
+        today = now_utc.astimezone(tz).date()
+        forward_events = _fetch_forward_events(refresh_ref, tz_name, today)
+        item = LatentCandidate(
+            item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
+            dismissal_count=new_count, dormant_until=None, last_surfaced_at=None,
+            has_open_suggestion=False, next_fit_start=None,
+            placeholder_event_id=placeholder_event_id,
+        )
+        with get_connection() as conn:
+            new_next_fit = _recompute_and_reschedule(
+                conn, payload.user_id, tz, wh_start, wh_end, now_local, today,
+                forward_events, item, min_start=defer_until_local,
+            )
+            conn.execute(
+                "UPDATE suggestions SET outcome = 'dismissed', awaiting_deferral_reply = false, "
+                "responded_at = now() WHERE id = %s",
+                (suggestion_id,),
+            )
+            conn.execute(
+                "UPDATE latents SET dismissal_count = %s WHERE item_id = %s",
+                (new_count, str(payload.item_id)),
+            )
+            conn.commit()
+        tz_for_render = tz
+    else:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE suggestions SET outcome = 'dismissed', awaiting_deferral_reply = false, "
+                "responded_at = now() WHERE id = %s",
+                (suggestion_id,),
+            )
+            conn.execute(
+                "UPDATE latents SET dismissal_count = %s WHERE item_id = %s",
+                (new_count, str(payload.item_id)),
+            )
+            conn.commit()
+        tz_for_render = UTC
+
+    _send_sms(payload.user_id, phone, render_deferred(new_next_fit, tz_for_render))
+    logger.info(
+        "DEFERRED (asked) item_id=%s defer_until=%s next_fit_start=%s",
+        payload.item_id, turn.defer_until, new_next_fit,
+    )
+    return {"status": "dismissed", "item_id": str(payload.item_id)}
+
+
 @app.post("/reply")
 async def reply(payload: RoutedReplyMessage):
     with get_connection() as conn:
@@ -915,30 +1036,43 @@ async def reply(payload: RoutedReplyMessage):
         return {"status": "unexpected_state", "item_id": str(payload.item_id)}
     (
         suggestion_id, title, _summary, effort_minutes, dismissal_count, placeholder_event_id,
-        tz_name, wh_start, wh_end, refresh_ref, phone, _scheduled_for,
+        tz_name, wh_start, wh_end, refresh_ref, phone, _scheduled_for, awaiting_deferral_reply,
     ) = ctx
 
-    classification = classify_reply(payload.text)
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(UTC).astimezone(tz)
 
-    if classification == "Y":
+    if awaiting_deferral_reply:
+        return await _resolve_deferral_reply(
+            payload, suggestion_id, title, effort_minutes, dismissal_count,
+            placeholder_event_id, tz_name, wh_start, wh_end, refresh_ref, phone, now_local,
+        )
+
+    turn = await converse_suggestion(
+        title=title, effort_minutes=effort_minutes, now_local=now_local, tz_name=tz_name,
+        latest_reply=payload.text,
+    )
+
+    if turn.intent == "ACCEPT":
         return _accept_suggestion(payload, suggestion_id, ctx)
 
-    if classification == "N":
+    if turn.intent == "DECLINE":
         new_count = dismissal_count + 1
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE suggestions SET outcome = 'dismissed', responded_at = now() WHERE id = %s",
-                (suggestion_id,),
+        if new_count >= 2:
+            # Second decline: unchanged 30d dormancy, no question asked —
+            # also clears the real placeholder rather than leaving a
+            # stale [idea] event sitting on the calendar for a month.
+            item = LatentCandidate(
+                item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
+                dismissal_count=new_count, dormant_until=None, last_surfaced_at=None,
+                has_open_suggestion=False, next_fit_start=None,
+                placeholder_event_id=placeholder_event_id,
             )
-            if new_count >= 2:
-                # Second dismissal: 30d dormancy, same as before — but now
-                # also clear the real placeholder rather than leaving a
-                # stale [idea] event sitting on the calendar for a month.
-                item = LatentCandidate(
-                    item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
-                    dismissal_count=new_count, dormant_until=None, last_surfaced_at=None,
-                    has_open_suggestion=False, next_fit_start=None,
-                    placeholder_event_id=placeholder_event_id,
+            with get_connection() as conn:
+                conn.execute(
+                    "UPDATE suggestions SET outcome = 'dismissed', responded_at = now() "
+                    "WHERE id = %s",
+                    (suggestion_id,),
                 )
                 _clear_placeholder(conn, payload.user_id, item)
                 conn.execute(
@@ -947,50 +1081,26 @@ async def reply(payload: RoutedReplyMessage):
                     (new_count, str(payload.item_id)),
                 )
                 conn.commit()
-                _send_sms(payload.user_id, phone, render_dismissed())
-                logger.info(
-                    "DISMISSED (dormant) item_id=%s dismissal_count=%d",
-                    payload.item_id, new_count,
-                )
-                return {"status": "dismissed", "item_id": str(payload.item_id)}
+            _send_sms(payload.user_id, phone, render_dismissed())
+            logger.info(
+                "DISMISSED (dormant) item_id=%s dismissal_count=%d",
+                payload.item_id, new_count,
+            )
+            return {"status": "dismissed", "item_id": str(payload.item_id)}
 
+        # First decline, user-directed: no longer a silent auto-reschedule
+        # — ask how long, and stay open for the answer (migrations/0023).
+        with get_connection() as conn:
             conn.execute(
-                "UPDATE latents SET dismissal_count = %s WHERE item_id = %s",
-                (new_count, str(payload.item_id)),
+                "UPDATE suggestions SET awaiting_deferral_reply = true WHERE id = %s",
+                (suggestion_id,),
             )
             conn.commit()
+        _send_sms(payload.user_id, phone, turn.reply_text)
+        logger.info("DECLINE, asked how long item_id=%s", payload.item_id)
+        return {"status": "awaiting_deferral", "item_id": str(payload.item_id)}
 
-        # First dismissal: reschedule to the next available slot right
-        # away, user-directed — a decline isn't a "don't ask again for a
-        # while" signal on its own, only a second one is.
-        new_next_fit = None
-        if refresh_ref is not None:
-            tz = ZoneInfo(tz_name)
-            now_utc = datetime.now(UTC)
-            today = now_utc.astimezone(tz).date()
-            now_local = now_utc.astimezone(tz)
-            forward_events = _fetch_forward_events(refresh_ref, tz_name, today)
-            item = LatentCandidate(
-                item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
-                dismissal_count=new_count, dormant_until=None, last_surfaced_at=None,
-                has_open_suggestion=False, next_fit_start=None,
-                placeholder_event_id=placeholder_event_id,
-            )
-            with get_connection() as conn:
-                new_next_fit = _recompute_and_reschedule(
-                    conn, payload.user_id, tz, wh_start, wh_end, now_local, today,
-                    forward_events, item,
-                )
-                conn.commit()
-            tz_for_render = tz
-        else:
-            tz_for_render = UTC
-
-        _send_sms(payload.user_id, phone, render_deferred(new_next_fit, tz_for_render))
-        logger.info("DEFERRED item_id=%s next_fit_start=%s", payload.item_id, new_next_fit)
-        return {"status": "dismissed", "item_id": str(payload.item_id)}
-
-    if classification == "LATER":
+    if turn.intent == "SNOOZE":
         item = LatentCandidate(
             item_id=str(payload.item_id), title=title, effort_minutes=effort_minutes,
             dismissal_count=dismissal_count, dormant_until=None, last_surfaced_at=None,
@@ -1012,11 +1122,13 @@ async def reply(payload: RoutedReplyMessage):
         logger.info("SNOOZED item_id=%s", payload.item_id)
         return {"status": "snoozed", "item_id": str(payload.item_id)}
 
-    logger.info(
-        "suggestion reply outside Y/N/Later, not handled item_id=%s text=%r",
-        payload.item_id,
-        payload.text,
-    )
+    # OTHER — real, adjacent bug fixed in the same pass: this used to be a
+    # silent drop (no SMS at all) for anything that wasn't a literal
+    # Y/N/Later keyword. A genuine re-ask now, from the same call that
+    # classified it OTHER.
+    logger.info("suggestion reply ambiguous item_id=%s text=%r", payload.item_id, payload.text)
+    if turn.reply_text:
+        _send_sms(payload.user_id, phone, turn.reply_text)
     return {"status": "unhandled_reply", "item_id": str(payload.item_id)}
 
 

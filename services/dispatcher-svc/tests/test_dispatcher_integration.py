@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from dispatcher_svc.capacity_engine import Event
+from dispatcher_svc.conversation import SuggestionTurnResult
 from fastapi.testclient import TestClient
 from obligation_engine_shared.db import get_connection
 
@@ -437,9 +438,12 @@ def test_accept_path_full_cycle(client, test_user, confirmed_subscription):
         patch("dispatcher_svc.main.AuthorizedSession", return_value=MagicMock()),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
         patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
+        mock_converse.return_value = SuggestionTurnResult(intent="ACCEPT")
         resp = client.post(
-            "/reply", json={"user_id": str(user_id), "item_id": str(item_id), "text": "y"}
+            "/reply",
+            json={"user_id": str(user_id), "item_id": str(item_id), "text": "yeah lets go"},
         )
 
     assert resp.status_code == 200

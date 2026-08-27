@@ -216,6 +216,54 @@ def test_next_fitting_slot_excludes_own_placeholder():
     assert result == datetime(2026, 8, 27, 9, 0, tzinfo=TZ)  # the whole day, "mine" excluded
 
 
+def test_next_fitting_slot_requires_the_30min_buffer_not_just_exact_fit():
+    """User-directed: a candidate interval must be >= effort_minutes +
+    30min, not just >= effort_minutes — real margin, not an exact-fit
+    slot with no room either side. day1's 120min gap exactly fits a
+    120min item with zero buffer, so it must be skipped; day2's 150min
+    gap (120 + the required 30) is the first that actually qualifies."""
+    day1 = date(2026, 8, 27)  # exactly 120min free — fits effort_minutes, not the buffer
+    day2 = date(2026, 8, 28)  # exactly 150min free — fits effort_minutes + buffer
+    forward_events = {
+        day1: [Event(start=time(11, 0), end=time(18, 0))],  # 9:00-11:00 free = 120min
+        day2: [Event(start=time(11, 30), end=time(18, 0))],  # 9:00-11:30 free = 150min
+    }
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    result = _next_fitting_slot(
+        forward_events, TZ, WH_START, WH_END, now_local, today=day1, effort_minutes=120,
+        exclude_event_id=None,
+    )
+    assert result == datetime(2026, 8, 28, 9, 0, tzinfo=TZ)
+
+
+def test_next_fitting_slot_min_start_skips_earlier_days_entirely():
+    """The decline-and-defer flow's floor: a day entirely before
+    min_start must not be offered, even though it would otherwise fit."""
+    day1 = date(2026, 8, 27)
+    day2 = date(2026, 8, 28)
+    forward_events = {day1: [], day2: []}
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    result = _next_fitting_slot(
+        forward_events, TZ, WH_START, WH_END, now_local, today=day1, effort_minutes=120,
+        exclude_event_id=None, min_start=datetime(2026, 8, 28, 0, 0, tzinfo=TZ),
+    )
+    assert result == datetime(2026, 8, 28, 9, 0, tzinfo=TZ)  # day1 skipped entirely
+
+
+def test_next_fitting_slot_min_start_clips_its_own_day():
+    """min_start landing mid-day clips that day's own search floor up to
+    its time-of-day, same clamping shape _buffered_wh_start already uses
+    for "today"."""
+    day = date(2026, 8, 27)
+    forward_events = {day: []}  # fully free 9-18
+    now_local = datetime(2026, 8, 27, 8, 0, tzinfo=TZ)
+    result = _next_fitting_slot(
+        forward_events, TZ, WH_START, WH_END, now_local, today=day, effort_minutes=60,
+        exclude_event_id=None, min_start=datetime(2026, 8, 27, 14, 0, tzinfo=TZ),
+    )
+    assert result == datetime(2026, 8, 27, 14, 0, tzinfo=TZ)  # not 9am, clipped to min_start
+
+
 def test_eligible_latents_excludes_dormant_and_maps_columns():
     conn = _mock_connection(
         fetchall_result=[

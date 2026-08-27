@@ -165,6 +165,37 @@ def _enqueue_fire_task(item_id, fire_at: datetime) -> None:
         logger.exception("failed to enqueue fire task item_id=%s", item_id)
 
 
+def _enqueue_next_fit_task(item_id) -> None:
+    """Same shape as committer_svc's own _enqueue_next_fit_task —
+    duplicated rather than imported, same per-service pattern as every
+    other Cloud Tasks enqueuer here. Fires an immediate (no
+    schedule_time) recompute at dispatcher-svc's own
+    /latents/{item_id}/next-fit, used here when a real Calendar event —
+    new or moved — has just landed on top of this idea's currently
+    scheduled placeholder slot (user-directed: the placeholder must move
+    off a slot the instant something else actually claims it, not wait
+    for the next twice-daily sweep or the fire-time re-verify)."""
+    try:
+        project_id = os.environ["GCP_PROJECT_ID"]
+        dispatcher_url = os.environ["DISPATCHER_SVC_URL"]
+        url = f"{dispatcher_url}/latents/{item_id}/next-fit"
+        dispatcher_sa = f"sa-dispatcher@{project_id}.iam.gserviceaccount.com"
+        client = tasks_v2.CloudTasksClient()
+        parent = client.queue_path(project_id, TASKS_LOCATION, TASKS_QUEUE)
+        client.create_task(
+            parent=parent,
+            task={
+                "http_request": {
+                    "http_method": tasks_v2.HttpMethod.POST,
+                    "url": url,
+                    "oidc_token": {"service_account_email": dispatcher_sa, "audience": url},
+                },
+            },
+        )
+    except Exception:
+        logger.exception("failed to enqueue next-fit task item_id=%s", item_id)
+
+
 def _ensure_watch(conn, user_id: UUID, refresh_ref: str) -> None:
     """Registers (or renews, within CHANNEL_RENEW_WINDOW of expiry) this
     user's push-notification channel. Calendar API channels aren't
@@ -243,6 +274,13 @@ def _parse_event_start(event: dict) -> datetime | None:
     return datetime.fromisoformat(start["dateTime"])
 
 
+def _parse_event_end(event: dict) -> datetime | None:
+    end = event.get("end", {})
+    if "dateTime" not in end:
+        return None
+    return datetime.fromisoformat(end["dateTime"])
+
+
 def _reconcile_obligation(conn, item_id, stored_due_at, event: dict, cancelled: bool) -> None:
     if cancelled:
         conn.execute("UPDATE items SET state = 'CANCELLED' WHERE id = %s", (str(item_id),))
@@ -312,12 +350,53 @@ def _reconcile_latent(conn, item_id, stored_next_fit, event: dict, cancelled: bo
     _enqueue_fire_task(item_id, new_start)
 
 
-def _reconcile_event(conn, event: dict) -> None:
+def _reschedule_conflicting_latents(conn, user_id: UUID, event: dict, cancelled: bool) -> None:
+    """User-directed: if a real event — new, or moved here — now overlaps
+    a committed idea's currently-scheduled placeholder slot, that idea
+    must move off it immediately, not wait for the next twice-daily
+    sweep or its own fire-time re-verify. Runs for every event in the
+    delta, tracked or not (an existing obligation dragged onto an idea's
+    slot is just as real a conflict as a brand-new event) — the
+    `placeholder_event_id != event_id` guard is what keeps an idea from
+    "conflicting" with its own placeholder. A cancelled event only ever
+    frees time, never claims it, so it can't create a new conflict."""
+    if cancelled:
+        return
+    new_start = _parse_event_start(event)
+    new_end = _parse_event_end(event)
+    if new_start is None or new_end is None:
+        return
+    event_id = event["id"]
+
+    rows = conn.execute(
+        """
+        SELECT l.item_id
+        FROM latents l JOIN items i ON i.id = l.item_id
+        WHERE i.user_id = %s AND i.state = 'COMMITTED' AND l.next_fit_start IS NOT NULL
+          AND (l.placeholder_event_id IS NULL OR l.placeholder_event_id != %s)
+          AND l.next_fit_start < %s
+          AND l.next_fit_start + (i.effort_minutes * interval '1 minute') > %s
+        """,
+        (str(user_id), event_id, new_end, new_start),
+    ).fetchall()
+    for (item_id,) in rows:
+        logger.info(
+            "sync: real event conflicts with idea's placeholder slot, rescheduling "
+            "item_id=%s conflicting_event_id=%s",
+            item_id, event_id,
+        )
+        _enqueue_next_fit_task(item_id)
+
+
+def _reconcile_event(conn, user_id: UUID, event: dict) -> None:
     """Looks up whether this Calendar event id is one we actually track
-    (an obligation's real event, or a latent's [idea] placeholder) —
-    anything else is skipped entirely, never touched. Both lookups are
-    scoped to state='COMMITTED' so an already-cancelled item can't be
-    "re-cancelled" or have its due_at churned by a leftover event."""
+    (an obligation's real event, or a latent's [idea] placeholder) — its
+    own due_at/next_fit_start change is reconciled if so, but every event
+    (tracked or not) is also checked against every *other* committed
+    idea's current placeholder slot for a fresh conflict. Both ownership
+    lookups are scoped to state='COMMITTED' so an already-cancelled item
+    can't be "re-cancelled" or have its due_at churned by a leftover
+    event."""
     event_id = event["id"]
     cancelled = event.get("status") == "cancelled"
 
@@ -328,15 +407,16 @@ def _reconcile_event(conn, event: dict) -> None:
     ).fetchone()
     if ob_row is not None:
         _reconcile_obligation(conn, ob_row[0], ob_row[1], event, cancelled)
-        return
+    else:
+        lat_row = conn.execute(
+            "SELECT l.item_id, l.next_fit_start FROM latents l JOIN items i ON i.id = l.item_id "
+            "WHERE l.placeholder_event_id = %s AND i.state = 'COMMITTED'",
+            (event_id,),
+        ).fetchone()
+        if lat_row is not None:
+            _reconcile_latent(conn, lat_row[0], lat_row[1], event, cancelled)
 
-    lat_row = conn.execute(
-        "SELECT l.item_id, l.next_fit_start FROM latents l JOIN items i ON i.id = l.item_id "
-        "WHERE l.placeholder_event_id = %s AND i.state = 'COMMITTED'",
-        (event_id,),
-    ).fetchone()
-    if lat_row is not None:
-        _reconcile_latent(conn, lat_row[0], lat_row[1], event, cancelled)
+    _reschedule_conflicting_latents(conn, user_id, event, cancelled)
 
 
 def _sync_user(conn, user_id: UUID, refresh_ref: str) -> None:
@@ -363,7 +443,7 @@ def _sync_user(conn, user_id: UUID, refresh_ref: str) -> None:
         events = []
 
     for event in events:
-        _reconcile_event(conn, event)
+        _reconcile_event(conn, user_id, event)
 
     conn.execute(
         "UPDATE calendar_sync_channels SET sync_token = %s, updated_at = now() WHERE user_id = %s",
