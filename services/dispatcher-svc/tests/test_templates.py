@@ -6,12 +6,13 @@ from zoneinfo import ZoneInfo
 
 from dispatcher_svc.templates import (
     relative_due_description,
+    render_accepted,
     render_deferred,
-    render_event_reminder_early,
-    render_event_reminder_start,
+    render_dismissed,
+    render_event_reminder,
     render_fire_suggestion,
-    render_reminder_early,
-    render_reminder_final,
+    render_reminder,
+    render_snoozed,
 )
 
 
@@ -23,28 +24,17 @@ def test_relative_due_description_today_tomorrow_and_n_days():
     assert relative_due_description(date(2026, 8, 30), today) == "in 3 days"
 
 
-def test_render_reminder_early_exact_format():
-    due = datetime(2026, 9, 4, 14, 0)  # a real Friday
-    body = render_reminder_early("Pay rent", due, today=date(2026, 9, 3))
-    assert body == "⏰ heads up — Pay rent is due tomorrow, Fri 4 Sep, 2:00 PM."
-
-
-def test_render_reminder_final_exact_format():
+def test_render_reminder_exact_format():
+    """v1 simplification: one reminder now, at the time-of."""
     due = datetime(2026, 9, 4, 14, 0)
-    body = render_reminder_final("Pay rent", due, today=date(2026, 9, 4))
-    assert body == "⏰ last call — Pay rent is due today, Fri 4 Sep, 2:00 PM."
+    body = render_reminder("Pay rent", due, today=date(2026, 9, 4))
+    assert body == "⏰ last call, Pay rent is due today, Fri 4 Sep, 2:00 PM."
 
 
-def test_render_event_reminder_early_exact_format():
+def test_render_event_reminder_exact_format():
     due = datetime(2026, 8, 25, 20, 39)
-    body = render_event_reminder_early("Meeting", due, today=date(2026, 8, 25))
-    assert body == "⏰ heads up — Meeting starts today, Tue 25 Aug, 8:39 PM."
-
-
-def test_render_event_reminder_start_exact_format():
-    due = datetime(2026, 8, 25, 20, 39)
-    body = render_event_reminder_start("Meeting", due, today=date(2026, 8, 25))
-    assert body == "⏰ Meeting is starting now — Tue 25 Aug, 8:39 PM."
+    body = render_event_reminder("Meeting", due, today=date(2026, 8, 25))
+    assert body == "⏰ Meeting is starting now, Tue 25 Aug, 8:39 PM."
 
 
 def test_render_fire_suggestion_exact_format():
@@ -52,7 +42,7 @@ def test_render_fire_suggestion_exact_format():
     arrives, replacing the old revival_score-picked render_suggestion."""
     body = render_fire_suggestion("Nerf gun turret", 240)
     assert body == (
-        'yo u have 4h free right now — wanna bang out "Nerf gun turret"?\n\nY / N / Later'
+        'yo u have 4h free right now, wanna bang out "Nerf gun turret"?\n\nY / N / Later'
     )
 
 
@@ -65,9 +55,26 @@ def test_render_deferred_with_a_new_slot():
     tz = ZoneInfo("America/Vancouver")
     next_fit = datetime(2026, 8, 28, 9, 0, tzinfo=tz)
     body = render_deferred(next_fit, tz)
-    assert body == "np — i'll text you again Friday."
+    assert body == "np, i'll text you again Friday."
 
 
 def test_render_deferred_with_no_slot_found():
     body = render_deferred(None, ZoneInfo("UTC"))
     assert body == "np, i'll keep an eye out for room."
+
+
+def test_no_template_body_contains_an_em_dash():
+    """No em dash, ever, in anything the bot says (user-directed)."""
+    due = datetime(2026, 9, 4, 14, 0)
+    today = date(2026, 9, 4)
+    bodies = [
+        render_reminder("Pay rent", due, today),
+        render_event_reminder("Meeting", due, today),
+        render_fire_suggestion("Nerf gun turret", 240),
+        render_deferred(datetime(2026, 8, 28, 9, 0, tzinfo=ZoneInfo("UTC")), ZoneInfo("UTC")),
+        render_deferred(None, ZoneInfo("UTC")),
+        render_accepted("Pay rent", due),
+        render_dismissed(),
+        render_snoozed(),
+    ]
+    assert all("—" not in body for body in bodies)

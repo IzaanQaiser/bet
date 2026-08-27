@@ -102,11 +102,12 @@ def test_reconcile_obligation_time_changed_updates_and_reschedules():
     assert len(update_calls) == 1
     params = update_calls[0].args[1]
     assert params[0] == datetime.fromisoformat(new_time)  # due_at
-    assert params[3] is None and params[4] is None  # neither reminder slot already past
-    assert mock_enqueue.call_count == 2  # both slots enqueued fresh
+    assert params[1] == datetime.fromisoformat(new_time)  # reminder_at == due_at (v1)
+    assert params[2] is None  # reminder not already past
+    mock_enqueue.assert_called_once_with(item_id, datetime.fromisoformat(new_time))
 
 
-def test_reconcile_obligation_past_new_time_marks_reminders_sent_no_enqueue():
+def test_reconcile_obligation_past_new_time_marks_reminder_sent_no_enqueue():
     from calendar_sync_svc.main import _reconcile_obligation
 
     conn = MagicMock()

@@ -453,7 +453,7 @@ def test_other_items_context_formats_and_excludes_current_item():
     assert "state = 'COMMITTED'" in sql
     assert "i.id != %s" in sql
     assert params == (str(user_id), str(item_id), 20)
-    assert result == ["Assignment due — due Wed 26 Aug, 7:00 PM"]
+    assert result == ["Assignment due, due Wed 26 Aug, 7:00 PM"]
 
 
 def test_other_items_context_empty_when_nothing_committed():
@@ -702,93 +702,25 @@ def test_duplicate_n_reply_with_missing_fields_resumes_clarification(client):
 
 
 
-# --- universal flat-30-minute reminders (no effort anywhere) -------------
+# --- single time-of reminder (v1 simplification) -------------------------
 
 
-def test_compute_reminder_times_flat_30min_before_and_at_due():
-    """One universal rule, user-specified: 30 minutes before due_at, and
-    at due_at itself — no effort, no task/event distinction in the math
-    at all anymore."""
-    from resolver_svc.main import _compute_reminder_times
+def test_compute_reminder_time_equals_due_at():
+    """v1 simplification, user-directed: the one remaining SMS reminder
+    fires AT due_at itself — no offset, no effort/task-event distinction
+    in the math at all."""
+    from resolver_svc.main import _compute_reminder_time
 
-    times = _compute_reminder_times("2026-09-04T18:00:00")
-    assert times == (datetime(2026, 9, 4, 17, 30), datetime(2026, 9, 4, 18, 0))
-
-
-def test_compute_reminder_times_none_when_due_at_missing():
-    from resolver_svc.main import _compute_reminder_times
-
-    assert _compute_reminder_times(None) is None
+    assert _compute_reminder_time("2026-09-04T18:00:00") == datetime(2026, 9, 4, 18, 0)
 
 
-def test_future_reminder_strings_drops_a_time_already_passed():
-    """Real bug, found live: a confirmation sent well after the 30-min
-    heads-up mark had already passed still told the user "I'll remind you
-    at 9:53pm" — a time already gone before the message was composed.
-    Only the still-future one should ever be returned."""
-    from resolver_svc.main import _future_reminder_strings
+def test_compute_reminder_time_none_when_due_at_missing():
+    from resolver_svc.main import _compute_reminder_time
 
-    # due 10:23pm, "now" is 10:02pm — the 30-min-before mark (9:53pm) is
-    # already in the past; only the at-due-time one is still ahead.
-    now_local = datetime(2026, 8, 25, 22, 2)
-    r1, r2 = _future_reminder_strings("2026-08-25T22:23:00", now_local)
-    assert r1 is None
-    assert r2 == "10:23 PM"
+    assert _compute_reminder_time(None) is None
 
 
-def test_future_reminder_strings_both_future_when_confirmed_early():
-    from resolver_svc.main import _future_reminder_strings
-
-    now_local = datetime(2026, 8, 25, 21, 0)
-    r1, r2 = _future_reminder_strings("2026-08-25T22:23:00", now_local)
-    assert r1 == "9:53 PM"
-    assert r2 == "10:23 PM"
-
-
-def test_ensure_reminder_mention_noop_when_already_passed():
-    from resolver_svc.main import _ensure_reminder_mention
-
-    # reminder_1_at_passed non-None means converse() already had the
-    # chance to mention it naturally — no deterministic append here.
-    now_local = datetime(2026, 9, 4, 12, 0)
-    text = _ensure_reminder_mention(
-        "bet, locked in", "2:00 PM", "2026-09-04T18:00:00", now_local
-    )
-    assert text == "bet, locked in"
-
-
-def test_ensure_reminder_mention_appends_both_when_newly_computable():
-    from resolver_svc.main import _ensure_reminder_mention
-
-    now_local = datetime(2026, 9, 4, 12, 0)
-    text = _ensure_reminder_mention(
-        "alright, sounds good — confirm?", None, "2026-09-04T18:00:00", now_local
-    )
-    assert text == "alright, sounds good — confirm? I'll remind you at 5:30 PM and 6:00 PM."
-
-
-def test_ensure_reminder_mention_appends_only_the_one_still_future():
-    """Confirming inside the 30-minute window: only the at-due-time
-    reminder is still ahead, so the append must name only that one, not
-    both."""
-    from resolver_svc.main import _ensure_reminder_mention
-
-    now_local = datetime(2026, 9, 4, 17, 45)
-    text = _ensure_reminder_mention(
-        "alright, sounds good — confirm?", None, "2026-09-04T18:00:00", now_local
-    )
-    assert text == "alright, sounds good — confirm? I'll remind you at 6:00 PM."
-
-
-def test_ensure_reminder_mention_noop_when_still_not_computable():
-    from resolver_svc.main import _ensure_reminder_mention
-
-    now_local = datetime(2026, 9, 4, 12, 0)
-    text = _ensure_reminder_mention("what's the deadline?", None, None, now_local)
-    assert text == "what's the deadline?"
-
-
-def test_confirm_and_publish_computes_reminder_times_and_flips_state():
+def test_confirm_and_publish_computes_reminder_time_and_flips_state():
     """_confirm_and_publish is the only path into CONFIRMED now (v1 polish,
     module docstring) — this is the reminder-time computation the old
     AFFIRM-reply path used to do, unit-tested directly against the helper
@@ -808,8 +740,7 @@ def test_confirm_and_publish_computes_reminder_times_and_flips_state():
     mock_publish.assert_called_once()
     topic, confirmed = mock_publish.call_args.args
     assert topic == "items-confirmed"
-    assert confirmed.reminder_1_at == datetime(2026, 9, 4, 17, 30)
-    assert confirmed.reminder_2_at == datetime(2026, 9, 4, 18, 0)
+    assert confirmed.reminder_at == datetime(2026, 9, 4, 18, 0)
 
     update_calls = [c for c in conn.execute.call_args_list if "UPDATE items" in c.args[0]]
     assert len(update_calls) == 1

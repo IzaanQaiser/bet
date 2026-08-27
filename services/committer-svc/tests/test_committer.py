@@ -95,6 +95,12 @@ def test_obligation_branch_calls_calendar_write(client):
     mock_session_cls.return_value.post.assert_called_once()
     _, kwargs = mock_session_cls.return_value.post.call_args
     assert kwargs["json"]["summary"] == "Pay rent"
+    # v1 simplification: the 30-min-before lead that used to be a second
+    # SMS now lives only as the Calendar event's own native reminder.
+    assert kwargs["json"]["reminders"] == {
+        "useDefault": False,
+        "overrides": [{"method": "popup", "minutes": 30}],
+    }
 
     # call 0 is the idempotency guard's items.state check; 1 is the SELECT
     # in _user_credentials; 2 is the ADR 0009 placeholder-lookup SELECT
@@ -139,11 +145,8 @@ def test_calendar_branch_localizes_due_at_before_insert(client):
     assert insert_params[1] == datetime(2026, 8, 28, 14, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
-def test_calendar_branch_persists_reminder_times(client):
-    confirmed = _confirmed_message(
-        reminder_1_at=datetime(2026, 8, 28, 10, 0),
-        reminder_2_at=datetime(2026, 8, 28, 12, 0),
-    )
+def test_calendar_branch_persists_reminder_time(client):
+    confirmed = _confirmed_message(reminder_at=datetime(2026, 8, 28, 14, 0))
     conn = _mock_connection(
         user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
     )
@@ -160,26 +163,21 @@ def test_calendar_branch_persists_reminder_times(client):
 
     assert resp.status_code == 200
     insert_sql, insert_params = conn.execute.call_args_list[3][0]
-    assert "reminder_1_at" in insert_sql
-    assert "reminder_2_at" in insert_sql
-    # Real bug, found live: these used to be inserted still-naive, which
+    assert "reminder_at" in insert_sql
+    # Real bug, found live: this used to be inserted still-naive, which
     # Postgres then silently interpreted as UTC on a timestamptz column —
-    # a real committed item's reminder times (and due_at) landed hours off
+    # a real committed item's reminder time (and due_at) landed hours off
     # from what the user actually said. Must be tz-aware before the INSERT.
     tz = ZoneInfo("America/Los_Angeles")
-    assert insert_params[4] == datetime(2026, 8, 28, 10, 0, tzinfo=tz)
-    assert insert_params[5] == datetime(2026, 8, 28, 12, 0, tzinfo=tz)
+    assert insert_params[4] == datetime(2026, 8, 28, 14, 0, tzinfo=tz)
 
 
-def test_calendar_branch_enqueues_a_reminder_task_per_slot(client):
+def test_calendar_branch_enqueues_a_reminder_task(client):
     """Real gap, found live: dispatcher-svc's own /dispatch only runs
     twice a day, too coarse for a same-day reminder. committer-svc must
-    schedule a precise Cloud Task per reminder slot, at the exact
-    (already-localized) reminder instant, instead of relying on polling."""
-    confirmed = _confirmed_message(
-        reminder_1_at=datetime(2026, 8, 28, 10, 0),
-        reminder_2_at=datetime(2026, 8, 28, 12, 0),
-    )
+    schedule a precise Cloud Task at the exact (already-localized)
+    reminder instant, instead of relying on polling."""
+    confirmed = _confirmed_message(reminder_at=datetime(2026, 8, 28, 14, 0))
     conn = _mock_connection(
         user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
     )
@@ -196,35 +194,26 @@ def test_calendar_branch_enqueues_a_reminder_task_per_slot(client):
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 200
-    assert mock_enqueue.call_count == 2
     tz = ZoneInfo("America/Los_Angeles")
-    mock_enqueue.assert_any_call(confirmed.item_id, 1, datetime(2026, 8, 28, 10, 0, tzinfo=tz))
-    mock_enqueue.assert_any_call(confirmed.item_id, 2, datetime(2026, 8, 28, 12, 0, tzinfo=tz))
+    mock_enqueue.assert_called_once_with(confirmed.item_id, datetime(2026, 8, 28, 14, 0, tzinfo=tz))
 
 
-def test_calendar_branch_skips_a_reminder_slot_already_overdue_at_commit(client):
+def test_calendar_branch_skips_a_reminder_already_overdue_at_commit(client):
     """Real bug, found live: confirming a meeting 2 minutes before it
-    started meant reminder_1_at (due - effort, meant as advance notice)
-    was already ~29 minutes in the past by commit time. Cloud Tasks
-    doesn't hold a past schedule_time — it fires immediately, so the
-    "heads up" text landed at the same instant as confirmation, right next
-    to the real on-time "starting now" reminder a minute later. Only the
-    still-future slot should ever get enqueued.
+    started meant reminder_at was already in the past by commit time.
+    Cloud Tasks doesn't hold a past schedule_time, it fires immediately,
+    which would land the reminder at the same instant as confirmation.
 
     Second real bug, found live right after: skipping the enqueue alone
-    left reminder_1_sent_at NULL forever, so /dispatch/reminders' own
+    left reminder_sent_at NULL forever, so /dispatch/reminders' own
     fallback poll (unable to tell "genuinely missed" apart from
-    "deliberately never scheduled") fired the stale "heads up" late —
-    AFTER the event's own "starting now" reminder had already gone out.
-    The skipped slot must be marked sent at insert time so the fallback's
-    own IS NULL idempotency check leaves it alone."""
+    "deliberately never scheduled") fired it late anyway. The skipped
+    reminder must be marked sent at insert time so the fallback's own
+    IS NULL idempotency check leaves it alone."""
     from datetime import UTC, timedelta
 
     now = datetime.now(UTC)
-    confirmed = _confirmed_message(
-        reminder_1_at=now - timedelta(minutes=29),  # already overdue
-        reminder_2_at=now + timedelta(minutes=1),  # still ahead
-    )
+    confirmed = _confirmed_message(reminder_at=now - timedelta(minutes=1))  # already overdue
     conn = _mock_connection(
         user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
     )
@@ -241,20 +230,17 @@ def test_calendar_branch_skips_a_reminder_slot_already_overdue_at_commit(client)
         resp = client.post("/pubsub/push", json=_push_envelope(confirmed))
 
     assert resp.status_code == 200
-    mock_enqueue.assert_called_once()
-    assert mock_enqueue.call_args.args[1] == 2  # only the still-future slot 2 enqueued
+    mock_enqueue.assert_not_called()
 
     insert_sql, insert_params = conn.execute.call_args_list[3][0]
-    assert "reminder_1_sent_at" in insert_sql
-    assert "reminder_2_sent_at" in insert_sql
-    assert insert_params[6] is not None  # slot 1: skipped, so marked closed out immediately
-    assert insert_params[7] is None  # slot 2: still ahead, real Cloud Task owns marking it sent
+    assert "reminder_sent_at" in insert_sql
+    assert insert_params[5] is not None  # marked closed out immediately, not left pending
 
 
-def test_calendar_branch_no_reminder_task_when_times_absent(client):
-    """A latent-turned-obligation or any commit with no reminder times
-    (both null) enqueues nothing — nothing to schedule."""
-    confirmed = _confirmed_message()  # reminder_1_at/reminder_2_at default None
+def test_calendar_branch_no_reminder_task_when_time_absent(client):
+    """A latent-turned-obligation or any commit with no reminder time
+    (null) enqueues nothing — nothing to schedule."""
+    confirmed = _confirmed_message()  # reminder_at defaults to None
     conn = _mock_connection(
         user_row=("projects/p/secrets/user-refresh-token-x/versions/latest", "America/Los_Angeles")
     )
@@ -468,8 +454,14 @@ def test_upsert_placeholder_creates_when_no_existing_event(client):
     assert resp.status_code == 200
     assert resp.json() == {"event_id": "new-evt"}
     mock_session_cls.return_value.post.assert_called_once()
-    summary = mock_session_cls.return_value.post.call_args.kwargs["json"]["summary"]
-    assert summary == "[idea] Nerf gun turret"
+    sent_json = mock_session_cls.return_value.post.call_args.kwargs["json"]
+    assert sent_json["summary"] == "[idea] Nerf gun turret"
+    # Idea placeholders get the same native Calendar reminder as a real
+    # obligation event, "all events and ideas" per the v1 ask.
+    assert sent_json["reminders"] == {
+        "useDefault": False,
+        "overrides": [{"method": "popup", "minutes": 30}],
+    }
 
 
 def test_upsert_placeholder_moves_when_existing_event_given(client):

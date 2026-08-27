@@ -347,26 +347,24 @@ Verified against real Vertex AI before wiring in: 7/7 scenarios correct — the 
 
 ## 4. Dispatcher contract — all deterministic templates
 
-### 4.1 Deadline reminders — two stages, effort-derived
+### 4.1 Deadline reminder — one stage, at the time-of
 
 ```
-⏰ heads up — {title} is due {relative_due_description}, {formatted_due_at}.
-Block off ~{effort} for it soon.
+⏰ last call, {title} is due {relative_due_description}, {formatted_due_at}.
 ```
 ```
-⏰ last call — {title} is due {relative_due_description}, {formatted_due_at}.
-About {effort} left if you start now.
+⏰ {title} is starting now, {formatted_due_at}.
 ```
-`{relative_due_description}` is `"today"`, `"tomorrow"`, or `"in {N} days"`, computed from `obligations.due_at`, not the LLM. `{effort}` is `obligations`' linked `items.effort_minutes`, formatted as hours/minutes.
+(the second form for `is_scheduled_event` obligations — worded as starting, not due). `{relative_due_description}` is `"today"`, `"tomorrow"`, or `"in {N} days"`, computed from `obligations.due_at`, not the LLM.
 
-**Superseded gap, originally found in step 8, redesigned in the effort-aware clarification pass:** the single fixed `reminder_window_hours`/`reminder_sent_at` columns (a blanket 24h-before-due window, never varying per obligation) are gone (migrations/0013). Two reminders are computed instead by resolver-svc at confirm time, once both `due_at` and `effort_minutes` are known: `reminder_1_at = due_at - 2*effort_minutes` (early heads-up) and `reminder_2_at = due_at - effort_minutes` (start-by, last call) — persisted on `obligations.reminder_1_at`/`reminder_2_at`, fired independently by dispatcher-svc against `reminder_1_sent_at`/`reminder_2_sent_at IS NULL`, same idempotency shape as before but per-slot. `{relative_due_description}` stays a separate, purely calendar-day calculation, same as before — an obligation can already be past a reminder threshold while still rendering as `"tomorrow"`, and that's correct, not a bug.
+**V1 simplification, user-directed (this section previously described an effort-derived two-stage design — migrations/0013's `reminder_1_at`/`reminder_2_at` — that a still-earlier same-session pass had already flattened to a fixed 30-minute-before/at-due pair before this doc was ever updated to match; this pass removes the earlier stage entirely rather than just correcting the drift):** exactly one SMS reminder now, fired by dispatcher-svc at `obligations.reminder_at`, which resolver-svc sets to `due_at` itself at confirm time (`resolver_svc/main.py::_compute_reminder_time`) — no offset math left in the SMS pipeline at all. The 30-minute-before lead a user might still want lives only in the real Calendar event's own native popup reminder now, set explicitly at creation time by committer-svc (`CALENDAR_REMINDER_OVERRIDE = {"useDefault": False, "overrides": [{"method": "popup", "minutes": 30}]}`, applied to both a real obligation event and an idea's placeholder event, replacing what used to be an implicit `useDefault`) — a Calendar-side notification, not a second text. `migrations/0022` drops `reminder_1_at`/`reminder_1_sent_at` and renames `reminder_2_at`/`reminder_2_sent_at` to `reminder_at`/`reminder_sent_at`, fired by dispatcher-svc against the same `reminder_sent_at IS NULL` idempotency shape as before.
 
-This is also what makes `effort_minutes` conversationally askable now, not just silently guessed: extractor-svc only guesses a bucket when the message gives real signal; when it doesn't, `"effort_minutes"` joins `missing_fields` alongside `due_at`/`email_recipient` and resolver-svc's `converse()` asks for it directly (conversation.py §3.2/§3.3's field-merge step), since the two reminder times can't be computed without it.
+Since the confirmation message already states the due/start time in the same breath ("it's due at 6pm" / "it starts at 3pm"), and the one remaining reminder always fires at exactly that instant, `converse()` no longer separately states a reminder time at all — restating it would just repeat what was already said, not add information. `effort_minutes` stays conversationally askable (extractor-svc guesses a bucket only when the message gives real signal; resolver-svc's `converse()` asks otherwise), but purely for Calendar event sizing now — reminder timing doesn't depend on it.
 
 ### 4.2 Fire-time suggestion — exact rendering (ADR 0009, replaces the old scored one)
 
 ```
-yo u have {block_hours} free right now — wanna bang out "{item_title}"?
+yo u have {block_hours} free right now, wanna bang out "{item_title}"?
 
 Y / N / Later
 ```
@@ -377,7 +375,7 @@ Y / N / Later
 **N (first dismissal) and Later replies** — the placeholder moves or clears (capacity-engine.md §5.4), and the reply differs from a flat "got it":
 
 ```
-np — i'll text you again {new_next_fit_start weekday}.
+np, i'll text you again {new_next_fit_start weekday}.
 ```
 or, if nothing in the 7-day window fits:
 ```

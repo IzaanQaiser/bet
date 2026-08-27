@@ -163,7 +163,7 @@ def test_due_at_none_stays_none():
     assert msg.due_at is None
 
 
-def test_confirmed_item_message_reminder_times_default_none():
+def test_confirmed_item_message_reminder_time_default_none():
     msg = ConfirmedItemMessage(
         item_id=uuid4(),
         user_id=uuid4(),
@@ -175,13 +175,11 @@ def test_confirmed_item_message_reminder_times_default_none():
         action_type="calendar",
         email_draft=None,
     )
-    assert msg.reminder_1_at is None
-    assert msg.reminder_2_at is None
+    assert msg.reminder_at is None
 
 
-def test_confirmed_item_message_reminder_times_roundtrip():
-    r1 = datetime(2026, 8, 26, 16, 0, 0)
-    r2 = datetime(2026, 8, 26, 17, 0, 0)
+def test_confirmed_item_message_reminder_time_roundtrip():
+    reminder_at = datetime(2026, 8, 26, 18, 0, 0)
     msg = ConfirmedItemMessage(
         item_id=uuid4(),
         user_id=uuid4(),
@@ -192,12 +190,10 @@ def test_confirmed_item_message_reminder_times_roundtrip():
         effort_minutes=60,
         action_type="calendar",
         email_draft=None,
-        reminder_1_at=r1,
-        reminder_2_at=r2,
+        reminder_at=reminder_at,
     )
     roundtripped = ConfirmedItemMessage.model_validate_json(msg.model_dump_json())
-    assert roundtripped.reminder_1_at == r1
-    assert roundtripped.reminder_2_at == r2
+    assert roundtripped.reminder_at == reminder_at
 
 
 @pytest.mark.parametrize(

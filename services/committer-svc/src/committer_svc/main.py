@@ -96,7 +96,7 @@ def _secret_client() -> secretmanager.SecretManagerServiceClient:
     return secretmanager.SecretManagerServiceClient()
 
 
-def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
+def _enqueue_reminder_task(item_id, fire_at: datetime) -> None:
     """Best-effort, not fatal to the commit: the obligations row and the
     real Calendar event are the parts that matter — a failed enqueue just
     means this one reminder relies on the infrequent poll fallback instead
@@ -106,7 +106,7 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
     scheduled_for in the task body (real bug, found designing calendar-
     sync-svc's two-way sync): lets /dispatch/reminders/fire recognize a
     task superseded by a later due_at change and no-op instead of firing
-    at the wrong time and blocking the correct one via reminder_N_sent_at."""
+    at the wrong time and blocking the correct one via reminder_sent_at."""
     try:
         project_id = os.environ["GCP_PROJECT_ID"]
         dispatcher_url = os.environ["DISPATCHER_SVC_URL"]
@@ -126,7 +126,6 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
                     "body": json.dumps(
                         {
                             "item_id": str(item_id),
-                            "slot": slot,
                             "scheduled_for": fire_at.isoformat(),
                         }
                     ).encode(),
@@ -137,9 +136,7 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
         )
     except Exception:
         logger.exception(
-            "failed to enqueue reminder task item_id=%s slot=%s (falling back to poll)",
-            item_id,
-            slot,
+            "failed to enqueue reminder task item_id=%s (falling back to poll)", item_id
         )
 
 
@@ -226,6 +223,19 @@ def _localize(dt, timezone: str):
     return dt
 
 
+
+# V1 simplification, user-directed: the SMS side collapsed to a single
+# time-of reminder (resolver_svc/main.py::_compute_reminder_time) — this
+# 30-minute lead lives only here now, as the Calendar event's own native
+# popup notification, set explicitly rather than left at the implicit
+# useDefault (which follows whatever the user's account default happens
+# to be, not a value this system controls or can reason about).
+CALENDAR_REMINDER_OVERRIDE = {
+    "useDefault": False,
+    "overrides": [{"method": "popup", "minutes": 30}],
+}
+
+
 def _write_calendar_event(
     confirmed: ConfirmedItemMessage, timezone: str, creds: Credentials, due_at
 ) -> str:
@@ -239,6 +249,7 @@ def _write_calendar_event(
             "description": confirmed.summary,
             "start": {"dateTime": due_at.isoformat(), "timeZone": timezone},
             "end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
+            "reminders": CALENDAR_REMINDER_OVERRIDE,
         },
     )
     response.raise_for_status()
@@ -247,10 +258,10 @@ def _write_calendar_event(
 
 # ADR 0009 — the only Calendar write for a latent's tentative slot, always
 # tagged so it reads as tentative on the user's real calendar, always
-# inert (no reminders, no obligations row) until an explicit Y promotes
-# it via _promote_placeholder_event below.
+# inert (no SMS reminder task, no obligations row) until an explicit Y
+# promotes it via _promote_placeholder_event below.
 PLACEHOLDER_TITLE_PREFIX = "[idea] "
-PLACEHOLDER_DESCRIPTION = "Auto-scheduled — you'll get a text when it's time."
+PLACEHOLDER_DESCRIPTION = "Auto-scheduled. You'll get a text when it's time."
 
 
 def _create_placeholder_event(payload: PlaceholderUpsertRequest, timezone: str, creds) -> str:
@@ -263,6 +274,7 @@ def _create_placeholder_event(payload: PlaceholderUpsertRequest, timezone: str, 
             "description": PLACEHOLDER_DESCRIPTION,
             "start": {"dateTime": payload.start.isoformat(), "timeZone": timezone},
             "end": {"dateTime": end_at.isoformat(), "timeZone": timezone},
+            "reminders": CALENDAR_REMINDER_OVERRIDE,
         },
     )
     response.raise_for_status()
@@ -356,8 +368,7 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
     if confirmed.action_type == "calendar":
         creds, timezone = _user_credentials(confirmed.user_id, CALENDAR_SCOPE)
         due_at = _localize(confirmed.due_at, timezone)
-        reminder_1_at = _localize(confirmed.reminder_1_at, timezone)
-        reminder_2_at = _localize(confirmed.reminder_2_at, timezone)
+        reminder_at = _localize(confirmed.reminder_at, timezone)
 
         # ADR 0009 — a resurfaced latent already has a real [idea]-tagged
         # placeholder on the calendar (dispatcher-svc's accept path always
@@ -389,55 +400,42 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
                 )
                 _conn.commit()
 
-        # Real finding, live: confirming something close to its own due
-        # time (a meeting 2 minutes out) meant reminder_1_at (due - effort,
-        # meant as advance notice) was already in the past by commit time.
-        # Cloud Tasks doesn't hold a past schedule_time for later — it
-        # dispatches immediately, so the "heads up, starting soon" text
-        # would fire at the same instant as confirmation, right next to the
-        # real on-time "starting now" reminder a minute later. That's not
-        # a missed reminder being rescued (the old "better late than
-        # never" reasoning, still correct for the /dispatch/reminders
-        # safety net's own genuine catch-up case) — there was never a gap
-        # to catch up from here, just a heads-up whose moment had already
-        # passed before it was ever scheduled. Skip enqueueing a slot
-        # that's already overdue at commit time instead of firing it
-        # immediately as stale noise.
+        # Real finding, live (predates the v1 single-reminder
+        # simplification, still applies): confirming something close to
+        # its own due time (a meeting 2 minutes out) meant reminder_at was
+        # already in the past by commit time. Cloud Tasks doesn't hold a
+        # past schedule_time for later, it dispatches immediately, which
+        # would fire the reminder at the same instant as confirmation.
+        # Skip enqueueing a slot that's already overdue at commit time
+        # instead of firing it immediately as stale noise.
         #
         # Second real bug, found live right after the first fix: skipping
-        # the enqueue isn't enough on its own — it left reminder_N_sent_at
+        # the enqueue isn't enough on its own, it left reminder_sent_at
         # NULL forever, and /dispatch/reminders' own fallback poll (its
         # genuine job is catching a slot a lost/failed Cloud Task never
         # fired) has no way to tell "genuinely missed" apart from
-        # "deliberately never scheduled" — it just sees an unsent, past-due
-        # slot and fires it late, exactly the stale noise the first fix
-        # was meant to prevent (a "heads up" reminder arriving AFTER the
-        # event's own "starting now" reminder already fired). A slot
-        # that's skipped here is done, not pending: mark it sent at insert
-        # time so the fallback's own `IS NULL` idempotency check correctly
-        # leaves it alone, the same way it already leaves a genuinely-sent
-        # slot alone.
+        # "deliberately never scheduled". A slot that's skipped here is
+        # done, not pending: mark it sent at insert time so the fallback's
+        # own `IS NULL` idempotency check correctly leaves it alone, the
+        # same way it already leaves a genuinely-sent slot alone.
         now = datetime.now(UTC)
-        reminder_1_already_past = bool(reminder_1_at and reminder_1_at <= now)
-        reminder_2_already_past = bool(reminder_2_at and reminder_2_at <= now)
+        reminder_already_past = bool(reminder_at and reminder_at <= now)
 
         with get_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO obligations
-                    (item_id, due_at, calendar_event_id, action_type, reminder_1_at, reminder_2_at,
-                     reminder_1_sent_at, reminder_2_sent_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (item_id, due_at, calendar_event_id, action_type, reminder_at,
+                     reminder_sent_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     str(confirmed.item_id),
                     due_at,
                     calendar_event_id,
                     confirmed.action_type,
-                    reminder_1_at,
-                    reminder_2_at,
-                    now if reminder_1_already_past else None,
-                    now if reminder_2_already_past else None,
+                    reminder_at,
+                    now if reminder_already_past else None,
                 ),
             )
             conn.execute(
@@ -445,10 +443,8 @@ def _commit_obligation(confirmed: ConfirmedItemMessage) -> None:
                 (confirmed.type, str(confirmed.item_id)),
             )
             conn.commit()
-        if reminder_1_at and not reminder_1_already_past:
-            _enqueue_reminder_task(confirmed.item_id, 1, reminder_1_at)
-        if reminder_2_at and not reminder_2_already_past:
-            _enqueue_reminder_task(confirmed.item_id, 2, reminder_2_at)
+        if reminder_at and not reminder_already_past:
+            _enqueue_reminder_task(confirmed.item_id, reminder_at)
         return
 
     if confirmed.action_type == "email":
