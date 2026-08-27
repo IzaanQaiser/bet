@@ -93,21 +93,29 @@ def block_fit(largest_contiguous_block: int, effort_minutes: int) -> int:
 
 Every committed, non-dormant latent gets a real, tagged `[idea] {title}` event written to the user's **main** Google Calendar at its own `next_fit_start` — the earliest day/time in the next 7 whose `largest_contiguous_block` clears `block_fit` for that item's `effort_minutes`. At the exact instant that slot arrives, the user is texted; **Y** promotes the same placeholder event in place (tag removed, real event); **N**/**Later** clears it and reschedules to the next available slot. There is no scoring, no threshold, no "at most one per run" — every eligible idea gets its own slot and its own text, independently.
 
-### 5.1 `_next_fitting_slot` — per-item, self-excluding, earliest-fitting
+### 5.1 `_next_fitting_slot` — per-item, self-excluding, earliest-fitting, margined
 
 ```python
 def _next_fitting_slot(forward_events, tz, wh_start, wh_end, now_local, today,
-                        effort_minutes, exclude_event_id) -> datetime | None:
+                        effort_minutes, exclude_event_id, min_start=None) -> datetime | None:
     for d in sorted(forward_events):
+        if min_start and d < min_start.date():
+            continue
         day_wh_start = buffered_wh_start(wh_start, wh_end, now_local) if d == today else wh_start
+        if min_start and d == min_start.date():
+            day_wh_start = min(max(day_wh_start, min_start.time()), wh_end)
         intervals = free_intervals(d, forward_events[d], day_wh_start, wh_end, exclude_event_id)
         for interval in intervals:  # already chronological — first fit wins
-            if block_fit(interval_duration, effort_minutes):
+            if block_fit(interval_duration, effort_minutes + IDEA_FIT_BUFFER_MINUTES):
                 return datetime.combine(d, interval.start, tzinfo=tz)
     return None
 ```
 
 `exclude_event_id` is the self-exclusion fix: an item's own existing placeholder is a real Calendar event, so without excluding it by id, recomputing that same item's slot would see its own placeholder as busy and needlessly evict itself every time it's recomputed. Every *other* item's placeholder is deliberately left in `forward_events` and still counts as busy — this is the entire mechanism behind a declined idea landing after every already-scheduled one (§5.3), with no cross-item cascade or reflow bookkeeping required.
+
+**`IDEA_FIT_BUFFER_MINUTES = 30`, v1, user-directed:** a candidate interval must be `>= effort_minutes + 30`, not just `>= effort_minutes` — real margin around the task on either side, not an exact-fit slot with nothing before or after it. Deliberately separate from `block_fit`'s own shared, no-margin rule rather than changing it there — that function is also used for the obligation accept-path fit check (§5.4) and day-level capacity metrics (§3/§4), neither of which this was about. Applies to every idea-slot search alike: initial placement, the sweep, a post-decline reschedule, and a conflict-triggered reschedule (§5.4.1).
+
+**`min_start`, v1, user-directed (the decline-and-defer flow, §5.4):** an additional floor beyond the usual `SUGGESTION_LEAD`-buffered "now" — days before it are skipped entirely, and its own day is clipped up to its time-of-day, the same clamping shape `buffered_wh_start` already uses for today. `None` (the default) leaves every other caller unaffected.
 
 **Real bug, found live, days after this shipped:** the first version picked the day's *largest* free interval (`max(intervals, key=duration)`), not its *earliest fitting* one. A user's real 2-hour idea got scheduled into a 3-hour gap at 8pm instead of the 2h36m gap at 5pm that already comfortably fit it, purely because 8pm's gap happened to be bigger. `free_intervals` already returns intervals in chronological order (built by walking busy time forward), so "earliest fitting" is just "first interval in the list whose duration clears `block_fit`" — no re-sort needed, and no reason it should ever have picked anything else. `_accept_suggestion` (§5.4) had the identical bug on the accept path, which was worse: it could silently commit the real obligation to a different time than what the fire-time text actually said, if some other part of the day had a bigger gap than the one just accepted. Fixed there too — try the earliest interval that fits the *original* `effort_minutes` first; only fall back to "whatever's biggest, capped down" (the pre-existing, still-correct "never refuse an accepted suggestion" behavior) when nothing on the day fully fits.
 
@@ -137,10 +145,16 @@ This bounds Cloud Tasks volume to "once per real slot change" and guarantees at 
 
 From there, the **existing** `/reply` machinery is reused almost entirely unchanged (`state-machine.md` §2.2/§2.3) — only how the reply gets classified changed, from a keyword match to `converse_suggestion`'s inferred `intent` (agent-contracts.md §4.2):
 - **`ACCEPT`** — re-verifies real current availability (excluding the item's own placeholder, §5.1), publishes `ConfirmedItemMessage` to `items.confirmed` exactly as before. committer-svc's `_commit_obligation` now checks for an existing `placeholder_event_id` first and promotes that same event via `PATCH` (tag/description stripped, real title/time set) instead of `POST`ing a duplicate — the placeholder columns are cleared in the same transaction.
-- **`DECLINE`, first dismissal** (`dismissal_count` about to become `< 2`) — **reschedules immediately** via §5.3, user-directed: a single decline isn't a "don't ask again for a while" signal on its own. Reply text (`render_deferred`) names the new day, or apologizes if nothing fit.
-- **`DECLINE`, second dismissal** (`dismissal_count` reaches `2`) — unchanged 30-day `dormant_until`, but now also clears the placeholder (`DELETE`) rather than leaving a stale tagged event sitting on the calendar for a month.
+- **`DECLINE`, first dismissal** (`dismissal_count` about to become `< 2`) — **v1 simplification, user-directed: no longer an immediate silent reschedule.** Asks how long to put it off (`reply_text`, same call), sets `suggestions.awaiting_deferral_reply = true` (`migrations/0023`) and leaves `outcome` `NULL` so the suggestion stays open. The next reply is a second turn of the same `converse_suggestion` call (`awaiting_deferral_reply=True`), resolving the free-text answer to a `defer_until` instant; §5.1's `_next_fitting_slot` then runs again with that as `min_start`, and the placeholder moves there — only *then* does `dismissal_count` increment and `outcome` get set. Reply text (`render_deferred`) names the new day, or apologizes if nothing fits from that floor onward.
+- **`DECLINE`, second dismissal** (`dismissal_count` reaches `2`) — unchanged, asks nothing: immediate 30-day `dormant_until`, and also clears the placeholder (`DELETE`) rather than leaving a stale tagged event sitting on the calendar for a month.
 - **`SNOOZE`** — unchanged 7-day `dormant_until`, no dismissal penalty, placeholder cleared the same way.
 - **`OTHER`** — a genuinely ambiguous reply gets a real, natural re-ask (agent-contracts.md §4.2) instead of the silent drop this used to be.
+
+#### 5.4.1 Reactive reschedule on an external conflict (`calendar-sync-svc`, v1, user-directed)
+
+Every one of the paths above is *user-initiated* — a reply, a fire. Nothing so far reacts to a real Calendar event landing directly on top of an idea's already-scheduled placeholder slot (a meeting booked outside the bot, or an existing obligation dragged onto it) until the next twice-daily sweep or the fire-time re-verify (§5.4 step 3) happens to catch it — up to hours of the placeholder sitting on a slot that's no longer actually free.
+
+`calendar-sync-svc`'s own webhook already fires on *every* Calendar change for a linked user (two-way-sync architecture, `overview.md` §2's asymmetry note), not just changes to events it tracks. Its reconciliation loop (`_reconcile_event`) now also runs, for every event in a delta regardless of whether it's a tracked obligation/placeholder: a query for every *other* committed latent whose `[next_fit_start, next_fit_start + effort_minutes)` window overlaps the event's own `[start, end)`. Any match triggers an immediate Cloud Task at dispatcher-svc's existing `POST /latents/{item_id}/next-fit` (the same endpoint committer-svc already fires on initial commit) — no new endpoint, no new write path, `calendar-sync-svc` still never calls the Calendar write API itself. A cancelled event is skipped outright (it only ever frees time, never claims it, so it can't create a new conflict); an idea's own placeholder is excluded from matching against itself the same way §5.1's `exclude_event_id` already does.
 
 ### 5.5 Eligibility, reconsidered without a scorer
 

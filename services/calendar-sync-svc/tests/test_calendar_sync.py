@@ -189,8 +189,10 @@ def test_reconcile_event_untracked_event_is_never_touched():
     from calendar_sync_svc.main import _reconcile_event
 
     conn = _mock_lookup_connection(ob_row=None, lat_row=None)
-    _reconcile_event(conn, _obligation_event())
-    # Only the two SELECT lookups happened — no UPDATE of any kind.
+    _reconcile_event(conn, uuid4(), _obligation_event())
+    # Only the two SELECT lookups happened — no UPDATE of any kind. (No
+    # "end" on this fixture short-circuits the conflict check before it
+    # ever queries, so no third SELECT either.)
     update_calls = [
         c for c in conn.execute.call_args_list if c.args[0].strip().startswith("UPDATE")
     ]
@@ -203,7 +205,7 @@ def test_reconcile_event_routes_to_obligation_when_matched():
     item_id = uuid4()
     conn = _mock_lookup_connection(ob_row=(item_id, datetime.now(UTC)))
     with patch("calendar_sync_svc.main._reconcile_obligation") as mock_reconcile:
-        _reconcile_event(conn, _obligation_event(cancelled=True))
+        _reconcile_event(conn, uuid4(), _obligation_event(cancelled=True))
     mock_reconcile.assert_called_once()
     assert mock_reconcile.call_args.args[1] == item_id
 
@@ -214,9 +216,64 @@ def test_reconcile_event_routes_to_latent_when_matched():
     item_id = uuid4()
     conn = _mock_lookup_connection(ob_row=None, lat_row=(item_id, datetime.now(UTC)))
     with patch("calendar_sync_svc.main._reconcile_latent") as mock_reconcile:
-        _reconcile_event(conn, _obligation_event(cancelled=True))
+        _reconcile_event(conn, uuid4(), _obligation_event(cancelled=True))
     mock_reconcile.assert_called_once()
     assert mock_reconcile.call_args.args[1] == item_id
+
+
+# --- _reschedule_conflicting_latents (user-directed: a real event landing on
+# an idea's placeholder slot must reschedule it immediately) --------------
+
+
+def _conflict_event(event_id="evt-conflict", start="2026-08-27T17:00:00-07:00",
+                     end="2026-08-27T18:00:00-07:00", cancelled=False):
+    event = {"id": event_id}
+    if cancelled:
+        event["status"] = "cancelled"
+    else:
+        event["start"] = {"dateTime": start}
+        event["end"] = {"dateTime": end}
+    return event
+
+
+def test_reschedule_conflicting_latents_triggers_next_fit_for_overlap():
+    from calendar_sync_svc.main import _reschedule_conflicting_latents
+
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = [("item-1",)]
+    with patch("calendar_sync_svc.main._enqueue_next_fit_task") as mock_enqueue:
+        _reschedule_conflicting_latents(conn, uuid4(), _conflict_event(), cancelled=False)
+    mock_enqueue.assert_called_once_with("item-1")
+
+
+def test_reschedule_conflicting_latents_noop_when_nothing_overlaps():
+    from calendar_sync_svc.main import _reschedule_conflicting_latents
+
+    conn = MagicMock()
+    conn.execute.return_value.fetchall.return_value = []
+    with patch("calendar_sync_svc.main._enqueue_next_fit_task") as mock_enqueue:
+        _reschedule_conflicting_latents(conn, uuid4(), _conflict_event(), cancelled=False)
+    mock_enqueue.assert_not_called()
+
+
+def test_reschedule_conflicting_latents_skips_cancelled_events():
+    """A cancelled event only ever frees time, it can't newly conflict
+    with anything — must not even query."""
+    from calendar_sync_svc.main import _reschedule_conflicting_latents
+
+    conn = MagicMock()
+    _reschedule_conflicting_latents(conn, uuid4(), _conflict_event(cancelled=True), cancelled=True)
+    conn.execute.assert_not_called()
+
+
+def test_reschedule_conflicting_latents_skips_all_day_events():
+    """No dateTime to compare against — nothing to check."""
+    from calendar_sync_svc.main import _reschedule_conflicting_latents
+
+    conn = MagicMock()
+    all_day_event = {"id": "evt-1", "start": {"date": "2026-08-27"}, "end": {"date": "2026-08-28"}}
+    _reschedule_conflicting_latents(conn, uuid4(), all_day_event, cancelled=False)
+    conn.execute.assert_not_called()
 
 
 # --- /webhook -------------------------------------------------------------

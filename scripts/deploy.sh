@@ -304,6 +304,13 @@ case "$SERVICE" in
     # queue/IAM this also needs (sa-dispatcher: cloudtasks.enqueuer on
     # "reminders", run.invoker on committer-svc) are provisioned once by
     # hand, not by this script — see infrastructure.md §5.1.
+    # GOOGLE_GENAI_USE_VERTEXAI/GOOGLE_CLOUD_PROJECT/GOOGLE_CLOUD_LOCATION/
+    # VERTEX_LOCATION/GEMINI_MODEL: dispatcher-svc's own conversational
+    # suggestion turn (dispatcher_svc/conversation.py, user-directed —
+    # the fire-time nudge and its natural-language reply are now LLM-
+    # generated, agent-contracts.md §0) — same Vertex AI env vars as
+    # resolver-svc's own ADK call. sa-dispatcher needs aiplatform.user for
+    # this too (granted by hand, same as sa-resolver/sa-extractor).
     COMMITTER_SVC_URL=$(gcloud run services describe committer-svc \
       --project="$PROJECT_ID" --region="$REGION" \
       --format='value(status.url)' --account=waslyrideshare@gmail.com)
@@ -314,7 +321,7 @@ case "$SERVICE" in
       --image="$IMAGE" \
       --service-account="$SA" \
       --add-cloudsql-instances="${PROJECT_ID}:${REGION}:obligation-engine-db" \
-      --set-env-vars="DB_USER=sa-dispatcher@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID},COMMITTER_SVC_URL=${COMMITTER_SVC_URL}" \
+      --set-env-vars="DB_USER=sa-dispatcher@${PROJECT_ID}.iam,INSTANCE_CONNECTION_NAME=${PROJECT_ID}:${REGION}:obligation-engine-db,GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID},TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID},TWILIO_API_KEY_SID=${TWILIO_API_KEY_SID},COMMITTER_SVC_URL=${COMMITTER_SVC_URL},GOOGLE_GENAI_USE_VERTEXAI=true,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,VERTEX_LOCATION=global,GEMINI_MODEL=gemini-3.5-flash" \
       --set-secrets="GOOGLE_OAUTH_CLIENT_SECRET=google-oauth-client-secret:latest,TWILIO_API_KEY_SECRET=twilio-api-key-secret:latest" \
       --min-instances=0 \
       --no-allow-unauthenticated \

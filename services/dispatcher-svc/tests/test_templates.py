@@ -10,7 +10,6 @@ from dispatcher_svc.templates import (
     render_deferred,
     render_dismissed,
     render_event_reminder,
-    render_fire_suggestion,
     render_reminder,
     render_snoozed,
 )
@@ -37,20 +36,6 @@ def test_render_event_reminder_exact_format():
     assert body == "⏰ Meeting is starting now, Tue 25 Aug, 8:39 PM."
 
 
-def test_render_fire_suggestion_exact_format():
-    """ADR 0009 — fires at the exact instant a latent's next_fit_start
-    arrives, replacing the old revival_score-picked render_suggestion."""
-    body = render_fire_suggestion("Nerf gun turret", 240)
-    assert body == (
-        'yo u have 4h free right now, wanna bang out "Nerf gun turret"?\n\nY / N / Later'
-    )
-
-
-def test_render_fire_suggestion_formats_partial_hours():
-    body = render_fire_suggestion("x", 90)
-    assert "1h 30min free" in body
-
-
 def test_render_deferred_with_a_new_slot():
     tz = ZoneInfo("America/Vancouver")
     next_fit = datetime(2026, 8, 28, 9, 0, tzinfo=tz)
@@ -70,7 +55,6 @@ def test_no_template_body_contains_an_em_dash():
     bodies = [
         render_reminder("Pay rent", due, today),
         render_event_reminder("Meeting", due, today),
-        render_fire_suggestion("Nerf gun turret", 240),
         render_deferred(datetime(2026, 8, 28, 9, 0, tzinfo=ZoneInfo("UTC")), ZoneInfo("UTC")),
         render_deferred(None, ZoneInfo("UTC")),
         render_accepted("Pay rent", due),

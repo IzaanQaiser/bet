@@ -21,13 +21,6 @@ def relative_due_description(due_at: date, today: date) -> str:
     return f"in {days} days"
 
 
-def _format_block_hours(minutes: int) -> str:
-    hours, mins = divmod(minutes, 60)
-    if mins == 0:
-        return f"{hours}h"
-    return f"{hours}h {mins}min"
-
-
 def render_reminder(title: str, due_at: datetime, today: date) -> str:
     """Fires AT due_at — v1 simplification, user-directed: the only SMS
     reminder now, at the time-of. The old 30-min-before heads-up SMS is
@@ -45,17 +38,6 @@ def render_event_reminder(title: str, due_at: datetime, today: date) -> str:
     appointment) counterpart to render_reminder above, worded as
     starting rather than due."""
     return f"⏰ {title} is starting now, {format_due_at(due_at)}."
-
-
-def render_fire_suggestion(item_title: str, block_minutes: int) -> str:
-    """ADR 0009 — fires the instant a latent's own next_fit_start
-    arrives, replacing the old revival_score-picked, one-per-run
-    render_suggestion. Deliberately terser — no time-of-day clause, no
-    "lightest day" evidence line; the moment itself is the pitch."""
-    return (
-        f'yo u have {_format_block_hours(block_minutes)} free right now, '
-        f'wanna bang out "{item_title}"?\n\nY / N / Later'
-    )
 
 
 def render_deferred(next_fit_start: datetime | None, tz) -> str:

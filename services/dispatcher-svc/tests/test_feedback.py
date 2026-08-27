@@ -5,11 +5,12 @@ replies to a fired suggestion, the 24h no-response timeout, and (ADR
 committer-svc/Cloud-Tasks client modules are all mocked here."""
 
 from datetime import date, datetime, time
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from dispatcher_svc.capacity_engine import Event
+from dispatcher_svc.conversation import SuggestionTurnResult
 from dispatcher_svc.main import _capped_effort_minutes, _resolve_stale_suggestions
 from fastapi.testclient import TestClient
 
@@ -49,6 +50,7 @@ def _suggestion_context(
     refresh_ref="projects/p/secrets/user-refresh-token-x/versions/latest",
     phone="+15551234567",
     scheduled_for=datetime(2026, 8, 27, 9, 0),
+    awaiting_deferral_reply=False,
 ):
     return (
         suggestion_id,
@@ -63,6 +65,7 @@ def _suggestion_context(
         refresh_ref,
         phone,
         scheduled_for,
+        awaiting_deferral_reply,
     )
 
 
@@ -111,8 +114,45 @@ def test_resolve_stale_suggestions_no_commit_when_none_stale():
 # --- /reply outcome table (state-machine.md §2, ADR 0009) --------------
 
 
-def test_n_reply_below_threshold_reschedules_immediately(client):
+def test_decline_first_time_asks_how_long_not_immediate_reschedule(client):
+    """User-directed: a first decline no longer silently auto-reschedules
+    — it asks how long to put it off, and stays open (no upsert/enqueue
+    yet; that only happens once the deferral answer resolves, see the
+    two-turn tests below)."""
     conn = _mock_connection(fetchone_result=_suggestion_context(dismissal_count=0))
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.tasks_client") as mock_tasks,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
+    ):
+        mock_converse.return_value = SuggestionTurnResult(
+            intent="DECLINE", reply_text="no worries, how long you wanna put it off?"
+        )
+        resp = client.post("/reply", json=_reply_payload("nah not right now"))
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "awaiting_deferral"
+    mock_sms.assert_called_once_with(ANY, ANY, "no worries, how long you wanna put it off?")
+    mock_committer.upsert_placeholder.assert_not_called()
+    mock_tasks.enqueue_fire_task.assert_not_called()
+
+    awaiting_update = [
+        c for c in conn.execute.call_args_list
+        if "UPDATE suggestions" in c.args[0] and "awaiting_deferral_reply = true" in c.args[0]
+    ]
+    assert len(awaiting_update) == 1
+
+
+def test_decline_then_defer_answer_reschedules_to_resolved_floor(client):
+    """The second turn: the suggestion is already awaiting_deferral_reply
+    (set by the test above's real flow), and this reply is the "how
+    long" answer, resolved by converse_suggestion into a concrete
+    instant that becomes _next_fitting_slot's floor."""
+    conn = _mock_connection(
+        fetchone_result=_suggestion_context(dismissal_count=0, awaiting_deferral_reply=True)
+    )
     events_by_day = {date(2026, 8, 28): []}
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
@@ -122,14 +162,17 @@ def test_n_reply_below_threshold_reschedules_immediately(client):
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
         patch("dispatcher_svc.main.committer_client") as mock_committer,
         patch("dispatcher_svc.main.tasks_client") as mock_tasks,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
+        mock_converse.return_value = SuggestionTurnResult(
+            defer_resolved=True, defer_until="2026-08-28T14:00:00"
+        )
         mock_committer.upsert_placeholder.return_value = "new-evt-id"
-        resp = client.post("/reply", json=_reply_payload("n"))
+        resp = client.post("/reply", json=_reply_payload("like tomorrow afternoon"))
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "dismissed"
     mock_sms.assert_called_once()
-    # A first dismissal reschedules — not a cooldown message.
     assert "np" in mock_sms.call_args.args[2]
     mock_committer.upsert_placeholder.assert_called_once()
     mock_tasks.enqueue_fire_task.assert_called_once()
@@ -137,20 +180,56 @@ def test_n_reply_below_threshold_reschedules_immediately(client):
     dismissal_update = [
         c for c in conn.execute.call_args_list
         if "UPDATE latents" in c.args[0] and "dismissal_count" in c.args[0]
-        and "dormant_until" not in c.args[0]
     ]
     assert len(dismissal_update) == 1
     assert dismissal_update[0].args[1][0] == 1  # dismissal_count incremented to 1
 
+    outcome_update = [
+        c for c in conn.execute.call_args_list
+        if "UPDATE suggestions" in c.args[0] and "outcome = 'dismissed'" in c.args[0]
+    ]
+    assert len(outcome_update) == 1
+    assert "awaiting_deferral_reply = false" in outcome_update[0].args[0]
 
-def test_n_reply_reaching_threshold_goes_dormant_and_clears_placeholder(client):
+
+def test_decline_then_defer_answer_still_unresolved_reasks(client):
+    """A vague, unparseable answer to "how long?" gets a real re-ask
+    instead of a guess — stays awaiting_deferral_reply, no reschedule."""
+    conn = _mock_connection(
+        fetchone_result=_suggestion_context(dismissal_count=0, awaiting_deferral_reply=True)
+    )
+    with (
+        patch("dispatcher_svc.main.get_connection", return_value=conn),
+        patch("dispatcher_svc.main._send_sms") as mock_sms,
+        patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
+    ):
+        mock_converse.return_value = SuggestionTurnResult(
+            defer_resolved=False, reply_text="no worries, how long roughly?"
+        )
+        resp = client.post("/reply", json=_reply_payload("idk"))
+
+    assert resp.json()["status"] == "awaiting_deferral"
+    mock_sms.assert_called_once_with(ANY, ANY, "no worries, how long roughly?")
+    mock_committer.upsert_placeholder.assert_not_called()
+
+    outcome_update = [
+        c for c in conn.execute.call_args_list
+        if "UPDATE suggestions" in c.args[0] and "outcome" in c.args[0]
+    ]
+    assert outcome_update == []
+
+
+def test_decline_reaching_threshold_goes_dormant_and_clears_placeholder(client):
     conn = _mock_connection(fetchone_result=_suggestion_context(dismissal_count=1))
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
         patch("dispatcher_svc.main._send_sms"),
         patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
-        resp = client.post("/reply", json=_reply_payload("no"))
+        mock_converse.return_value = SuggestionTurnResult(intent="DECLINE")
+        resp = client.post("/reply", json=_reply_payload("nope, not feeling it"))
 
     assert resp.json()["status"] == "dismissed"
     mock_committer.delete_placeholder.assert_called_once()
@@ -164,14 +243,16 @@ def test_n_reply_reaching_threshold_goes_dormant_and_clears_placeholder(client):
     assert dormancy_update[0].args[1][0] == 2  # dismissal_count incremented to 2
 
 
-def test_later_reply_snoozes_clears_placeholder_no_dismissal_change(client):
+def test_snooze_reply_clears_placeholder_no_dismissal_change(client):
     conn = _mock_connection(fetchone_result=_suggestion_context(dismissal_count=1))
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
         patch("dispatcher_svc.main._send_sms") as mock_sms,
         patch("dispatcher_svc.main.committer_client") as mock_committer,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
-        resp = client.post("/reply", json=_reply_payload("later"))
+        mock_converse.return_value = SuggestionTurnResult(intent="SNOOZE")
+        resp = client.post("/reply", json=_reply_payload("remind me in a while"))
 
     assert resp.json()["status"] == "snoozed"
     mock_sms.assert_called_once()
@@ -203,8 +284,10 @@ def test_y_reply_publishes_confirmed_and_sends_ack(client):
         patch("dispatcher_svc.main.AuthorizedSession"),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
         patch("dispatcher_svc.main.publish") as mock_publish,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
-        resp = client.post("/reply", json=_reply_payload("y"))
+        mock_converse.return_value = SuggestionTurnResult(intent="ACCEPT")
+        resp = client.post("/reply", json=_reply_payload("yeah lets go"))
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "accepted"
@@ -246,8 +329,10 @@ def test_y_reply_picks_earliest_fitting_gap_not_largest(client):
         patch("dispatcher_svc.main.AuthorizedSession"),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
         patch("dispatcher_svc.main.publish") as mock_publish,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
-        resp = client.post("/reply", json=_reply_payload("y"))
+        mock_converse.return_value = SuggestionTurnResult(intent="ACCEPT")
+        resp = client.post("/reply", json=_reply_payload("yeah lets go"))
 
     assert resp.status_code == 200
     _topic, confirmed = mock_publish.call_args[0]
@@ -276,8 +361,10 @@ def test_y_reply_falls_back_to_largest_capped_when_nothing_fully_fits(client):
         patch("dispatcher_svc.main.AuthorizedSession"),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
         patch("dispatcher_svc.main.publish") as mock_publish,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
-        resp = client.post("/reply", json=_reply_payload("y"))
+        mock_converse.return_value = SuggestionTurnResult(intent="ACCEPT")
+        resp = client.post("/reply", json=_reply_payload("yeah lets go"))
 
     assert resp.status_code == 200
     _topic, confirmed = mock_publish.call_args[0]
@@ -296,8 +383,10 @@ def test_y_reply_no_capacity_left_dismisses_instead(client):
         patch("dispatcher_svc.main.AuthorizedSession"),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
         patch("dispatcher_svc.main.publish") as mock_publish,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
-        resp = client.post("/reply", json=_reply_payload("y"))
+        mock_converse.return_value = SuggestionTurnResult(intent="ACCEPT")
+        resp = client.post("/reply", json=_reply_payload("yeah lets go"))
 
     assert resp.json()["status"] == "no_capacity"
     mock_publish.assert_not_called()
@@ -305,18 +394,27 @@ def test_y_reply_no_capacity_left_dismisses_instead(client):
     assert "filled up" in mock_sms.call_args.args[2]
 
 
-def test_other_reply_logged_not_acted_on(client):
+def test_other_reply_gets_a_natural_reask_not_silence(client):
+    """Real, adjacent bug fixed alongside the natural-language reply
+    change: an ambiguous reply used to get zero SMS response at all — a
+    real dead end for exactly the kind of casual, non-keyword reply this
+    whole change exists to support. Now the LLM's own re-ask goes out
+    instead of silence."""
     conn = _mock_connection(fetchone_result=_suggestion_context())
     with (
         patch("dispatcher_svc.main.get_connection", return_value=conn),
         patch("dispatcher_svc.main._send_sms") as mock_sms,
         patch("dispatcher_svc.main.publish") as mock_publish,
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
-        resp = client.post("/reply", json=_reply_payload("maybe tomorrow?"))
+        mock_converse.return_value = SuggestionTurnResult(
+            intent="OTHER", reply_text="my bad, you down or nah?"
+        )
+        resp = client.post("/reply", json=_reply_payload("what job again"))
 
     assert resp.json()["status"] == "unhandled_reply"
-    mock_sms.assert_not_called()
     mock_publish.assert_not_called()
+    mock_sms.assert_called_once_with(ANY, ANY, "my bad, you down or nah?")
 
 
 def test_reply_with_no_open_suggestion_returns_unexpected_state(client):
@@ -538,14 +636,18 @@ def test_fire_sends_sms_and_creates_suggestion_when_slot_still_fits(client):
         patch("dispatcher_svc.main.user_credentials"),
         patch("dispatcher_svc.main.AuthorizedSession"),
         patch("dispatcher_svc.main.fetch_events_for_range", return_value=events_by_day),
+        patch("dispatcher_svc.main.converse_suggestion") as mock_converse,
     ):
+        mock_converse.return_value = SuggestionTurnResult(
+            message_text="yo u have 4h to work on that nerf gun turret?"
+        )
         resp = client.post(
             f"/latents/{uuid4()}/fire", json={"scheduled_for": scheduled_for.isoformat()}
         )
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "fired"
-    mock_sms.assert_called_once()
+    mock_sms.assert_called_once_with(ANY, ANY, "yo u have 4h to work on that nerf gun turret?")
     insert_calls = [
         c for c in conn.execute.call_args_list if "INSERT INTO suggestions" in c.args[0]
     ]

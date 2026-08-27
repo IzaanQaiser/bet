@@ -279,22 +279,29 @@ Since the resolver acknowledgment already states the due/start time in the same 
 class SuggestionTurnResult(BaseModel):
     message_text: str | None = None   # set on the nudge turn
     intent: Literal["ACCEPT", "DECLINE", "SNOOZE", "OTHER"] | None = None  # set on the reply turn
-    reply_text: str | None = None     # set only on OTHER, a natural re-ask
+    reply_text: str | None = None     # DECLINE's "how long?" ask, OTHER's re-ask, or an unresolved
+                                       # deferral re-ask
+    defer_until: str | None = None    # deferral-resolve turn only, ISO naive local datetime
+    defer_resolved: bool = False      # deferral-resolve turn only
 ```
 
+Three modes of the same call, `dispatcher_svc/conversation.py::converse_suggestion`:
 - **Nudge turn** (`latest_reply=None`): given only `title`/`effort_minutes` — deliberately terse inputs, same "the moment itself is the pitch" reasoning the old template already used (no time-of-day clause, no "lightest day" evidence line). States the real `effort_minutes`, not the block size, in one natural sentence — e.g. `"yo u have 15 minutes to apply to that tesla job?"` for a 15-minute item, no title quoted verbatim, no `Y / N / Later` footer.
-- **Reply turn** (`latest_reply` given): classifies the free-text reply as `ACCEPT`/`DECLINE`/`SNOOZE`/`OTHER`. Deliberately does **not** generate the acknowledgment text for `ACCEPT`/`DECLINE`/`SNOOZE` — those state real, just-computed facts (the actual committed time, the actual rescheduled day) the model was never given and must never guess, the same ADR 0003 boundary the conversation call site's own locked-in message already respects. `reply_text` is set only on `OTHER`, a genuine natural re-ask — real, adjacent bug fixed in the same pass: an ambiguous reply used to get **zero** SMS response at all.
+- **Reply turn** (`latest_reply` given, `awaiting_deferral_reply=False`): classifies the free-text reply as `ACCEPT`/`DECLINE`/`SNOOZE`/`OTHER`. Deliberately does **not** generate the acknowledgment text for `ACCEPT`/`SNOOZE` — those state real, just-computed facts (the actual committed time, the actual dormancy) the model was never given and must never guess, the same ADR 0003 boundary the conversation call site's own locked-in message already respects. `reply_text` is set on `DECLINE` (the "how long?" follow-up, below) and `OTHER` (a genuine natural re-ask — real, adjacent bug fixed in the same pass: an ambiguous reply used to get **zero** SMS response at all).
+- **Deferral-resolve turn** (`latest_reply` given, `awaiting_deferral_reply=True`): the user has just answered "how long do you wanna put this off?" — resolves it to `defer_until`, or leaves `defer_resolved` false and writes a re-ask `reply_text` if genuinely unparseable.
 
-**`ACCEPT`** — `dispatcher-svc` re-verifies real current availability and publishes `ConfirmedItemMessage` exactly as before (§4.4). **`DECLINE`, first dismissal** and **`SNOOZE`** — the placeholder moves or clears (capacity-engine.md §5.4), acknowledged by the existing deterministic templates, unchanged:
+**`ACCEPT`** — `dispatcher-svc` re-verifies real current availability and publishes `ConfirmedItemMessage` exactly as before (§4.3). **`SNOOZE`** — the placeholder clears (capacity-engine.md §5.4), acknowledged by `render_snoozed()` ("OK, I'll check back in about a week.") — 7d dormancy, no dismissal penalty, unchanged.
+
+**`DECLINE` — v1 simplification, user-directed: no longer a silent immediate reschedule.** The *first* decline (`dismissal_count` about to become `< 2`) instead asks how long to put it off, via `reply_text` on the same `converse_suggestion` call that classified the decline (e.g. "no worries, how long you wanna put it off?" — a normal question, not a fixed script) — `suggestions.awaiting_deferral_reply` is set true (`migrations/0023`) and the suggestion stays open (`outcome` still `NULL`, so `ingest-svc` keeps routing the next reply here). That next reply is a **second turn of the same call**, `awaiting_deferral_reply=True`: resolves the free-text answer ("in 2 hours", "tomorrow afternoon", "next week") to a concrete `defer_until` instant, the same "never invent, ask again if vague" discipline `due_at` resolution already uses, except a bare day-part ("tomorrow") resolves to a reasonable specific time rather than staying unresolved, since a deferral floor is a rough "check back around then" instant, not a hard deadline. Once resolved, `_next_fitting_slot`'s existing earliest-fitting-gap search (§5.4 below) runs again with `defer_until` as an added floor, and the placeholder moves there — acknowledged the same way as before:
 
 ```
 np, i'll text you again {new_next_fit_start weekday}.
 ```
-or, if nothing in the 7-day window fits:
+or, if nothing in the 7-day window fits from that floor onward:
 ```
 np, i'll keep an eye out for room.
 ```
-`render_deferred(next_fit_start, tz)`. `render_dismissed()` ("Got it, I won't suggest that again for a while.") is reached **only** on the second `DECLINE` (30d dormancy) — its "for a while" wording would be actively wrong for a first decline, which reschedules within the same reply. `render_snoozed()` ("OK, I'll check back in about a week.") — `SNOOZE`'s 7d framing is always accurate.
+`render_deferred(next_fit_start, tz)`, dismissal_count only incrementing once this second turn actually resolves. The *second* decline (`dismissal_count` reaching `2`) is unchanged and asks nothing — immediate 30d dormancy, `render_dismissed()` ("Got it, I won't suggest that again for a while.").
 
 ### 4.3 Accepted-suggestion → `ConfirmedItemMessage`
 
