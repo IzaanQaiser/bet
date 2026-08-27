@@ -57,91 +57,96 @@ export function SettingsPanel({
   }
 
   return (
-    <div className="rounded-[10px] border-[1.5px] border-dashed border-border px-[18px] pb-[14px] pt-4">
-      <p className="mb-[3px] font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
+    <div className="rounded-[10px] border-[1.5px] border-dashed border-border px-6 py-5">
+      <p className="mb-4 font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground">
         settings
       </p>
-      <p className="mb-3 text-xs text-muted-foreground">timezone and working hours</p>
 
-      <label
-        htmlFor="settings-timezone"
-        className="mb-1 block font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground"
-      >
-        Timezone
-      </label>
-      <select
-        id="settings-timezone"
-        value={selectedTz}
-        onChange={(e) => {
-          setSelectedTz(e.target.value);
-          setStatus("idle");
-        }}
-        className="mb-1.5 w-full max-w-[280px] rounded-[6px] border border-border bg-background px-2 py-1.5 text-[13px]"
-      >
-        {TIMEZONES.map((tz) => (
-          <option key={tz} value={tz}>
-            {tz.replace(/_/g, " ")}
-          </option>
-        ))}
-      </select>
+      <div className="grid grid-cols-1 gap-x-10 gap-y-5 sm:grid-cols-2">
+        <div className="flex flex-col">
+          <label
+            htmlFor="settings-timezone"
+            className="mb-2 block font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground"
+          >
+            Timezone
+          </label>
+          <select
+            id="settings-timezone"
+            value={selectedTz}
+            onChange={(e) => {
+              setSelectedTz(e.target.value);
+              setStatus("idle");
+            }}
+            className="w-full rounded-[6px] border border-border bg-background px-2.5 py-2 text-[13px]"
+          >
+            {TIMEZONES.map((tz) => (
+              <option key={tz} value={tz}>
+                {tz.replace(/_/g, " ")}
+              </option>
+            ))}
+          </select>
 
-      {selectedTz !== DETECTED_TIMEZONE && (
-        <button
-          type="button"
-          onClick={() => {
-            setSelectedTz(DETECTED_TIMEZONE);
-            setStatus("idle");
-          }}
-          className="mb-3 block font-mono text-[10px] text-muted-foreground underline hover:text-foreground"
-        >
-          Use detected: {DETECTED_TIMEZONE.replace(/_/g, " ")}
-        </button>
-      )}
+          {selectedTz !== DETECTED_TIMEZONE && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedTz(DETECTED_TIMEZONE);
+                setStatus("idle");
+              }}
+              className="mt-2 self-start font-mono text-[10px] text-muted-foreground underline hover:text-foreground"
+            >
+              Use detected: {DETECTED_TIMEZONE.replace(/_/g, " ")}
+            </button>
+          )}
+        </div>
 
-      <p className="mb-1 block font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
-        Working hours
-      </p>
-      <p className="mb-1.5 max-w-[42ch] text-[11px] leading-snug text-muted-foreground">
-        When you&apos;re free to work — this is what idea suggestions and reminders are scored
-        against.
-      </p>
-      <div className="mb-1.5 flex max-w-[280px] items-center gap-2">
-        <input
-          type="time"
-          aria-label="Working hours start"
-          value={start}
-          onChange={(e) => {
-            setStart(e.target.value);
-            setStatus("idle");
-          }}
-          className="w-full rounded-[6px] border border-border bg-background px-2 py-1.5 text-[13px]"
-        />
-        <span className="text-muted-foreground">–</span>
-        <input
-          type="time"
-          aria-label="Working hours end"
-          value={end}
-          onChange={(e) => {
-            setEnd(e.target.value);
-            setStatus("idle");
-          }}
-          className="w-full rounded-[6px] border border-border bg-background px-2 py-1.5 text-[13px]"
-        />
+        <div className="flex flex-col">
+          <p className="mb-2 block font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+            Working hours
+          </p>
+          <p className="mb-2 text-[11px] leading-snug text-muted-foreground">
+            When you&apos;re free to work — this is what idea suggestions and reminders are
+            scored against.
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              type="time"
+              aria-label="Working hours start"
+              value={start}
+              onChange={(e) => {
+                setStart(e.target.value);
+                setStatus("idle");
+              }}
+              className="w-full rounded-[6px] border border-border bg-background px-2.5 py-2 text-[13px]"
+            />
+            <span className="text-muted-foreground">–</span>
+            <input
+              type="time"
+              aria-label="Working hours end"
+              value={end}
+              onChange={(e) => {
+                setEnd(e.target.value);
+                setStatus("idle");
+              }}
+              className="w-full rounded-[6px] border border-border bg-background px-2.5 py-2 text-[13px]"
+            />
+          </div>
+          {invalidRange && (
+            <p className="mt-2 text-[11px] text-destructive">Start has to be before end.</p>
+          )}
+        </div>
       </div>
-      {invalidRange && (
-        <p className="mb-1.5 text-[11px] text-destructive">Start has to be before end.</p>
-      )}
 
       <button
         type="button"
         onClick={handleSave}
         disabled={status === "saving" || !dirty || invalidRange}
-        className="mt-1.5 w-full max-w-[280px] rounded-[6px] border border-border bg-foreground py-1.5 text-[13px] font-medium text-background transition-opacity disabled:opacity-40"
+        className="mt-5 w-full rounded-[6px] border border-border bg-foreground py-2 text-[13px] font-medium text-background transition-opacity disabled:opacity-40"
       >
         {status === "saving" ? "Saving…" : status === "saved" ? "Saved" : "Save"}
       </button>
       {status === "error" && (
-        <p className="mt-1.5 text-[11px] text-destructive">Couldn&apos;t save — try again.</p>
+        <p className="mt-2 text-[11px] text-destructive">Couldn&apos;t save — try again.</p>
       )}
     </div>
   );
