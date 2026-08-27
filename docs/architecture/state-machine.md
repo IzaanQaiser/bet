@@ -17,31 +17,25 @@ stateDiagram-v2
     [*] --> RECEIVED: ingest-svc writes row, publishes items.raw
     RECEIVED --> EXTRACTED: extractor-svc publishes items.extracted
     EXTRACTED --> DUPLICATE_SUSPECTED: resolver, similarity >= 0.92
-    EXTRACTED --> CLARIFYING: resolver, missing_fields or confidence < 0.75
-    EXTRACTED --> AWAITING_CONFIRMATION: resolver, complete + confident
+    EXTRACTED --> CLARIFYING: resolver, missing_fields
+    EXTRACTED --> CONFIRMED: resolver, complete
 
     DUPLICATE_SUSPECTED --> MERGED: user confirms same item
     DUPLICATE_SUSPECTED --> CLARIFYING: user says different, still incomplete
-    DUPLICATE_SUSPECTED --> AWAITING_CONFIRMATION: user says different, complete
+    DUPLICATE_SUSPECTED --> CONFIRMED: user says different, complete
 
     CLARIFYING --> CLARIFYING: reply still incomplete, exchange_count < 3
-    CLARIFYING --> AWAITING_CONFIRMATION: reply completes required fields
+    CLARIFYING --> CONFIRMED: reply completes required fields
     CLARIFYING --> NEEDS_REVIEW: exchange_count reaches 3, still incomplete
-
-    AWAITING_CONFIRMATION --> CANCELLED: user replies N
-    AWAITING_CONFIRMATION --> CLARIFYING: user sends a correction that reopens a missing/ambiguous field
-    AWAITING_CONFIRMATION --> CONFIRMED: user replies Y
 
     CONFIRMED --> COMMITTED: committer-svc writes Calendar/Gmail + DB
 
     RECEIVED --> FAILED: technical error, any stage
     EXTRACTED --> FAILED: technical error, any stage
     CLARIFYING --> FAILED: technical error, any stage
-    AWAITING_CONFIRMATION --> FAILED: technical error, any stage
     CONFIRMED --> FAILED: technical error, any stage
 
     MERGED --> [*]
-    CANCELLED --> [*]
     NEEDS_REVIEW --> [*]
     COMMITTED --> [*]
     FAILED --> [*]
@@ -56,9 +50,7 @@ stateDiagram-v2
 | `DUPLICATE_SUSPECTED` | High-similarity match found, awaiting user disambiguation | `resolver-svc`, waits on SMS reply | Yes |
 | `CLARIFYING` | Missing/low-confidence fields, question sent | `resolver-svc`, waits on SMS reply | Yes |
 | `NEEDS_REVIEW` | Clarification budget exhausted, still incomplete | Terminal for MVP — see §1.3 | Yes |
-| `AWAITING_CONFIRMATION` | Complete record shown to user, awaiting Y/N/correction | `resolver-svc`, waits on SMS reply | Yes |
-| `CANCELLED` | User declined | Terminal | Yes |
-| `CONFIRMED` | User affirmed, about to commit | `committer-svc` consumes from `items.confirmed` | Yes (brief) |
+| `CONFIRMED` | Complete record published to `items.confirmed`, about to commit | `committer-svc` consumes from `items.confirmed` | Yes (brief) |
 | `COMMITTED` | Written to Calendar/Gmail + DB | Terminal for obligations; start of latent lifecycle (§2) for latents | Yes |
 | `MERGED` | Confirmed duplicate of an existing item | Terminal | Yes |
 | `FAILED` | Technical failure at any stage | Dead-letter, see §3 | Yes |
@@ -68,42 +60,42 @@ stateDiagram-v2
 Runs once, immediately, before the completeness check — per PRD §5.2 ordering.
 
 1. Embed `title + summary` (`text-embedding-004`), cosine search `item_embeddings` for this user.
-2. `similarity ≥ 0.92` → `DUPLICATE_SUSPECTED`. Send: *"Is this the same as [existing title]?"* Reply `Y` → `MERGED` (no new `obligations`/`latents` row is created; the existing item's record is left untouched — a duplicate confirms nothing new, it discards the incoming one). Reply `N` → proceed to the completeness check as if no match existed.
-3. `0.82 ≤ similarity < 0.92` **and** the existing match is a latent → not a blocking state. This is folded into the eventual confirmation message as an optional suffix (§1.2) rather than its own stage, since PRD §5.2 calls it an "offer," not a requirement. `parent_item_id` is set only if the user opts in.
+2. `similarity ≥ 0.92` → `DUPLICATE_SUSPECTED`. Ask naturally whether this is the same as the existing item. A positive reply → `MERGED` (no new `obligations`/`latents` row is created; the existing item's record is left untouched — a duplicate confirms nothing new, it discards the incoming one). A negative reply → proceed to the completeness check as if no match existed.
+3. `0.82 ≤ similarity < 0.92` **and** the existing match is a latent → not a blocking state. This is folded into the resolver conversation as an optional attachment offer rather than its own stage, since PRD §5.2 calls it an "offer," not a requirement. `parent_item_id` is set only if the user opts in.
 4. Below `0.82` → no dedupe action.
 
 ### 1.2 Completeness check (on entering `EXTRACTED`, after dedupe clears)
 
-**`resolver-svc` creates the `conversations` row unconditionally at this point** — even when nothing is missing and the item goes straight to `AWAITING_CONFIRMATION` — because it's also where a `due_at` the extractor already resolved gets staged (`conversations.resolved_fields`, `data-model.md` §2.4) ahead of commit, not only a scratchpad for multi-turn clarification.
+**`resolver-svc` creates the `conversations` row unconditionally at this point** — even when nothing is missing and the item goes straight to `CONFIRMED` — because it's also where a `due_at` the extractor already resolved gets staged (`conversations.resolved_fields`, `data-model.md` §2.4) ahead of commit, not only a scratchpad for multi-turn clarification.
 
-- `missing_fields` non-empty **or** `confidence < 0.75` → `CLARIFYING`.
-- Otherwise → `AWAITING_CONFIRMATION` directly.
+- `missing_fields` non-empty → `CLARIFYING`.
+- Otherwise → `CONFIRMED` directly: publish `ConfirmedItemMessage` and let `committer-svc` write Calendar/Gmail/DB.
 
-**Resolved gap, found in step 10 building this for real:** in practice this collapses to `missing_fields` non-empty, full stop — see `agent-contracts.md` §3.2's "Resolved gap" note on why a confidence-only trigger (empty `missing_fields`, `confidence < 0.75`) goes straight to `AWAITING_CONFIRMATION` instead of `CLARIFYING`, since there'd be nothing for a clarifying question to ask about.
+**Resolved gap, found in step 10 and superseded by v1 polish:** confidence is now observability, not a state-transition gate. A confidence-only trigger (empty `missing_fields`, low `confidence`) has nothing concrete to ask about, so it commits like any other complete item.
 
 **Exchange counting**, precisely (PRD §5.2 says "max 3 exchanges" without defining the unit — defined here):
 - One exchange = one outbound clarification question from `resolver-svc`. `conversations.exchange_count` increments **when the question is sent**, not when the reply arrives.
 - On each inbound reply, `resolver-svc` merges the answer into the item's fields and re-checks `missing_fields`.
   - Still incomplete and `exchange_count < 3` → send the next question (batching all remaining missing fields into one message), increment `exchange_count`, stay in `CLARIFYING`.
-  - Complete → `AWAITING_CONFIRMATION`.
+  - Complete → `CONFIRMED`; publish `ConfirmedItemMessage` immediately.
   - Still incomplete and `exchange_count == 3` → `NEEDS_REVIEW`. No 4th question is sent.
-- A thread-attachment offer (§1.1.3), if applicable, rides on the *same* message as the confirmation card in `AWAITING_CONFIRMATION` — it does not consume clarification budget and does not block confirmation. Reply grammar: `Y` / `N` / a correction confirms or cancels the primary item; attaching the thread is a separate, optional one-line acknowledgment the user can ignore with no consequence beyond the two items staying unlinked.
+- A thread-attachment offer (§1.1.3), if applicable, rides on the resolver conversation — it does not consume clarification budget and does not block commit. Attaching the thread is a separate, optional acknowledgment the user can ignore with no consequence beyond the two items staying unlinked.
 
 ### 1.3 `NEEDS_REVIEW` — terminal for MVP
 
-**Decision made in this doc:** there is no automated recovery path out of `NEEDS_REVIEW`. If the system can't get the required fields in 3 exchanges, it stops asking rather than nagging — consistent with the confirm-before-write philosophy (an unresolved item is safer than a guessed one). The user can always send the item again as a fresh message, which creates a new `items` row and starts over; there is no attempt to detect "this is a retry of that stuck item" — that's real complexity for a case that shouldn't occur often against a well-tuned extractor. Worth an ADR if this needs to change post-hackathon; not worth one now.
+**Decision made in this doc:** there is no automated recovery path out of `NEEDS_REVIEW`. If the system can't get the required fields in 3 exchanges, it stops asking rather than nagging — an unresolved item is safer than a guessed one. The user can always send the item again as a fresh message, which creates a new `items` row and starts over; there is no attempt to detect "this is a retry of that stuck item" — that's real complexity for a case that shouldn't occur often against a well-tuned extractor. Worth an ADR if this needs to change post-hackathon; not worth one now.
 
-### 1.4 `AWAITING_CONFIRMATION` — no timeout
+### 1.4 Auto-commit once complete
 
-**Decision made in this doc:** no automatic expiry. The item waits indefinitely for a `Y`, `N`, or correction tied to its `conversation` row. Rationale: confirm-before-write (ADR 0003) means an unconfirmed item doing nothing is the correct default, and adding a timeout means adding a second terminal state (`EXPIRED`, distinct from `CANCELLED`) for a failure mode — a user who never replies — that costs nothing to leave open. If real usage shows stale `AWAITING_CONFIRMATION` items piling up, revisit as its own ADR.
+**V1 polish, user-directed:** `AWAITING_CONFIRMATION` is retired from the normal path. Once an item is structurally complete, `resolver-svc` publishes `items.confirmed` immediately and sends a natural acknowledgment. There is no confirmation timeout because there is no open confirmation state to expire.
 
-A **correction** (a reply that isn't `Y`/`N`) is treated as new information: if it invalidates a previously-filled field (e.g. corrects the date to something ambiguous), it moves the item back to `CLARIFYING` rather than trying to parse the correction inline as a confirmation. Keeps the "resolver only ever asks one kind of question per state" property, which is what makes conversation state simple to reason about.
+`ingest-svc` may still route legacy `AWAITING_CONFIRMATION` rows to `resolver-svc` so old in-flight items do not strand after a deploy, but no current code path creates new ones.
 
 ### 1.5 `CONFIRMED` → `COMMITTED`
 
-`resolver-svc` publishes to `items.confirmed` the instant a `Y` is parsed — this is the one and only place a message is allowed onto that topic from the forward pipeline (§4 covers the second, narrower path from `dispatcher-svc`). The message is built by reading the `items` row plus `conversations.resolved_fields` and merging them (`agent-contracts.md` §3.2) — this is where a staged `due_at` finally reaches a service that can write it anywhere durable. `committer-svc` consumes, and branches on `type`: for an obligation it writes Calendar (or Gmail, per ADR 0008, selected by `action_type`) and `INSERT`s `obligations`; for a latent it makes no external write and just `INSERT`s `latents`. Either way it sets `COMMITTED`. There is no user-visible gap between `Y` and the write completing that the state machine needs to model — if `committer-svc` fails here, it's a technical failure (§3), not a new user-facing state.
+`resolver-svc` publishes to `items.confirmed` the instant dedupe clears and required fields are present — this is the one and only place a message is allowed onto that topic from the forward pipeline (§4 covers the second, narrower path from `dispatcher-svc`). The message is built by reading the `items` row plus `conversations.resolved_fields` and merging them (`agent-contracts.md` §3.5) — this is where a staged `due_at` finally reaches a service that can write it anywhere durable. `committer-svc` consumes, and branches on `type`: for an obligation it writes Calendar (or Gmail, per ADR 0008, selected by `action_type`) and `INSERT`s `obligations`; for a latent it makes no external write and just `INSERT`s `latents`. Either way it sets `COMMITTED`. If `committer-svc` fails here, it's a technical failure (§3), not a new user-facing state.
 
-**Resolved, step 15 — the email branch's mechanics, no new state needed.** An email obligation flows through `RECEIVED → EXTRACTED → (DUPLICATE_SUSPECTED →) (CLARIFYING →) AWAITING_CONFIRMATION → CONFIRMED → COMMITTED` exactly like a calendar obligation — `committer-svc`'s branch on `action_type` (`agent-contracts.md` §2.1) is the only place the two paths actually differ, and it was already anticipated by `obligations.action_type`'s `CHECK` constraint (`data-model.md` §2) since step 1. No new column, no new state.
+**Resolved, step 15, updated for v1 polish — the email branch's mechanics, no new state needed.** An email obligation flows through `RECEIVED → EXTRACTED → (DUPLICATE_SUSPECTED →) (CLARIFYING →) CONFIRMED → COMMITTED` exactly like a calendar obligation — `committer-svc`'s branch on `action_type` (`agent-contracts.md` §2.1) is the only place the two paths actually differ, and it was already anticipated by `obligations.action_type`'s `CHECK` constraint (`data-model.md` §2) since step 1. No new column, no new state.
 
 - `committer-svc` sends via `POST https://gmail.googleapis.com/gmail/v1/users/me/messages/send` with a base64url-encoded RFC 2822 MIME message built from `confirmed.email_draft` (body) and the recipient staged in `conversations.resolved_fields` (`agent-contracts.md` §3.2's step-15 addition) — same `AuthorizedSession`/refresh-token pattern already used for Calendar, requesting `gmail.send` scope instead of `calendar.events` on the `Credentials` object for that one call. No new OAuth bootstrap needed: `scripts/bootstrap_oauth_token.py` already requests both scopes together (`infrastructure.md` §4) — this was true since step 6, unused by any code until now.
 - The `obligations` row gets `email_draft` (the sent body, for a real record of what was actually sent — not re-fetched from Gmail) and `email_sent_at = now()`, written in the same transaction as the row's `INSERT`, mirroring exactly how `calendar_event_id` is written for the calendar branch.
@@ -132,9 +124,9 @@ stateDiagram-v2
     [*] --> ELIGIBLE: item COMMITTED as latent
     ELIGIBLE --> ELIGIBLE: next_fit_start computed, real [idea]-tagged placeholder written (ADR 0009)
     ELIGIBLE --> SURFACED: the item's own next_fit_start arrives, fire-time text sent
-    SURFACED --> ACCEPTED: user replies Y
-    SURFACED --> ELIGIBLE: user replies N, dismissal_count < 2 (rescheduled immediately, new placeholder)
-    SURFACED --> DORMANT: user replies N, dismissal_count reaches 2 (placeholder cleared)
+    SURFACED --> ACCEPTED: reply classified ACCEPT
+    SURFACED --> ELIGIBLE: reply classified DECLINE, dismissal_count < 2 (rescheduled immediately, new placeholder)
+    SURFACED --> DORMANT: reply classified DECLINE, dismissal_count reaches 2 (placeholder cleared)
     SURFACED --> ELIGIBLE: user replies "Later" (snoozed 7d via dormant_until, placeholder cleared, no dismissal_count change)
     SURFACED --> ELIGIBLE: no reply within 24h (outcome=no_response, no penalty)
     DORMANT --> ELIGIBLE: dormant_until passes (pure timestamp comparison, no job needed)
@@ -163,7 +155,7 @@ PRD §6.3 defines `Later` (snooze 7d) and dismissal (`dismissal_count ≥ 2` →
 
 `dispatcher-svc` has no Calendar *write* scope (`overview.md` §3 — only `committer-svc` writes externally). So acceptance doesn't write directly; it re-enters the pipeline at the one place that's allowed to:
 
-1. User replies `Y` to a suggestion. `ingest-svc` routes it to `dispatcher-svc` (§4).
+1. User replies to a suggestion in natural language; `ingest-svc` routes it to `dispatcher-svc` (§4), which classifies the reply as an acceptance (`dispatcher_svc/conversation.py::converse_suggestion`, `agent-contracts.md` §4.2 — replaces an earlier literal-`Y` keyword match).
 2. `dispatcher-svc` sets `suggestions.outcome = 'accepted'`, computes the target slot — **event start = the start of the `largest_contiguous_block` on the suggested day; duration = `effort_minutes`, capped at the block length** (decision made here; PRD names the block but not the exact slot placement) — and publishes directly to `items.confirmed` with `type` flipped to `obligation`, `due_at` set to that computed start time.
 3. `committer-svc` consumes it exactly as it would a resolver-confirmed item — it has no way to tell the two apart, and doesn't need to. **ADR 0009 addition:** before writing, it checks `latents.placeholder_event_id` for this item — if a real placeholder already exists (true for every latent surfaced via the ADR 0009 fire-time flow), it `PATCH`es that same Calendar event in place (tag/description stripped, real title/time set) instead of `POST`ing a duplicate, then clears the placeholder columns in the same transaction.
 
@@ -171,7 +163,7 @@ This reuses the existing commit path instead of giving `dispatcher-svc` its own 
 
 **Resolved gap, found building step 14 for real:** `committer-svc`'s items-row UPDATE only ever set `state`, never `type` — harmless for every path built before this one, since a resolver-confirmed item's `type` never changes between `EXTRACTED` and `COMMITTED`. This accept path is the first caller that actually needs `type` to change (a latent becoming an obligation) — fixed by always writing `confirmed.type` there, a no-op for the pre-existing path and correct for this one, keeping "`committer-svc` has no way to tell the two apart, and doesn't need to" literally true rather than just true in spirit.
 
-**Resolved gap, also found building step 14: `ConfirmedItemMessage.effort_minutes` is a strict `Literal[15, 30, 60, 120, 240]` (`schemas.py`) — "capped at the block length" can't mean an arbitrary integer.** Decided: use the largest of the five buckets that's `<=` both the item's original `effort_minutes` and the block's actual length, falling back to the smallest bucket (15) if even that overruns. An explicit user `Y` always gets scheduled somewhere rather than being silently refused over a small bucket-granularity overrun.
+**Resolved gap, also found building step 14: `ConfirmedItemMessage.effort_minutes` is a strict `Literal[15, 30, 60, 120, 240]` (`schemas.py`) — "capped at the block length" can't mean an arbitrary integer.** Decided: use the largest of the five buckets that's `<=` both the item's original `effort_minutes` and the block's actual length, falling back to the smallest bucket (15) if even that overruns. An explicit acceptance always gets scheduled somewhere rather than being silently refused over a small bucket-granularity overrun.
 
 **Resolved gap: the slot a suggestion was built from can be stale by the time a reply arrives** — a user might reply hours or a full day later, and the day's real Calendar state can have changed in between (more events booked, or the fire-time computation simply ran a while ago). `dispatcher-svc`'s accept handler re-fetches real, current Calendar events for the suggested day and recomputes the largest free interval at accept time, **excluding the item's own real placeholder event from that re-fetch** (ADR 0009 — otherwise the placeholder itself would incorrectly read as busy time blocking its own slot). If the day has genuinely filled up since (some other real event), the suggestion is dismissed with an apologetic message rather than scheduling into a conflict or silently failing.
 
@@ -204,10 +196,10 @@ Both are check-then-act guards, not hard transactional locks, but sufficient to 
 `ingest-svc` is the only Twilio webhook target. On every inbound message, before treating it as a new item:
 
 ```
-1. open conversations row for this user (state CLARIFYING or AWAITING_CONFIRMATION)?
+1. open conversations row for this user (state DUPLICATE_SUSPECTED or CLARIFYING; legacy AWAITING_CONFIRMATION rows are still routed)?
      → yes: forward to resolver-svc (this is a reply, not a new item)
 2. else, a suggestions row for this user with outcome IS NULL?
-     → yes: forward to dispatcher-svc (this is Y / N / Later)
+     → yes: forward to dispatcher-svc (this is a suggestion reply)
 3. else: new item — store media if present, publish to items.raw
 ```
 
@@ -215,7 +207,7 @@ Both are check-then-act guards, not hard transactional locks, but sufficient to 
 
 Forwarding in steps 1–2 is a synchronous internal call (Cloud Run service-to-service IAM), because both `resolver-svc` and `dispatcher-svc` typically need to reply to the same SMS thread immediately (next question, or "got it, added to your calendar") — there's no reason to add queue latency to a live back-and-forth the way there is for the durability-sensitive forward pipeline.
 
-**Build-order note, not a spec gap:** step 1 (forward to `resolver-svc`) was built in step 9, since there's no way to do a real SMS confirm/cancel round trip — that step's own required manual verification — without it; `ingest-svc` calls `resolver-svc`'s `POST /reply` with an ID-token-authenticated request, matching the synchronous-call design above exactly. Step 2 (forward to `dispatcher-svc`) is not built yet — `dispatcher-svc` has no accept-path endpoint until the feedback-loop step (PRD build order step 14), so there's nothing for that branch to call. Not a live gap in the meantime: nothing sends a suggestion that could be replied to in the deployment's current state either, so step 2's branch can't actually be reached yet regardless.
+**Build-order note, not a spec gap:** step 1 (forward to `resolver-svc`) was built when real multi-turn resolver conversations first landed; `ingest-svc` calls `resolver-svc`'s `POST /reply` with an ID-token-authenticated request, matching the synchronous-call design above exactly. Step 2 (forward to `dispatcher-svc`) is now built as the suggestion accept/decline/snooze path.
 
 ---
 

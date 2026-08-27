@@ -9,7 +9,7 @@ The obvious way to build a multi-step agentic pipeline is one orchestrator agent
 There is no orchestrator agent. Control flow is an explicit, code-defined state machine (`docs/architecture/state-machine.md`). LLM agents (Extractor, Resolver, Dispatcher) are invoked by pipeline code with a fixed next step; they are never given a tool that lets them call the next stage themselves or decide the pipeline's shape.
 
 ## Alternatives considered
-- **Single orchestrator agent with tool access to each stage.** Rejected: an LLM deciding control flow means a hallucinated or injected instruction (e.g. from a photographed note) could, in principle, cause the pipeline to skip a stage — skip confirmation, retry indefinitely, or route around dedupe. A state machine cannot be talked into skipping a state.
+- **Single orchestrator agent with tool access to each stage.** Rejected: an LLM deciding control flow means a hallucinated or injected instruction (e.g. from a photographed note) could, in principle, cause the pipeline to skip a stage — bypass dedupe/clarification, retry indefinitely, or route around the typed commit path. A state machine cannot be talked into skipping a state.
 - **ADK's built-in multi-agent delegation patterns.** Considered for the Extractor→Resolver handoff specifically. Rejected for the same reason: delegation is still an LLM decision about control flow, even if scoped to one framework's abstraction.
 
 ## Consequences

@@ -4,6 +4,8 @@ Read this after the PRD at the start of every session — it's the fast answer t
 
 **Last updated:** 2026-08-27 (session 7, later)
 
+**Current behavior, authoritative:** the normal resolver confirmation gate is retired. Complete, non-duplicate items auto-publish to `items.confirmed`; incomplete items clarify first; suspected duplicates ask before merging. Older notes below that mention confirmation cards, `AWAITING_CONFIRMATION` as the normal path, or "Y before commit" are historical verification records from the pre-v1-polish flow, not current product behavior.
+
 ---
 
 ## Phase
@@ -14,7 +16,7 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 
 ## Current step — PRD §14 build order
 
-**Steps 1-15 done. Phase F (ship) paused — user live-tested the system and redirected toward a conversational UX redesign first (Phase G, in progress). Plan: `/Users/izaan/.claude/plans/spicy-purring-karp.md`.**
+**Steps 1-15 done. Phase G conversational redesign done. Phase F ship work remains: README/spin-up instructions, diagram export, demo/write-up, and any final deployment verification. Original Phase G plan: `/Users/izaan/.claude/plans/spicy-purring-karp.md`.**
 
 | Step | Status |
 |---|---|
@@ -30,14 +32,14 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 | 7. Capacity engine, pure functions | **Done** — `services/dispatcher-svc/src/dispatcher_svc/capacity_engine.py`, 25 tests, all passing, no I/O. Worked example reproduced exactly (`fit_score=0.875`, `revival_score≈0.633`), contrast example reproduces `fit_score=0`. |
 | 8. `dispatcher-svc` | **Done** — deployed to Cloud Run, Cloud Scheduler jobs live, real end-to-end verified against the real Calendar and real Twilio: 7 `capacity_snapshots` persisted, a real reminder SMS sent and confirmed idempotent (second run sent 0), a real suggestion SMS sent matching `agent-contracts.md` §4.2 exactly with a real `suggestions` row + `latents` update. Several real deploy-time bugs found and fixed — see Notes. |
 | **Phase D — Trust and quality features** | |
-| 9. Real `resolver-svc` — confirmation | **Done** — deployed to Cloud Run (`resolver-svc` + `ingest-svc`), real end-to-end verified for both `Y` and `N`: a real confirmation card SMS sent, a real signed webhook reply routed through `ingest-svc` → `resolver-svc` → `items.confirmed` → `committer-svc` → a real Calendar event (`Y` path), and a real `CANCELLED` state + "Cancelled." SMS (`N` path). Also built `ingest-svc`'s inbound-reply routing (state-machine.md §4), a hard prerequisite not named in this step's one-line description. |
-| 10. Real `resolver-svc` — clarification loop | **Done** — deployed to Cloud Run, real end-to-end verified: a real ambiguous obligation ("deadline unclear") got a real clarifying question, a real ambiguous reply ("soon") correctly triggered a real follow-up question (`exchange_count` → 2), and a real clear reply ("this friday at 2pm") correctly resolved to the actual next Friday, `AWAITING_CONFIRMATION`, and a real confirmation card. A real Vertex AI schema limitation (`dict[str, Any]` output fields) was found and worked around before ever deploying — see Notes. |
+| 9. Real `resolver-svc` — conversational auto-commit | **Done** — current behavior: complete, non-duplicate items publish to `items.confirmed` immediately with a natural acknowledgment; no confirmation card/Y/N round trip. Dedupe and clarification remain blocking when needed. |
+| 10. Real `resolver-svc` — clarification loop | **Done** — deployed to Cloud Run, real end-to-end verified historically. Current behavior: a real ambiguous obligation gets a clarifying question; once a reply fills the required fields, the item proceeds directly to `CONFIRMED`/`items.confirmed`. A real Vertex AI schema limitation (`dict[str, Any]` output fields) was found and worked around before ever deploying — see Notes. |
 | 11. Multimodal ingest | **Done** — deployed to Cloud Run (`ingest-svc` + `extractor-svc`), real end-to-end verified with an actual photo MMS'd to +14152365420: real GCS storage, real Gemini multimodal extraction (`title="Pay rent"`, `summary="Pay rent by Friday."`), correctly routed into the real clarification loop since "Friday" is ambiguous, real clarifying SMS delivered and received. A real Pub/Sub non-idempotency finding surfaced along the way — see Notes. |
 | 12. Dedupe via embeddings | **Done** — deployed to Cloud Run (`resolver-svc` + `ingest-svc`), real end-to-end verified via a real 3-message signed-webhook sequence: a differently-worded near-duplicate scored 0.8875 similarity (below the 0.92 threshold, correctly no dedupe action) and proceeded normally; a near-literal resend scored high enough to trigger a real `DUPLICATE_SUSPECTED`, a real "Is this the same as X?" SMS, and a real `Y` reply → `MERGED` with no new `obligations` row and the original item left untouched. Real integration tests against actual pgvector also pass. A real routing gap in `ingest-svc` (missing `DUPLICATE_SUSPECTED`) was found and fixed — see Notes. |
 | **Phase E — Resilience and polish** | |
 | 13. DLQ + error handling | **Done** — deployed to Cloud Run (`committer-svc` + `resolver-svc`), real end-to-end verified: a forced technical failure published straight to the live `items-extracted` topic correctly reached exactly 5 real delivery attempts, forwarded to the real `.dlq` topic, and landed as a real `dead_letters` row with `items.state='FAILED'`; `scripts/replay_dead_letter.py` correctly republished it to `items-extracted` (not `items-raw`) and it failed reproducibly the same way. Two real bugs found and fixed along the way — see Notes, including one found by this step's own verification process, not by writing tests. |
 | 14. Feedback loop / dismissal scoring | **Done** — deployed to Cloud Run (`dispatcher-svc` + `ingest-svc` + `committer-svc`), real end-to-end verified: a real `Y` reply produced a real Calendar event and flipped a latent to a committed obligation, a real `N` incremented `dismissal_count`, a real `Later` set `dormant_until = now()+7d` — all via real signed webhooks routed live through `ingest-svc` → `dispatcher-svc`. Two real bugs found in the process (both in step 13's idempotency guard, not new step-14 code) and a real DB grant migration — see Notes. |
-| 15. Email draft + send action (stretch) | **Done** — deployed to Cloud Run (`extractor-svc` + `resolver-svc` + `committer-svc`), real end-to-end verified: a real self-addressed SMS was classified `action_type="email"`, drafted a real body, showed the real draft on a real confirmation card, and a real `Y` reply triggered a real Gmail send (`obligations.email_sent_at` set, no exception from the real API call). Spec written before any code (agent-contracts.md §2.1/§3.2/§3.3, state-machine.md §1.5), resolving the "Open gap, flagged rather than invented" note carried since step 9. Found and fixed a real Gemini prompt gap and a real, systemic Pub/Sub ack-deadline bug along the way — see Notes. |
+| 15. Email draft + send action (stretch) | **Done** — deployed to Cloud Run (`extractor-svc` + `resolver-svc` + `committer-svc`). Current behavior: an email action drafts in the extractor and sends through `committer-svc` once recipient/body are complete, with no separate confirmation card. Found and fixed a real Gemini prompt gap and a real, systemic Pub/Sub ack-deadline bug along the way — see Notes. |
 | **Phase F — Ship** | |
 | 16. Seed demo data script | Not started — paused for Phase G |
 | 17. Record demo | Not started — paused for Phase G |
@@ -47,8 +49,8 @@ All six architecture docs (`docs/architecture/`), all ADRs (`docs/decisions/`), 
 | A. Latency fix (`--min-instances=1`) | **Done** — see Notes |
 | B. Chat detection (`is_actionable`/`chat_reply`, new `CHATTED` state) | **Done** — see Notes |
 | C. `messages` table (tone-mirroring plumbing) | **Done** — see Notes |
-| D. Unified conversational turn (resolver-svc) — replaces `clarification.py`/`templates.py`/`reply_classifier.py` for the main confirm flow | **Done** — see Notes |
-| Phase 2 follow-up — dispatcher-svc suggestion flow gets the same treatment | Not started (explicit follow-up, not in this pass) |
+| D. Unified conversational turn (resolver-svc) — replaces `clarification.py`/`templates.py`/`reply_classifier.py` for the resolver flow | **Done** — see Notes |
+| Phase 2 follow-up — dispatcher-svc suggestion flow gets the same treatment | **Done** — `dispatcher_svc/conversation.py` handles fire-time nudge text and accept/decline/snooze/other classification. |
 
 ## Blockers
 
