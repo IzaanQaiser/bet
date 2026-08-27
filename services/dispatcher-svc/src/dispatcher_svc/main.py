@@ -613,6 +613,7 @@ async def dispatch_reminders():
 class ReminderFirePayload(BaseModel):
     item_id: UUID
     slot: int
+    scheduled_for: datetime | None = None
 
 
 @app.post("/dispatch/reminders/fire")
@@ -628,12 +629,23 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
     cancelled, or already sent by the /dispatch/reminders fallback in the
     meantime (Cloud Tasks delivers at-least-once) — same
     reminder_N_sent_at IS NULL idempotency guard every other reminder
-    path already relies on."""
+    path already relies on.
+
+    scheduled_for (real bug, found designing calendar-sync-svc's two-way
+    sync): without it, a due_at change (from Calendar sync, or any future
+    reschedule path) leaves the *old* task still armed for the *old*
+    instant — it would fire early, send a reminder with the freshly-read
+    (now-correct) text at the *wrong time*, and mark reminder_N_sent_at,
+    silently suppressing the real, later task via this same idempotency
+    check. Optional only for backward compatibility with any already-
+    enqueued task from before this field existed; every enqueuer now sets
+    it. Same staleness pattern /latents/{item_id}/fire already uses."""
     with get_connection() as conn:
         row = conn.execute(
             """
             SELECT i.title, o.due_at, i.is_scheduled_event, i.user_id,
-                   o.reminder_1_sent_at, o.reminder_2_sent_at, u.timezone, u.phone_e164
+                   o.reminder_1_sent_at, o.reminder_2_sent_at, u.timezone, u.phone_e164,
+                   o.reminder_1_at, o.reminder_2_at
             FROM obligations o
             JOIN items i ON i.id = o.item_id
             JOIN users u ON u.id = i.user_id
@@ -658,7 +670,19 @@ async def dispatch_reminders_fire(payload: ReminderFirePayload):
             reminder_2_sent_at,
             tz_name,
             phone,
+            reminder_1_at,
+            reminder_2_at,
         ) = row
+
+        if payload.scheduled_for is not None:
+            current_target = reminder_1_at if payload.slot == 1 else reminder_2_at
+            if current_target is None or payload.scheduled_for != current_target:
+                logger.info(
+                    "reminder fire skipped item_id=%s slot=%s (stale task, current=%s != %s)",
+                    payload.item_id, payload.slot, current_target, payload.scheduled_for,
+                )
+                return {"status": "stale_task_skipped", "item_id": str(payload.item_id)}
+
         already_sent = reminder_1_sent_at if payload.slot == 1 else reminder_2_sent_at
         if already_sent is not None:
             return {"status": "already_sent", "item_id": str(payload.item_id)}

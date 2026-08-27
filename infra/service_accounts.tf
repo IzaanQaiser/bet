@@ -51,6 +51,21 @@ resource "google_service_account" "dashboard" {
   depends_on   = [google_project_service.apis]
 }
 
+# Two-way Calendar sync — the reverse of the direction that already
+# worked (dashboard/ADR-0009 delete-here -> real Calendar delete). Only
+# ever reads Calendar (events.watch/events.list) and writes Postgres;
+# never calls the Calendar write API, so it never touches ADR 0003/0009's
+# single-writer boundary. See docs/architecture/overview.md's service
+# topology for why this is its own service, not folded into
+# dispatcher-svc: its /webhook route must be publicly reachable
+# (Google's push notifications carry no Cloud Run IAM token), and that
+# toggle is service-wide, not per-route.
+resource "google_service_account" "calendar_sync" {
+  account_id   = "sa-calendar-sync"
+  display_name = "calendar-sync-svc"
+  depends_on   = [google_project_service.apis]
+}
+
 # Developer's own IAM identity, granted cloudsqlsuperuser for running
 # migrations. Deliberate addition beyond docs/architecture/infrastructure.md's
 # original service-account list: none of the four service-account Postgres

@@ -27,7 +27,7 @@ These are inherited from the PRD's non-negotiables (§15) and translated into st
 
 ## 2. Service topology
 
-Five Cloud Run services, one Cloud Scheduler job, five Pub/Sub topics (four pipeline + one fan-out for dead-letters per topic in practice, detailed in §4).
+Five Cloud Run services in the core pipeline (plus `dashboard-svc` and `calendar-sync-svc`, added after this diagram was first drawn — see the open item at the bottom of this doc), two Cloud Scheduler jobs, five Pub/Sub topics (four pipeline + one fan-out for dead-letters per topic in practice, detailed in §4).
 
 ```mermaid
 flowchart TB
@@ -44,7 +44,9 @@ flowchart TB
         resolver["resolver-svc\n(Cloud Run, ADK)"]
         committer["committer-svc\n(Cloud Run)"]
         dispatcher["dispatcher-svc\n(Cloud Run)"]
+        calsync["calendar-sync-svc\n(Cloud Run, public)"]
         scheduler["Cloud Scheduler\n(07:00 + midday)"]
+        calscheduler["Cloud Scheduler\n(every 15 min)"]
         gcs["GCS\n(media, 30d TTL)"]
         sql["Cloud SQL\nPostgres + pgvector"]
 
@@ -74,6 +76,12 @@ flowchart TB
     dispatcher -->|read/write snapshots, suggestions| sql
     dispatcher -->|reminder + suggestion SMS| twilio
     dispatcher -->|publish on suggestion accept| t3
+
+    gcal -->|push notification| calsync
+    calscheduler --> calsync
+    calsync -->|events.list, read only| gcal
+    calsync -->|reconcile due_at/next_fit_start, cancel| sql
+    calsync -->|reschedule reminder/fire| dispatcher
 ```
 
 ### Service responsibilities
@@ -85,12 +93,14 @@ flowchart TB
 | `resolver-svc` | Consume `items.extracted`, run dedupe + clarification + confirmation over SMS, hold `conversations` state, publish to `items.confirmed`. | Pub/Sub push + Twilio inbound SMS webhook (a conversation spans multiple inbound messages) |
 | `committer-svc` | Consume `items.confirmed`, write to Calendar (and Gmail, stretch), mark item `COMMITTED`. Also the dead-letter writer: subscribes to all three `.dlq` topics and persists `dead_letters` rows (decision made in `infrastructure.md` §2.1 — reuses this service rather than standing up a sixth one). | Pub/Sub push |
 | `dispatcher-svc` | Compute capacity snapshots, fire deadline reminders, score latents, send at most one suggestion. | Cloud Scheduler (cron) + manual trigger endpoint for demo/judging |
+| `calendar-sync-svc` | Reconcile changes made directly on Google Calendar (deletions, time moves) back into `items`/`obligations`/`latents` — the reverse of the direction every other service already writes. Registers a Calendar `events.watch` push channel per linked user and runs `events.list` incremental sync (`syncToken`) on every push; a 15-minute Cloud Scheduler run is the fallback poll and channel-renewal check, same precise-push + infrequent-poll shape as reminders. Only ever reads Calendar and writes Postgres — never calls the Calendar write API, so it doesn't touch the single-writer boundary below. | Google Calendar push notification (public webhook) + Cloud Scheduler (cron) |
 
 `ingest-svc` is the single Twilio-facing webhook — Twilio supports one messaging webhook per number, so every inbound SMS, whether a brand-new item or a reply mid-conversation, lands there first. `ingest-svc` does a cheap routing check (open `conversations` row for this user → forward to `resolver-svc`; else a pending, unanswered `suggestions` row → forward to `dispatcher-svc`; else treat as a new item and publish to `items.raw`) via a synchronous internal call authenticated by Cloud Run service-to-service IAM, not a public route. Full routing precedence and reply semantics are in `docs/architecture/state-machine.md`.
 
-**Two asymmetries** in an otherwise uniform "topic in, topic out" topology (was one, before ADR [0009](../decisions/0009-tentative-placeholder-write-before-confirm.md)):
+**Three asymmetries** in an otherwise uniform "topic in, topic out" topology (was one, before ADR [0009](../decisions/0009-tentative-placeholder-write-before-confirm.md)):
 1. `ingest-svc` sometimes calls `resolver-svc`/`dispatcher-svc` directly instead of only publishing (above).
 2. `dispatcher-svc` calls `committer-svc` directly (`PUT`/`DELETE /latents/{item_id}/placeholder`) to request a tentative idea-placeholder write — synchronous because it needs the real Calendar event id back immediately, to persist into `latents.placeholder_event_id` (capacity-engine.md §5.2, ADR 0009). `committer-svc` remains the only service that ever calls the Calendar write API in either case.
+3. `calendar-sync-svc` is the only public (`--allow-unauthenticated`) service in the system — required because Google's push notifications carry no Cloud Run IAM token, and that toggle is service-wide rather than per-route. It is scoped to exactly one webhook route plus one Scheduler-triggered route, both independently verified in application code (channel-token check on the webhook; Google-signed OIDC identity check on the Scheduler route) rather than relying on platform IAM. It calls `dispatcher-svc`'s existing `/dispatch/reminders/fire` and `/latents/{item_id}/fire` endpoints to re-schedule Cloud Tasks after a reconciled time change, the same way `committer-svc` already does.
 
 ---
 
@@ -105,8 +115,9 @@ This table is the security story. Enforced via per-service service accounts and 
 | `resolver-svc` | `items.extracted`, `items` (own conversation), `item_embeddings` | `items` (state `CLARIFYING`/`CONFIRMED`), `conversations`, `item_embeddings`, `items.confirmed` topic, Twilio (outbound SMS) | Gemini (generate), embeddings | **none** |
 | `committer-svc` | `items.confirmed`, `items.raw.dlq`, `items.extracted.dlq`, `items.confirmed.dlq` | `items` (state `COMMITTED`), `obligations`, `latents`, `dead_letters` | none | Calendar (write), Gmail (send, stretch only) |
 | `dispatcher-svc` | `items`, `latents`, `capacity_snapshots`, `suggestions` | `capacity_snapshots`, `suggestions`, `latents` (surface metadata, `next_fit_start`/`placeholder_event_id`), Twilio (outbound SMS), `items.confirmed` topic (publish, and only after parsing an explicit accept reply to a suggestion — same confirm-before-write rule as `resolver-svc`, see ADR 0003), `committer-svc` (`run.invoker`, for the placeholder call above), Cloud Tasks `reminders` queue (`cloudtasks.enqueuer`, new — previously only ever a Cloud Tasks target) | none | Calendar (read only) — never gains write scope; a Calendar write it causes goes through `committer-svc`, see ADR 0009 |
+| `calendar-sync-svc` | Google Calendar push notifications + `events.list` deltas, `calendar_sync_channels`, `items`/`obligations`/`latents`/`users` (read, to match incoming events and read refresh tokens) | `calendar_sync_channels` (channel/sync token bookkeeping), `items` (state `CANCELLED` only), `obligations` (`due_at`, `reminder_*_at`), `latents` (`next_fit_start`, `placeholder_event_id`), Cloud Tasks `reminders` queue (`cloudtasks.enqueuer`), `dispatcher-svc` (`run.invoker`, to re-fire reminder/placeholder tasks after a reconciled time change) | none | Calendar (read only) — same `calendar.events` scope already granted, no new consent; never calls the Calendar write API |
 
-Read this table top to bottom and confirm: **no service that touches untrusted user input (`ingest-svc`, `extractor-svc`) holds any external write credential.** The only services with Calendar/Gmail write scope (`committer-svc`) or Calendar read scope (`dispatcher-svc`) never see raw user input directly — they only consume already-confirmed, already-structured state.
+Read this table top to bottom and confirm: **no service that touches untrusted user input (`ingest-svc`, `extractor-svc`) holds any external write credential.** The only services with Calendar/Gmail write scope (`committer-svc`) or Calendar read scope (`dispatcher-svc`, `calendar-sync-svc`) never see raw user input directly — they only consume already-confirmed, already-structured state, or in `calendar-sync-svc`'s case, Calendar state that only ever originated from this system's own prior writes (any event with no match in `obligations`/`latents` is skipped, never touched).
 
 ---
 
@@ -152,3 +163,4 @@ Flagging rather than deciding here, per `AGENTS.md`:
 - ~~Capacity snapshot computation detail and worked numeric examples~~ → done, see `capacity-engine.md`
 - ~~Terraform/gcloud resource list, service account names, exact IAM role bindings~~ → done, see `infrastructure.md` §1–§2, §6.
 - ~~Local dev story (Pub/Sub emulator, Cloud SQL proxy)~~ → done, see `infrastructure.md` §7.
+- **Gap, flagged not filled:** `dashboard-svc` (the web read/write surface for the account, `PATCH /me/profile`, `DELETE /me/items/{id}`, per `status.md`) predates `calendar-sync-svc` but was never added to this doc's diagram, service table, or write-access matrix. Not filled in here since its exact scope wasn't re-derived as part of this change — needs its own pass.

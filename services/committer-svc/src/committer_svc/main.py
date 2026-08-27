@@ -101,7 +101,12 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
     real Calendar event are the parts that matter — a failed enqueue just
     means this one reminder relies on the infrequent poll fallback instead
     of firing precisely on time, not that the item silently loses its
-    reminder entirely."""
+    reminder entirely.
+
+    scheduled_for in the task body (real bug, found designing calendar-
+    sync-svc's two-way sync): lets /dispatch/reminders/fire recognize a
+    task superseded by a later due_at change and no-op instead of firing
+    at the wrong time and blocking the correct one via reminder_N_sent_at."""
     try:
         project_id = os.environ["GCP_PROJECT_ID"]
         dispatcher_url = os.environ["DISPATCHER_SVC_URL"]
@@ -118,7 +123,13 @@ def _enqueue_reminder_task(item_id, slot: int, fire_at: datetime) -> None:
                     "http_method": tasks_v2.HttpMethod.POST,
                     "url": url,
                     "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({"item_id": str(item_id), "slot": slot}).encode(),
+                    "body": json.dumps(
+                        {
+                            "item_id": str(item_id),
+                            "slot": slot,
+                            "scheduled_for": fire_at.isoformat(),
+                        }
+                    ).encode(),
                     "oidc_token": {"service_account_email": dispatcher_sa, "audience": url},
                 },
                 "schedule_time": schedule_time,

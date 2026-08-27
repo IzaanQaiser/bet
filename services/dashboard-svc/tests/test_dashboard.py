@@ -414,6 +414,7 @@ def test_delete_committed_item_deletes_calendar_event_and_cancels(client):
     mock_conn.execute.return_value.fetchone.return_value = (
         user_id,
         "cal-evt-1",
+        None,
         "projects/test/secrets/user-refresh-token-x/versions/latest",
     )
     mock_session = MagicMock()
@@ -439,10 +440,45 @@ def test_delete_committed_item_deletes_calendar_event_and_cancels(client):
     mock_conn.commit.assert_called_once()
 
 
+def test_delete_committed_idea_deletes_placeholder_and_clears_columns(client):
+    """Real bug, found building two-way Calendar sync: this endpoint only
+    ever checked obligations.calendar_event_id — deleting an idea never
+    deleted its real [idea]-tagged placeholder event, only the DB row."""
+    user_id, item_id = uuid4(), uuid4()
+    mock_conn = _mock_connection()
+    mock_conn.execute.return_value.fetchone.return_value = (
+        user_id,
+        None,
+        "placeholder-evt-1",
+        "projects/test/secrets/user-refresh-token-x/versions/latest",
+    )
+    mock_session = MagicMock()
+    mock_session.delete.return_value = MagicMock(status_code=204)
+
+    with (
+        patch("dashboard_svc.main.get_connection", return_value=mock_conn),
+        patch(
+            "dashboard_svc.main.secretmanager.SecretManagerServiceClient",
+            return_value=_mock_secret_client(),
+        ),
+        patch("dashboard_svc.main.AuthorizedSession", return_value=mock_session),
+    ):
+        resp = client.delete(f"/me/items/{item_id}", headers=_auth_header(user_id))
+
+    assert resp.status_code == 200
+    mock_session.delete.assert_called_once_with(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events/placeholder-evt-1"
+    )
+    latent_update = [c for c in mock_conn.execute.call_args_list if "UPDATE latents" in c.args[0]]
+    assert len(latent_update) == 1
+    assert "next_fit_start = NULL" in latent_update[0].args[0]
+    assert "placeholder_event_id = NULL" in latent_update[0].args[0]
+
+
 def test_delete_in_progress_item_skips_calendar_no_event_id(client):
     user_id, item_id = uuid4(), uuid4()
     mock_conn = _mock_connection()
-    mock_conn.execute.return_value.fetchone.return_value = (user_id, None, None)
+    mock_conn.execute.return_value.fetchone.return_value = (user_id, None, None, None)
 
     with (
         patch("dashboard_svc.main.get_connection", return_value=mock_conn),
@@ -463,6 +499,7 @@ def test_delete_already_gone_calendar_event_still_succeeds(client):
     mock_conn.execute.return_value.fetchone.return_value = (
         user_id,
         "cal-evt-1",
+        None,
         "projects/test/secrets/user-refresh-token-x/versions/latest",
     )
     mock_session = MagicMock()
@@ -487,6 +524,7 @@ def test_delete_calendar_api_error_is_best_effort_not_fatal(client):
     mock_conn.execute.return_value.fetchone.return_value = (
         user_id,
         "cal-evt-1",
+        None,
         "projects/test/secrets/user-refresh-token-x/versions/latest",
     )
 

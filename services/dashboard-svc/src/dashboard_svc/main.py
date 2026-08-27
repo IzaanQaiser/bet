@@ -400,20 +400,28 @@ async def delete_item(item_id: UUID, user_id: UUID = Depends(current_user_id)):
     """Clears an item out of the caller's own dashboard — works for both
     an in-progress "agent memory" entry and a committed calendar item.
     Real feedback this exists for: deleting an event directly in Google
-    Calendar doesn't tell this system anything (no sync watches for
-    external deletions), so it stayed stranded in the dashboard — this
-    endpoint is the other direction: delete here, and it best-effort
+    Calendar doesn't tell this system anything on its own — calendar-
+    sync-svc (ADR-0009-adjacent two-way sync) is the *other* direction
+    for that; this endpoint handles delete-here-first. Best-effort
     deletes the real Calendar event too, not just our own row. Soft-
     deletes (state='CANCELLED'), doesn't remove the row — obligations/
     conversations/suggestions rows still reference it.
+
+    Real bug, found while building two-way sync: this only ever looked up
+    obligations.calendar_event_id — deleting an *idea* here never deleted
+    its real [idea]-tagged placeholder at all, only its DB row. Fixed by
+    also checking latents.placeholder_event_id (an item is one or the
+    other, never both, so at most one of the two is ever non-null).
     """
     with get_connection() as conn:
         row = conn.execute(
             """
-            SELECT i.user_id, o.calendar_event_id, u.google_refresh_token_ref
+            SELECT i.user_id, o.calendar_event_id, l.placeholder_event_id,
+                   u.google_refresh_token_ref
             FROM items i
             JOIN users u ON u.id = i.user_id
             LEFT JOIN obligations o ON o.item_id = i.id
+            LEFT JOIN latents l ON l.item_id = i.id
             WHERE i.id = %s
             """,
             (str(item_id),),
@@ -423,14 +431,16 @@ async def delete_item(item_id: UUID, user_id: UUID = Depends(current_user_id)):
         # so this never confirms whether the item exists for someone else.
         raise HTTPException(status_code=404, detail="not found")
 
-    _, calendar_event_id, refresh_token_ref = row
-    if calendar_event_id and refresh_token_ref:
+    _, calendar_event_id, placeholder_event_id, refresh_token_ref = row
+    event_id = calendar_event_id or placeholder_event_id
+    if event_id and refresh_token_ref:
         try:
             session = AuthorizedSession(_user_calendar_credentials(refresh_token_ref))
-            resp = session.delete(f"{CALENDAR_EVENTS_URL}/{calendar_event_id}")
+            resp = session.delete(f"{CALENDAR_EVENTS_URL}/{event_id}")
             # 404/410: already gone — e.g. the user deleted it directly in
-            # Google Calendar, which is exactly the case this endpoint
-            # exists to reconcile. That's the goal state, not a failure.
+            # Google Calendar, which is exactly the case calendar-sync-svc
+            # exists to reconcile from the other direction. Goal state,
+            # not a failure.
             if resp.status_code not in (200, 204, 404, 410):
                 resp.raise_for_status()
         except Exception:
@@ -440,6 +450,12 @@ async def delete_item(item_id: UUID, user_id: UUID = Depends(current_user_id)):
 
     with get_connection() as conn:
         conn.execute("UPDATE items SET state = 'CANCELLED' WHERE id = %s", (str(item_id),))
+        if placeholder_event_id:
+            conn.execute(
+                "UPDATE latents SET next_fit_start = NULL, placeholder_event_id = NULL "
+                "WHERE item_id = %s",
+                (str(item_id),),
+            )
         conn.commit()
     return {"status": "ok"}
 
