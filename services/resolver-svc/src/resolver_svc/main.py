@@ -1,5 +1,4 @@
-"""resolver-svc — step 12: dedupe via embeddings, on top of step 10's
-real clarification loop and step 9's real confirmation.
+"""resolver-svc — dedupe, clarification, and conversational auto-commit.
 
 state-machine.md §1.1: on entering EXTRACTED, before the completeness
 check ever runs, check for a duplicate — a cheap dedupe_hash exact match
@@ -7,8 +6,9 @@ first (no embedding call needed), then a text-embedding-004 cosine
 search over item_embeddings for this user. similarity >= 0.92 (or an
 exact hash match) routes to DUPLICATE_SUSPECTED and asks "is this the
 same as X?" — never silently merged (ADR 0003). A 0.82-0.92 match
-against an existing *latent* is folded into the eventual confirmation
-message as a non-blocking thread-attach offer instead of its own stage.
+against an existing *latent* is folded into the eventual auto-commit
+acknowledgment as a non-blocking thread-attach offer instead of its own
+stage.
 
 Every path that can reach a completed item carries a possible thread-attach
 candidate forward through conversations.resolved_fields (the documented
@@ -23,20 +23,15 @@ matched item across the DUPLICATE_SUSPECTED Y/N round trip; there is no
 dedicated column for either, matching how `due_at` already had nowhere
 else to live pre-commit (data-model.md §2.4's original resolved bug).
 
-Phase G step D (agent-contracts.md §3.2/§3.3) replaces the old due_at-only
-clarify() call, the fixed render_confirmation_card template, and strict
-Y/N/ATTACH keyword matching with resolver_svc.conversation.converse(),
-one Gemini call per turn that merges fields, classifies intent (AFFIRM/
-DENY/CORRECTION/ATTACH/OTHER) when replying to an already-sent
-confirmation, and writes the actual outbound SMS in the user's own
-mirrored voice. Real correction handling (a reply that changes a detail
-rather than confirming/denying) is genuinely new here — never built
-before this step. CORRECTION never publishes on its own, no matter how
-complete the merged fields look — only a subsequent, separate AFFIRM turn
-ever triggers items.confirmed (ADR 0003's actual mechanism: the LLM only
-fills a classified field, pipeline code below does a plain
-`if result.intent == "AFFIRM":` before ever publishing — never a second
-LLM call interpreting the first one's output).
+Phase G replaced the old due_at-only clarify() call, fixed
+render_confirmation_card template, and strict Y/N/ATTACH keyword matching
+with resolver_svc.conversation.converse(), one Gemini call per turn that
+merges fields and writes the actual outbound SMS in the user's own
+mirrored voice. For normal items, there is no separate confirmation turn:
+when required fields are complete, pipeline code publishes
+items.confirmed immediately. The LLM still has no tools and no write
+credentials; ADR 0003's boundary is credential scope and typed commit
+messages, not an extra Y/N prompt.
 
 The dedupe question was step D's one deliberate exception — left as the
 fixed "Reply Y to merge, N if it's different" template/classifier, not
@@ -58,26 +53,24 @@ guarded against it.
 
 Phase G follow-up (same session as step D): converse() gained
 `relates_to_item` (conversation.py's own docstring has the full design) —
-when a reply during CLARIFYING or AWAITING_CONFIRMATION doesn't actually
-relate to the open item, `_route_as_new_item()` leaves that item
-completely untouched and gives the text its own new item via the same
-path a first-contact message takes (`create_raw_item` + `items-raw`
-publish). The DUPLICATE_SUSPECTED path applies the same `relates_to_item`
-check now too (below), on top of its own separate dedupe-question fix.
+when a reply during CLARIFYING or a legacy AWAITING_CONFIRMATION row
+doesn't actually relate to the open item, `_route_as_new_item()` leaves
+that item completely untouched and gives the text its own new item via
+the same path a first-contact message takes (`create_raw_item` +
+`items-raw` publish). The DUPLICATE_SUSPECTED path applies the same
+`relates_to_item` check now too (below), on top of its own dedupe-question
+fix.
 
 V1 polish, user-directed: the explicit confirmation step (AWAITING_CONFIRMATION,
 "down to lock that in?" + a required Y reply) is removed. The moment
 still_missing empties out — first pass or after a clarification reply — the
 item auto-commits straight to CONFIRMED via `_confirm_and_publish`, no
-affirmative required. This is a deliberate override of PRD §5.2's "never
-write to the calendar on inference alone" non-negotiable, flagged to the
-user and confirmed explicitly before implementing, not an oversight —
-scoped to v2 being a from-scratch rebuild, not a permanent architectural
-stance. `_handle_confirmation_reply` and the whole AFFIRM/DENY/CORRECTION/
-ATTACH-for-a-fresh-item machinery it implemented are gone with it — no
-code path sets `items.state = 'AWAITING_CONFIRMATION'` anymore. The dedupe
-question (below) is untouched: a likely-duplicate match is still never
-silently merged, that wasn't part of what was asked to change.
+affirmative required. This is the current product design. `_handle_confirmation_reply`
+and the whole AFFIRM/DENY/CORRECTION/ATTACH-for-a-fresh-item machinery it
+implemented are gone with it — no code path sets
+`items.state = 'AWAITING_CONFIRMATION'` anymore. The dedupe question
+(below) is untouched: a likely-duplicate match is still never silently
+merged, that wasn't part of what was asked to change.
 
 The guard checks for an existing `conversations` row, not `items.state`
 — an earlier draft checked state, and a second real bug (found

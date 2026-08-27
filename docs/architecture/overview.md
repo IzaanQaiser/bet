@@ -20,7 +20,7 @@ These are inherited from the PRD's non-negotiables (§15) and translated into st
 
 - **No orchestrator agent.** Control flow is an explicit state machine (`state-machine.md`). LLM agents decide *content* (what to extract, what to ask, what to suggest); they never decide *what happens next in the pipeline*. This is enforced by construction — agents are invoked by pipeline code with a fixed next-step, not given tools to call the next stage themselves.
 - **Write access is scoped per service, enforced by IAM.** Not "the extractor shouldn't write to the calendar" as a convention the code happens to follow — the extractor's service account has no Calendar or Gmail scope and no DB write role. A prompt injection in a photographed note cannot escalate past what the service account can physically do.
-- **Confirm-before-write is structural, not a prompt instruction.** Only `committer-svc` holds write credentials to Calendar/Gmail, and it only ever consumes messages from the `items.confirmed` topic, which only `resolver-svc` publishes to, which only happens after an explicit user affirmative is parsed. There is no code path from raw ingest to a calendar write that skips confirmation.
+- **External writes are structurally isolated, not prompt-instructed.** Only `committer-svc` holds Calendar/Gmail write credentials, and it only ever consumes typed commit messages from `items.confirmed` or explicit placeholder requests from `dispatcher-svc`. The LLM call sites never receive write tools or write credentials, and the services that touch raw Twilio/media input cannot call Calendar or Gmail.
 - **Every cross-service handoff is durable and replayable.** Pub/Sub between every stage, not direct service-to-service calls. A crashed service doesn't lose the item — it redelivers. This is also what makes the dead-letter queue possible at every stage uniformly.
 
 ---
@@ -64,8 +64,8 @@ flowchart TB
     t2 --> resolver
     resolver -->|embed| vertex
     resolver -->|read/write items, CLARIFYING/CONFIRMED| sql
-    resolver -->|SMS clarify/confirm| twilio
-    resolver -->|publish on confirm| t3
+    resolver -->|SMS clarify/ack| twilio
+    resolver -->|publish when complete| t3
     t3 --> committer
     committer -->|write event| gcal
     committer -->|send draft, stretch| gmail
@@ -90,9 +90,9 @@ flowchart TB
 |---|---|---|
 | `ingest-svc` | Validate Twilio webhook signature, persist media to GCS, publish raw item to `items.raw`. No LLM calls. | Twilio webhook (sync HTTP) |
 | `extractor-svc` | Consume `items.raw`, call Gemini 3.5 Flash with strict schema, publish to `items.extracted`. | Pub/Sub push |
-| `resolver-svc` | Consume `items.extracted`, run dedupe + clarification + confirmation over SMS, hold `conversations` state, publish to `items.confirmed`. | Pub/Sub push + Twilio inbound SMS webhook (a conversation spans multiple inbound messages) |
+| `resolver-svc` | Consume `items.extracted`, run dedupe + clarification over SMS, hold `conversations` state, publish to `items.confirmed` once required fields are complete. | Pub/Sub push + Twilio inbound SMS webhook (a conversation spans multiple inbound messages) |
 | `committer-svc` | Consume `items.confirmed`, write to Calendar (and Gmail, stretch), mark item `COMMITTED`. Also the dead-letter writer: subscribes to all three `.dlq` topics and persists `dead_letters` rows (decision made in `infrastructure.md` §2.1 — reuses this service rather than standing up a sixth one). | Pub/Sub push |
-| `dispatcher-svc` | Compute capacity snapshots, fire deadline reminders, score latents, send at most one suggestion. | Cloud Scheduler (cron) + manual trigger endpoint for demo/judging |
+| `dispatcher-svc` | Compute capacity snapshots, fire deadline reminders, schedule latent placeholders, fire suggestions at their next-fit slots, and classify suggestion replies. | Cloud Scheduler (cron), Cloud Tasks, and manual trigger endpoint for demo/judging |
 | `calendar-sync-svc` | Reconcile changes made directly on Google Calendar (deletions, time moves) back into `items`/`obligations`/`latents` — the reverse of the direction every other service already writes. Registers a Calendar `events.watch` push channel per linked user and runs `events.list` incremental sync (`syncToken`) on every push; a 15-minute Cloud Scheduler run is the fallback poll and channel-renewal check, same precise-push + infrequent-poll shape as reminders. Only ever reads Calendar and writes Postgres — never calls the Calendar write API, so it doesn't touch the single-writer boundary below. | Google Calendar push notification (public webhook) + Cloud Scheduler (cron) |
 
 `ingest-svc` is the single Twilio-facing webhook — Twilio supports one messaging webhook per number, so every inbound SMS, whether a brand-new item or a reply mid-conversation, lands there first. `ingest-svc` does a cheap routing check (open `conversations` row for this user → forward to `resolver-svc`; else a pending, unanswered `suggestions` row → forward to `dispatcher-svc`; else treat as a new item and publish to `items.raw`) via a synchronous internal call authenticated by Cloud Run service-to-service IAM, not a public route. Full routing precedence and reply semantics are in `docs/architecture/state-machine.md`.
@@ -114,10 +114,10 @@ This table is the security story. Enforced via per-service service accounts and 
 | `extractor-svc` | `items.raw` | `items.extracted` topic | Gemini (generate) | **none** |
 | `resolver-svc` | `items.extracted`, `items` (own conversation), `item_embeddings` | `items` (state `CLARIFYING`/`CONFIRMED`), `conversations`, `item_embeddings`, `items.confirmed` topic, Twilio (outbound SMS) | Gemini (generate), embeddings | **none** |
 | `committer-svc` | `items.confirmed`, `items.raw.dlq`, `items.extracted.dlq`, `items.confirmed.dlq` | `items` (state `COMMITTED`), `obligations`, `latents`, `dead_letters` | none | Calendar (write), Gmail (send, stretch only) |
-| `dispatcher-svc` | `items`, `latents`, `capacity_snapshots`, `suggestions` | `capacity_snapshots`, `suggestions`, `latents` (surface metadata, `next_fit_start`/`placeholder_event_id`), Twilio (outbound SMS), `items.confirmed` topic (publish, and only after parsing an explicit accept reply to a suggestion — same confirm-before-write rule as `resolver-svc`, see ADR 0003), `committer-svc` (`run.invoker`, for the placeholder call above), Cloud Tasks `reminders` queue (`cloudtasks.enqueuer`, new — previously only ever a Cloud Tasks target) | none | Calendar (read only) — never gains write scope; a Calendar write it causes goes through `committer-svc`, see ADR 0009 |
+| `dispatcher-svc` | `items`, `latents`, `capacity_snapshots`, `suggestions` | `capacity_snapshots`, `suggestions`, `latents` (surface metadata, `next_fit_start`/`placeholder_event_id`), Twilio (outbound SMS), `items.confirmed` topic (publish only after classifying a suggestion reply as accept), `committer-svc` (`run.invoker`, for the placeholder call above), Cloud Tasks `reminders` queue (`cloudtasks.enqueuer`, new — previously only ever a Cloud Tasks target) | Gemini (generate, suggestion text/reply intent), no tools | Calendar (read only) — never gains write scope; a Calendar write it causes goes through `committer-svc`, see ADR 0009 |
 | `calendar-sync-svc` | Google Calendar push notifications + `events.list` deltas, `calendar_sync_channels`, `items`/`obligations`/`latents`/`users` (read, to match incoming events and read refresh tokens) | `calendar_sync_channels` (channel/sync token bookkeeping), `items` (state `CANCELLED` only), `obligations` (`due_at`, `reminder_*_at`), `latents` (`next_fit_start`, `placeholder_event_id`), Cloud Tasks `reminders` queue (`cloudtasks.enqueuer`), `dispatcher-svc` (`run.invoker`, to re-fire reminder/placeholder tasks after a reconciled time change) | none | Calendar (read only) — same `calendar.events` scope already granted, no new consent; never calls the Calendar write API |
 
-Read this table top to bottom and confirm: **no service that touches untrusted user input (`ingest-svc`, `extractor-svc`) holds any external write credential.** The only services with Calendar/Gmail write scope (`committer-svc`) or Calendar read scope (`dispatcher-svc`, `calendar-sync-svc`) never see raw user input directly — they only consume already-confirmed, already-structured state, or in `calendar-sync-svc`'s case, Calendar state that only ever originated from this system's own prior writes (any event with no match in `obligations`/`latents` is skipped, never touched).
+Read this table top to bottom and confirm: **no service that touches untrusted user input (`ingest-svc`, `extractor-svc`) holds any external write credential.** The only services with Calendar/Gmail write scope (`committer-svc`) or Calendar read scope (`dispatcher-svc`, `calendar-sync-svc`) never see raw user input directly — they only consume typed, structured pipeline state, or in `calendar-sync-svc`'s case, Calendar state that only ever originated from this system's own prior writes (any event with no match in `obligations`/`latents` is skipped, never touched).
 
 ---
 
@@ -150,7 +150,7 @@ Concretely: `items.raw`, `items.extracted`, `items.confirmed` each have a paired
 
 ## 5. Correlation and observability
 
-Every service logs structured JSON with `item_id` (or, for dispatcher runs with no single item, `dispatch_run_id`) as a correlation field. This is what lets a judge — or you, on camera — follow one screenshot from Twilio webhook through extraction, clarification, confirmation, and calendar write in Cloud Logging, filtered on a single ID. No distributed tracing system is being introduced for a 9-day build; structured logs with a consistent correlation key is the entire observability strategy, and it's sufficient for this scale.
+Every service logs structured JSON with `item_id` (or, for dispatcher runs with no single item, `dispatch_run_id`) as a correlation field. This is what lets a judge — or you, on camera — follow one screenshot from Twilio webhook through extraction, clarification/auto-commit, and calendar write in Cloud Logging, filtered on a single ID. No distributed tracing system is being introduced for a 9-day build; structured logs with a consistent correlation key is the entire observability strategy, and it's sufficient for this scale.
 
 ---
 

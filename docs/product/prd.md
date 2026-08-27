@@ -25,7 +25,7 @@ Every design decision below serves that thesis. If a feature does not make the d
 1. Multimodal SMS ingest — image, PDF, text
 2. Structured extraction with confidence + missing-field detection
 3. Clarification loop over SMS (bounded)
-4. Explicit confirmation before any write
+4. Auto-commit once the item is complete; ask only for missing/ambiguous fields or duplicate disambiguation
 5. Semantic dedupe on ingest
 6. Calendar write for obligations + **SMS deadline reminders** (the alarm-clock-fatigue fix — see §1)
 7. Capacity computation from the user's calendar
@@ -34,7 +34,7 @@ Every design decision below serves that thesis. If a feature does not make the d
 10. Dead-letter queue + failure handling throughout
 
 ### Stretch (post-core-loop, agreed in session)
-11. **Email draft + send action.** For actionable items where the obligation *is* an email, the system drafts the email, sends the draft back over SMS for review, and — on explicit confirmation — sends it via Gmail API. This is **not** a new subsystem: it reuses the existing Extractor → Resolver → confirm → commit pipeline with a second write target (Gmail send) alongside the existing one (Calendar write). The confirm-gate is identical to the calendar path — no autonomous send.
+11. **Email draft + send action.** For actionable items where the obligation *is* an email, the system drafts the email and sends it via Gmail API once the recipient/body are structurally complete. If the recipient is missing or ambiguous, Resolver asks for it first. This is **not** a new subsystem: it reuses the existing Extractor → Resolver → commit pipeline with a second write target (Gmail send) alongside the existing one (Calendar write).
 
 ### Explicitly out of scope
 - Browser automation
@@ -42,7 +42,7 @@ Every design decision below serves that thesis. If a feature does not make the d
 - Multi-user / teams
 - Mobile app or rich web UI (SMS is the interface; a thin read-only dashboard is optional)
 - Task completion tracking beyond accept/dismiss
-- **Generalized agentic task execution** (pay a bill, "do x task" on the user's behalf, arbitrary computer use). Excluded permanently, not just deferred: it contradicts the core trust principle (confirm before any write), each action category is its own integration surface with no shared pipeline to reuse, and irreversible financial actions are the wrong place to spend a 9-day build's risk budget. State this explicitly in the write-up as a deliberate scope boundary, not a gap.
+- **Generalized agentic task execution** (pay a bill, "do x task" on the user's behalf, arbitrary computer use). Excluded permanently, not just deferred: each action category is its own integration surface with no shared pipeline to reuse, and irreversible financial actions are the wrong place to spend a 9-day build's risk budget. State this explicitly in the write-up as a deliberate scope boundary, not a gap.
 
 ### Cut order under time pressure
 Cut from the bottom. **Never cut the dispatcher — without it this is a forwarding bot.**
@@ -55,7 +55,7 @@ Cut from the bottom. **Never cut the dispatcher — without it this is a forward
 6. Clarification loop → degrade to "reply with the missing field"
 7. — hard floor —
 8. Capacity engine (DO NOT CUT)
-9. Ingest→confirm→commit path (DO NOT CUT)
+9. Ingest→commit path (DO NOT CUT)
 
 ---
 
@@ -74,7 +74,7 @@ Cut from the bottom. **Never cut the dispatcher — without it this is a forward
 
 **Bonus (up to +0.8):** blog post (+0.2), social post with `#AllThingsAgenticHackathon` (+0.2), Veo (+0.2), Lyria (+0.2).
 
-**Rubric risk to preempt explicitly in the demo/write-up:** Taskmaster judging asks whether the agent "completes a multi-step background workflow without human intervention." Our confirm-gate means nothing commits without a reply. Frame this correctly: autonomy lives in the *dispatcher deciding, unprompted, that now is the moment* — not in skipping consent on an irreversible write. State this distinction on camera; don't let a judge read the confirm-gate as incompleteness.
+**Rubric point to emphasize in the demo/write-up:** Taskmaster judging asks whether the agent "completes a multi-step background workflow without human intervention." This system now does: once a message is actionable, complete, and not a duplicate, it commits without a separate "Y/N" confirmation round trip. The safety story is not an extra tap; it is bounded integrations, missing-field clarification, duplicate disambiguation, an explicit state machine, and a single external writer (`committer-svc`) isolated from raw input.
 
 ---
 
@@ -123,25 +123,18 @@ Rules:
 **Removed, v1, user-directed:** `focus_depth` (shallow/deep classification) and everything derived from it — judged too verbose for v1. See `capacity-engine.md` §4 for the resulting single-rule `block_fit`.
 
 ### 5.2 Resolver
-**Role:** owns the human loop. Turns a low-confidence or incomplete extraction into a confirmed record.
-**Model:** Gemini 3.5 Flash for question generation only.
+**Role:** owns the human loop. Turns an incomplete extraction into a commit-ready record.
+**Model:** Gemini 3.5 Flash for conversational field merge, duplicate disambiguation, and in-voice replies.
 **Write access:** writes to `items` in state `CLARIFYING`/`CONFIRMED`. No calendar access, no email-send access.
 
 Behaviour:
 1. **Dedupe check.** Embed the item, cosine search `item_embeddings`.
    - `similarity ≥ 0.92` → ask the user: "Is this the same as *[existing title]*?" Never merge silently.
    - `0.82 ≤ similarity < 0.92` and existing item is a latent → offer thread attachment.
-2. **Clarification.** If `missing_fields` non-empty or `confidence < 0.75`, ask for the missing fields. **Max 3 exchanges**, batching multiple missing fields into one message where natural. On exhaustion → park the item as `NEEDS_REVIEW`, do not guess.
-3. **Confirmation.** Always. Render a compact card and require an explicit affirmative before emitting `commit`.
+2. **Clarification.** If `missing_fields` is non-empty, ask for the missing fields. **Max 3 exchanges**, batching multiple missing fields into one message where natural. On exhaustion → park the item as `NEEDS_REVIEW`, do not guess.
+3. **Commit.** Once dedupe clears and required fields are present, publish to `items.confirmed` immediately. Resolver sends a natural "locked it in" style SMS, but there is no separate confirmation card or affirmative reply step.
 
-> **Design principle (non-negotiable):** the system is only as good as it is accurate. An extra tap is an acceptable price for certainty. Never write to the calendar (or send an email) on inference alone.
-
-Confirmation format:
-```
-📅 Visa appointment
-Thu 4 Sep, 2:00 PM · 60 min
-Reply Y to confirm, N to cancel, or send a correction.
-```
+> **Design principle (non-negotiable):** do not guess missing facts. Ask when a field is missing or ambiguous; otherwise commit. The user already expressed intent by texting the obligation/action into the system.
 
 ### 5.3 Dispatcher
 **Role:** the agent that runs when the user isn't there. This is the product.
@@ -224,9 +217,6 @@ EXTRACTED
    ↓ resolver: completeness check
    ├→ CLARIFYING ⟲ (max 3 exchanges) → NEEDS_REVIEW (on exhaustion)
    ↓
-AWAITING_CONFIRMATION
-   ├→ (N) → CANCELLED
-   ↓ (Y)
 CONFIRMED
    ↓ committer
 COMMITTED
@@ -320,7 +310,7 @@ Cloud Run: ingest-svc          (validates, stores media to GCS, publishes)
    ↓ Pub/Sub topic: items.raw
 Cloud Run: extractor-svc       (Gemini 3.5 Flash, ADK)
    ↓ Pub/Sub topic: items.extracted
-Cloud Run: resolver-svc        (dedupe, clarify, confirm — holds conversation state)
+Cloud Run: resolver-svc        (dedupe, clarify, auto-commit — holds conversation state)
    ↓ Pub/Sub topic: items.confirmed
 Cloud Run: committer-svc       (Calendar API write, Gmail API send, Postgres write)
 
@@ -392,7 +382,7 @@ Judged on reproducibility. Must contain:
 | 0:00–0:30 | **Cold open — the dispatcher fires unprompted.** Phone on the desk buzzes. The suggestion appears. No setup, no narration yet. Lead with the twist. |
 | 0:30–1:00 | The friction, stated plainly. Obligations arrive in four channels; ideas die in notes apps because resurfacing has no trigger. |
 | 1:00–1:30 | Architecture walkthrough on the diagram. Say the line: *"LLMs decide content, the state machine decides control flow."* Point at the DLQ. |
-| 1:30–3:00 | **Live, unedited run.** Send a screenshot → clarification exchange → confirmation → calendar event appears. Cloud Run logs streaming in a visible pane throughout. Show the Cloud Run dashboard and the `.run.app` URL. |
+| 1:30–3:00 | **Live, unedited run.** Send a screenshot → clarification exchange if needed → calendar event appears. Cloud Run logs streaming in a visible pane throughout. Show the Cloud Run dashboard and the `.run.app` URL. |
 | 3:00–3:40 | **Manually trigger the dispatcher.** Show the capacity snapshot in the logs — the actual numbers, the contiguous block, the load delta. Suggestion arrives. Accept it. Calendar updates. |
 | 3:40–4:00 | Dismissal loop in one line, close. |
 
@@ -416,10 +406,10 @@ Strict. Do not work ahead. Each step below is scoped to one service, one well-is
 2. **DB schema + shared package.** Apply the migration from `data-model.md`'s DDL (including the `resolved_fields` fix). Build `shared/obligation_engine_shared`: Pydantic schemas from `agent-contracts.md` §1, `db.py`, `pubsub.py`. *Reads:* `data-model.md`, `agent-contracts.md` §1, `engineering/conventions.md`. *Done when:* migration applies cleanly; the shared package is importable from a throwaway script.
 3. **`ingest-svc` + real Twilio number.** Webhook signature validation, `INSERT` into `items` (state `RECEIVED`), publish `items.raw`, text-only (no media yet). Deployed, wired to a real Twilio number. *Reads:* `overview.md` (ingest-svc row), `state-machine.md` (`RECEIVED` only), `infrastructure.md` (`sa-ingest`). *Done when:* texting the number creates an `items` row and a message lands on `items.raw`.
 
-### Phase B — Core pipeline (auto-confirm stub, no gate yet)
+### Phase B — Core pipeline
 
 4. **`extractor-svc`.** Consume `items.raw`, Gemini call via ADK (prompt + schema from `agent-contracts.md` §2), publish `items.extracted`. Text-only. *Reads:* `agent-contracts.md` §0, §2; `overview.md` (extractor-svc row); `infrastructure.md` (`sa-extractor`). *Done when:* a text item reaches `EXTRACTED` with correct fields, traceable by `item_id` in Cloud Logging.
-5. **`resolver-svc` stub — temporary.** Consumes `items.extracted`, skips dedupe/clarify/confirm entirely, auto-publishes `items.confirmed`. **This deliberately violates confirm-before-write (ADR 0003) on purpose, only to prove the pipe end to end — step 9 replaces it with the real gate before this is ever demoed.** *Reads:* `state-machine.md` §1 (just the happy path), `agent-contracts.md` §1. *Done when:* an extracted item reaches `items.confirmed` untouched by a human.
+5. **`resolver-svc` first cut.** Consumes `items.extracted`, skips dedupe/clarify temporarily, and auto-publishes complete items to `items.confirmed` to prove the pipe end to end. This is not a trust violation in the current design; ADR 0003's boundary is about external write credentials staying isolated in `committer-svc`. *Reads:* `state-machine.md` §1 (just the happy path), `agent-contracts.md` §1. *Done when:* an extracted item reaches `items.confirmed` untouched by a human.
 6. **`committer-svc`.** Consume `items.confirmed`, branch on `type` (obligation → Calendar write; latent → no external write), `INSERT` `obligations`/`latents`, mark `COMMITTED`. Uses the manually-bootstrapped OAuth token from §14's scope note above. *Reads:* `state-machine.md` §1.5; `agent-contracts.md` §1; `data-model.md` (`obligations`/`latents`); `infrastructure.md` (`sa-committer`). *Done when:* texting an obligation produces a real Google Calendar event.
 
 ### Phase C — The differentiator
@@ -429,7 +419,7 @@ Strict. Do not work ahead. Each step below is scoped to one service, one well-is
 
 ### Phase D — Trust and quality features
 
-9. **Real `resolver-svc` — confirmation.** Replace step 5's stub with the actual `AWAITING_CONFIRMATION` ↔ `CONFIRMED`/`CANCELLED` gate — confirmation card, Y/N/correction parsing. Clarification still stubbed (next step). *Reads:* `state-machine.md` §1.2, §1.4; `agent-contracts.md` §3.3, §4.3. *Done when:* a complete item now requires a real `Y` before it commits; `N` cancels.
+9. **Real `resolver-svc` — conversational auto-commit.** Replace step 5's stub with the actual dedupe/clarify/conversation logic. Complete items publish immediately; incomplete items ask for missing fields; suspected duplicates ask before merging. *Reads:* `state-machine.md` §1.1–§1.5; `agent-contracts.md` §3.5. *Done when:* a complete item commits without a Y/N round trip, and an incomplete item asks a real follow-up question.
 10. **Real `resolver-svc` — clarification loop.** The Gemini clarification call, `conversations.resolved_fields` staging, exchange counting, `CLARIFYING`/`NEEDS_REVIEW`. *Reads:* `state-machine.md` §1.2, §1.3; `agent-contracts.md` §3.2; `data-model.md` §2.4. *Done when:* an incomplete item gets a real clarifying question; 3 unresolved exchanges lands `NEEDS_REVIEW`.
 11. **Multimodal ingest.** Extend `ingest-svc` (media → GCS) and `extractor-svc` (image/PDF bytes to Gemini). *Reads:* `overview.md` (media path); `agent-contracts.md` §2. *Done when:* a photographed note extracts correctly.
 12. **Dedupe via embeddings.** `dedupe_hash` prefilter, `text-embedding-004` call, `item_embeddings`, `DUPLICATE_SUSPECTED`, thread-attach offer. *Reads:* `state-machine.md` §1.1; `data-model.md` §2.1; `agent-contracts.md` §3.1. *Done when:* a near-duplicate item triggers "is this the same as X?".
@@ -438,7 +428,7 @@ Strict. Do not work ahead. Each step below is scoped to one service, one well-is
 
 13. **DLQ + error handling.** Dead-letter config on every subscription; `committer-svc`'s dead-letter-writer subscriptions. *Reads:* `overview.md` §4; `state-machine.md` §3; `infrastructure.md` §2.1. *Done when:* forcing a failure produces a `dead_letters` row, and manual replay works.
 14. **Feedback loop / dismissal scoring.** Suggestion outcomes recorded, `dismissal_count`/`dormant_until` updates. ~20 lines. *Reads:* `state-machine.md` §2.2; `capacity-engine.md` §5. *Done when:* two dismissals correctly produce a 30-day dormancy (verify by manipulating timestamps, don't wait).
-15. **Email draft + send action (stretch).** Spec the drafting mechanism first — flagged open in `agent-contracts.md` §3.2 — then implement: extends the Extractor schema/prompt and `committer-svc`'s Gmail branch. *Reads:* ADR 0008; `agent-contracts.md`'s open-gap note. *Done when:* an email-type obligation drafts, confirms, and sends.
+15. **Email draft + send action (stretch).** Spec the drafting mechanism first — flagged open in `agent-contracts.md` §3.2 — then implement: extends the Extractor schema/prompt and `committer-svc`'s Gmail branch. *Reads:* ADR 0008; `agent-contracts.md`'s open-gap note. *Done when:* an email-type obligation drafts and sends once recipient/body are complete.
 
 ### Phase F — Ship
 
@@ -451,11 +441,12 @@ Strict. Do not work ahead. Each step below is scoped to one service, one well-is
 
 ## 15. Non-negotiables
 
-- Never write to the calendar, or send an email, without explicit user confirmation.
+- Never guess a missing/ambiguous field; clarify first.
+- Never let any service except `committer-svc` write to Calendar or Gmail.
 - Never merge a suspected duplicate silently.
 - Never invent a date the user didn't supply.
-- Maximum one proactive suggestion per dispatcher run.
+- Latent placeholders are always tagged `[idea]`, reversible, and written only through `committer-svc`.
 - The extractor never holds write credentials.
-- Suggestions always name their evidence ("3h clear, lightest day in two weeks").
+- Suggestions are short, in-voice, and state the actual effort being proposed.
 - Generalized agentic execution (bill pay, arbitrary tasks) is out of scope permanently, not deferred.
 - The dispatcher ships. Everything else is negotiable.
