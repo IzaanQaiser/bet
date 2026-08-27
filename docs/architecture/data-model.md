@@ -73,7 +73,7 @@ CREATE TABLE obligations (
     due_at             timestamptz,
     calendar_event_id  text,
     -- migrations/0022: one time-of reminder, set by resolver-svc to
-    -- due_at itself at confirm time (see agent-contracts.md §4.1). Was a
+    -- due_at itself when publishing items.confirmed (see agent-contracts.md §4.1). Was a
     -- due_at-2*effort/due_at-effort pair (migrations/0013), then a flat
     -- due_at-30min/due_at pair, before collapsing to this single column.
     reminder_at        timestamptz,
@@ -163,9 +163,9 @@ The PRD sketch names this column `payload_ref`, implying a pointer (e.g. to GCS)
 
 ### 2.4 `conversations.resolved_fields` — where `due_at` lives before commit
 
-**Resolved bug, not in the PRD sketch at all.** `due_at` has no column on `items` — it lives only on `obligations` (§2, above) — and `resolver-svc` has no Postgres grant on `obligations` (`infrastructure.md` §2.2; only `committer-svc` writes it, at commit time). So as originally written, once the clarification call (`agent-contracts.md` §3.2) resolved a `due_at` from a reply, there was nowhere for `resolver-svc` to durably persist it before the user confirms — Cloud Run instances are stateless between invocations, so it can't just be held in memory across turns either.
+**Resolved bug, not in the PRD sketch at all.** `due_at` has no column on `items` — it lives only on `obligations` (§2, above) — and `resolver-svc` has no Postgres grant on `obligations` (`infrastructure.md` §2.2; only `committer-svc` writes it, at commit time). So as originally written, once the conversation call (`agent-contracts.md` §3.5) resolved a `due_at` from a reply, there was nowhere for `resolver-svc` to durably persist it before commit — Cloud Run instances are stateless between invocations, so it can't just be held in memory across turns either.
 
-Fixed here: `resolved_fields` holds obligation-specific values resolved during the pipeline but not yet committed — `due_at`, and as of step 15, `action_type`/`email_draft` too (`agent-contracts.md` §2.1/§3.2 — the email-action stretch's drafting mechanism, resolved rather than left open). **`resolver-svc` creates the `conversations` row unconditionally the moment it consumes an `items.extracted` message** — not only when clarification is actually needed — and immediately stages any `due_at` the extractor already produced into `resolved_fields`. This means the zero-clarification-needed path (straight to `AWAITING_CONFIRMATION`) still has somewhere for `due_at` to live, not just the multi-exchange path. One `conversations` row per item, used as `resolver-svc`'s scratchpad from `EXTRACTED` through to `CONFIRMED`/`CANCELLED`/`NEEDS_REVIEW`/`MERGED`.
+Fixed here: `resolved_fields` holds obligation-specific values resolved during the pipeline but not yet committed — `due_at`, and as of step 15, `action_type`/`email_draft` too (`agent-contracts.md` §2.1/§3.5 — the email-action stretch's drafting mechanism, resolved rather than left open). **`resolver-svc` creates the `conversations` row unconditionally the moment it consumes an `items.extracted` message** — not only when clarification is actually needed — and immediately stages any `due_at` the extractor already produced into `resolved_fields`. This means the zero-clarification-needed path (straight to `CONFIRMED`) still has somewhere for `due_at` to live, not just the multi-exchange path. One `conversations` row per item, used as `resolver-svc`'s scratchpad from `EXTRACTED` through to `CONFIRMED`/`NEEDS_REVIEW`/`MERGED`.
 
 `title`/`summary`/`effort_minutes`/`confidence` don't have this problem — they're already columns on `items`, and `resolver-svc` has `UPDATE` on `items` (`infrastructure.md` §2.2), so those get written straight there as they're resolved.
 
@@ -181,7 +181,7 @@ Also not specified anywhere: where a *pending* dedupe match (awaiting the user's
 
 ### 2.5 `conversations.state` — removed from the PRD sketch
 
-The PRD sketch lists a `state` column on `conversations`. Dropped here: it would duplicate `items.state`, which already distinguishes `CLARIFYING` from `AWAITING_CONFIRMATION` for the same item, and two columns tracking the same fact is a drift risk (which one does `resolver-svc` trust if they ever disagree?). "Is this conversation open" is answered by joining to `items.state IN ('DUPLICATE_SUSPECTED', 'CLARIFYING', 'AWAITING_CONFIRMATION')` — a two-table join on indexed columns (`conversations.user_id`, `items` primary key), cheap enough at this scale. `items.state` remains the single source of truth for pipeline position, full stop. (`DUPLICATE_SUSPECTED` added to this set in step 12 — see §2.7; the query above was originally the two step-9/10 states only.)
+The PRD sketch lists a `state` column on `conversations`. Dropped here: it would duplicate `items.state`, which already distinguishes open resolver turns from terminal/commit states, and two columns tracking the same fact is a drift risk (which one does `resolver-svc` trust if they ever disagree?). "Is this conversation open" is answered by joining to current resolver-waiting states, `items.state IN ('DUPLICATE_SUSPECTED', 'CLARIFYING')`, with legacy `AWAITING_CONFIRMATION` included only to drain rows created before the v1 auto-commit change — a two-table join on indexed columns (`conversations.user_id`, `items` primary key), cheap enough at this scale. `items.state` remains the single source of truth for pipeline position, full stop.
 
 ---
 
