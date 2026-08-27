@@ -3,7 +3,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { MemoryList } from "@/components/memory-list";
-import { type ProfileUpdate, SettingsMenu } from "@/components/settings-menu";
+import { type ProfileUpdate, SettingsPanel } from "@/components/settings-panel";
 import { digitsOnly, formatPhoneDisplay, toE164 } from "@/lib/phone";
 
 const SESSION_KEY = "bet_dashboard_session";
@@ -307,22 +307,12 @@ export function DashboardApp() {
         <h1 className="font-serif text-[clamp(28px,4vw,38px)] leading-[1.05] tracking-[-0.02em]">
           What bet&apos;s tracking.
         </h1>
-        <div className="flex shrink-0 items-center gap-3">
-          {profile && (
-            <SettingsMenu
-              timezone={profile.timezone}
-              workingHoursStart={profile.working_hours_start}
-              workingHoursEnd={profile.working_hours_end}
-              onSave={saveProfile}
-            />
-          )}
-          <button
-            onClick={logout}
-            className="font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground hover:text-foreground"
-          >
-            Log out
-          </button>
-        </div>
+        <button
+          onClick={logout}
+          className="shrink-0 font-mono text-xs uppercase tracking-[0.12em] text-muted-foreground hover:text-foreground"
+        >
+          Log out
+        </button>
       </div>
 
       {loadError && <p className="mb-6 text-sm text-destructive">{loadError}</p>}
@@ -330,12 +320,20 @@ export function DashboardApp() {
       {!items || !profile ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
       ) : (
-        <MemoryList
-          inProgress={items.in_progress}
-          committed={items.committed}
-          timeZone={timeZone}
-          onDelete={deleteItem}
-        />
+        <div className="flex flex-col gap-6">
+          <MemoryList
+            inProgress={items.in_progress}
+            committed={items.committed}
+            timeZone={timeZone}
+            onDelete={deleteItem}
+          />
+          <SettingsPanel
+            timezone={profile.timezone}
+            workingHoursStart={profile.working_hours_start}
+            workingHoursEnd={profile.working_hours_end}
+            onSave={saveProfile}
+          />
+        </div>
       )}
     </>
   );
