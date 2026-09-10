@@ -1,4 +1,4 @@
-# BET
+# BE
 
 **A capacity-aware personal obligation engine that turns unstructured messages into durable, schedulable work while keeping LLMs behind deterministic system boundaries.**
 
