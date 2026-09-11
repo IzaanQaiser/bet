@@ -1,6 +1,6 @@
 # bet
 
-**A capacity-aware personal obligation engine that turns unstructured messages into durable, schedulable work while keeping LLMs behind deterministic system boundaries.**
+**A context-aware personal obligation engine that turns unstructured messages into durable, schedulable work while keeping LLMs behind deterministic system boundaries.**
 
 BET is built around a simple rule: **models can interpret intent, but they should not control execution.**
 
